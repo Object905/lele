@@ -486,30 +486,10 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             }
         }
         "CumSum" => {
-            let axis = if ctx.node.input.len() > 1 {
-                ctx.ints(1).map_or(0, |ints| ints[0])
-            } else {
-                ctx.node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "axis")
-                    .map(|a| a.i)
-                    .unwrap_or(0)
+            let Op::CumSum { exclusive, reverse } = ctx.ir().op else {
+                return Ok(false);
             };
-            let exclusive = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "exclusive")
-                .map(|a| a.i != 0)
-                .unwrap_or(false);
-            let reverse = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "reverse")
-                .map(|a| a.i != 0)
-                .unwrap_or(false);
+            let axis = ctx.ints(1).map_or(0, |ints| ints[0]);
             writeln!(
                 w,
                 "{}let {} = lele::kernels::cumsum(&{}, {}, {}, {}, {});",
@@ -517,13 +497,9 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             )?;
         }
         "Einsum" => {
-            let equation = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "equation")
-                .map(|a| String::from_utf8_lossy(&a.s).to_string())
-                .unwrap_or_default();
+            let Op::Einsum { equation } = &ctx.ir().op else {
+                return Ok(false);
+            };
             let normalized = equation.replace(' ', "");
             match normalized.as_str() {
                 "bs,d->bsd" => {

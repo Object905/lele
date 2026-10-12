@@ -1,7 +1,4 @@
-use super::super::{
-    generate::OpContext,
-    ir::{ConvAttrs, Op},
-};
+use super::super::{generate::OpContext, ir::Op};
 use std::io::Write;
 
 /// Compute explicit pads from auto_pad attribute for SAME_UPPER/SAME_LOWER.
@@ -67,10 +64,8 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
 
     match op {
         "Conv" => {
-            // Only a Conv outside the default domain is untyped.
-            let conv = match &ctx.ir().op {
-                Op::Conv(conv) => conv.clone(),
-                _ => ConvAttrs::parse(ctx.node),
+            let Op::Conv(conv) = &ctx.ir().op else {
+                return Ok(false);
             };
             let dilations = conv.dilations.clone().unwrap_or_default();
             let group = conv.group.unwrap_or(1);
@@ -121,36 +116,15 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             )?;
         }
         "Gemm" => {
-            let alpha = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "alpha")
-                .map(|a| a.f)
-                .unwrap_or(1.0);
-            let beta = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "beta")
-                .map(|a| a.f)
-                .unwrap_or(1.0);
-            let trans_a = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "transA")
-                .map(|a| a.i)
-                .unwrap_or(0)
-                != 0;
-            let trans_b = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "transB")
-                .map(|a| a.i)
-                .unwrap_or(0)
-                != 0;
+            let Op::Gemm {
+                alpha,
+                beta,
+                trans_a,
+                trans_b,
+            } = ctx.ir().op
+            else {
+                return Ok(false);
+            };
             let c = if inputs.len() > 2 && !inputs[2].is_empty() {
                 format!("Some(&{})", inputs[2])
             } else {
@@ -223,14 +197,12 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             } else {
                 "None".to_string()
             };
-            let linear_before_reset = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "linear_before_reset")
-                .map(|a| a.i)
-                .unwrap_or(0)
-                != 0;
+            let Op::Gru {
+                linear_before_reset,
+            } = ctx.ir().op
+            else {
+                return Ok(false);
+            };
             writeln!(
                 w,
                 "{}let mut buf_{}_h = Vec::<f32>::new();",
@@ -272,12 +244,8 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             }
         }
         "LayerNormalization" => {
-            let (axis, epsilon) = match ctx.ir().op {
-                Op::LayerNormalization { axis, epsilon } => (axis, epsilon),
-                _ => panic!(
-                    "LayerNormalization '{}' outside the default domain",
-                    ctx.node.name
-                ),
+            let Op::LayerNormalization { axis, epsilon } = ctx.ir().op else {
+                return Ok(false);
             };
             let scale = if ctx.node.input.len() > 1
                 && !ctx.node.input[1].is_empty()
@@ -322,34 +290,13 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             }
         }
         "ConvInteger" => {
-            let dilations = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "dilations")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let group = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "group")
-                .map(|a| a.i)
-                .unwrap_or(1);
-            let pads = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "pads")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let strides = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "strides")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
+            let Op::ConvInteger(conv) = &ctx.ir().op else {
+                return Ok(false);
+            };
+            let dilations = conv.dilations.clone().unwrap_or_default();
+            let group = conv.group.unwrap_or(1);
+            let pads = conv.pads.clone().unwrap_or_default();
+            let strides = conv.strides.clone().unwrap_or_default();
             let x_zero_point = if inputs.len() > 2 && !ctx.node.input[2].is_empty() {
                 format!("Some(&{})", inputs[2])
             } else {
@@ -401,13 +348,9 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             }
         }
         "BatchNormalization" => {
-            let epsilon = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "epsilon")
-                .map(|a| a.f)
-                .unwrap_or(1e-5);
+            let Op::BatchNormalization { epsilon } = ctx.ir().op else {
+                return Ok(false);
+            };
             writeln!(
                 w,
                 "{}let {} = lele::kernels::batch_norm(&{}, &{}, &{}, &{}, &{}, {:?}, {});",
@@ -423,52 +366,19 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             )?;
         }
         "MaxPool" => {
-            let kernel_shape = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "kernel_shape")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let strides = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "strides")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let auto_pad = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "auto_pad")
-                .and_then(|a| std::str::from_utf8(&a.s).ok())
-                .unwrap_or("NOTSET");
-            let dilations = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "dilations")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
+            let Op::MaxPool(pool) = &ctx.ir().op else {
+                return Ok(false);
+            };
+            let kernel_shape = pool.kernel_shape.clone().unwrap_or_default();
+            let strides = pool.strides.clone().unwrap_or_default();
+            let auto_pad = pool.auto_pad.as_deref().unwrap_or("NOTSET");
+            let dilations = pool.dilations.clone().unwrap_or_default();
             let pads = if auto_pad != "NOTSET" && !auto_pad.is_empty() {
                 compute_same_pads(&kernel_shape, &strides, &dilations, auto_pad).unwrap_or_default()
             } else {
-                ctx.node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "pads")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or(vec![])
+                pool.pads.clone().unwrap_or_default()
             };
-            let ceil_mode = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "ceil_mode")
-                .map(|a| a.i)
-                .unwrap_or(0)
-                != 0;
+            let ceil_mode = pool.ceil_mode;
             writeln!(
                 w,
                 "{}let {} = lele::kernels::max_pool2d(&{}, &{:?}, &{:?}, &{:?}, &{:?}, {}, {});",
@@ -486,13 +396,16 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
         "Resize" => {
             // ONNX Resize op: inputs are [X, roi, scales] or [X, roi, scales, sizes]
             // For YOLO, we use scales mode with nearest interpolation
-            let coord_transform = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "coordinate_transformation_mode")
-                .and_then(|a| std::str::from_utf8(&a.s).ok().map(|s| s.to_string()))
-                .unwrap_or("half_pixel".to_string());
+            let Op::Resize {
+                coordinate_transformation_mode,
+                ..
+            } = &ctx.ir().op
+            else {
+                return Ok(false);
+            };
+            let coord_transform = coordinate_transformation_mode
+                .as_deref()
+                .unwrap_or("half_pixel");
 
             // Check if sizes input is provided (input[3])
             let has_sizes = inputs.len() > 3 && !ctx.node.input[3].is_empty();
@@ -523,34 +436,16 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             )?;
         }
         "AveragePool" => {
-            let kernel_shape = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "kernel_shape")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let strides = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "strides")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let pads = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "pads")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let count_include_pad = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "count_include_pad")
-                .map(|a| a.i != 0)
-                .unwrap_or(false);
+            let Op::AveragePool {
+                pool,
+                count_include_pad,
+            } = &ctx.ir().op
+            else {
+                return Ok(false);
+            };
+            let kernel_shape = pool.kernel_shape.clone().unwrap_or_default();
+            let strides = pool.strides.clone().unwrap_or_default();
+            let pads = pool.pads.clone().unwrap_or_default();
             writeln!(
                 w,
                 "{}let {} = lele::kernels::average_pool2d(&{}, &{:?}, &{:?}, &{:?}, {}, {});",
@@ -565,34 +460,13 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             )?;
         }
         "ConvTranspose" => {
-            let dilations = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "dilations")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let group = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "group")
-                .map(|a| a.i)
-                .unwrap_or(1);
-            let pads = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "pads")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            let strides = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "strides")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
+            let Op::ConvTranspose(conv) = &ctx.ir().op else {
+                return Ok(false);
+            };
+            let dilations = conv.dilations.clone().unwrap_or_default();
+            let group = conv.group.unwrap_or(1);
+            let pads = conv.pads.clone().unwrap_or_default();
+            let strides = conv.strides.clone().unwrap_or_default();
             let bias_arg = if inputs.len() > 2 {
                 format!("Some(&{})", inputs[2])
             } else {

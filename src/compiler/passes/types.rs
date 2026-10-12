@@ -65,6 +65,7 @@ pub(crate) fn follows_input(op: &Op, i: usize) -> Option<usize> {
         | Op::Cast { .. }
         | Op::Constant { .. }
         | Op::ConstantOfShape { .. }
+        | Op::ConvInteger(_)
         | Op::EmbeddingConcat { .. }
         | Op::Shape { .. }
         | Op::QuantizeLinear(_)
@@ -89,7 +90,6 @@ pub(crate) fn follows_input(op: &Op, i: usize) -> Option<usize> {
             | "IsNaN"
             | "IsInf"
             | "MatMulInteger"
-            | "ConvInteger"
             | "DynamicQuantizeLinear" => None,
             "Where" => Some(1),
             _ => Some(0),
@@ -110,6 +110,7 @@ fn output_dtype(op: &Op, i: usize, input: &dyn Fn(usize) -> DType) -> DType {
         Op::Constant { value } => DType::from_onnx(value.data_type),
         Op::ConstantOfShape { value } | Op::EmbeddingConcat { value } => tensor_type(value),
         Op::Shape { .. } | Op::ArgMax { .. } | Op::TopK { .. } => I64,
+        Op::ConvInteger(_) => I32,
         Op::QuantizeLinear(attrs) => attrs.output_dtype.unwrap_or(match input(2) {
             Undefined => U8,
             t => t,
@@ -124,7 +125,7 @@ fn output_dtype(op: &Op, i: usize, input: &dyn Fn(usize) -> DType) -> DType {
             .get(i + 1)
             .map_or(Undefined, |&v| body.value(v).dtype),
         Op::Onnx { op_type, .. } => match op_type.as_str() {
-            "MatMulInteger" | "ConvInteger" => I32,
+            "MatMulInteger" => I32,
             "DynamicQuantizeLinear" => [U8, F32, U8].get(i).copied().unwrap_or(Undefined),
             "Equal" | "Less" | "LessOrEqual" | "Greater" | "GreaterOrEqual" | "And" | "Or"
             | "Xor" | "Not" | "IsNaN" | "IsInf" => Bool,

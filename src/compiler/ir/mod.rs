@@ -15,7 +15,7 @@
 
 mod op;
 
-pub use op::{Activation, ConvAttrs, DType, Op, QuantAttrs, Reduction};
+pub use op::{Activation, ConvAttrs, DType, Op, PoolAttrs, QuantAttrs, Reduction};
 
 use crate::model::onnx_proto::{
     GraphProto, NodeProto, TensorProto, TensorShapeProto, TypeProto, ValueInfoProto,
