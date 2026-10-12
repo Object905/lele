@@ -399,6 +399,8 @@ impl Compiler {
         }
         // Runs after folding so that only the activation pairs are left.
         passes::fuse_qdq(&mut ir);
+        passes::sink_constant_of_shape(&mut ir);
+        passes::group_dynamic_quant_matmul(&mut ir);
         let graph_storage = ir.into_onnx();
         let graph = &graph_storage;
         let mut weights_data = Vec::new();
@@ -423,198 +425,11 @@ impl Compiler {
                 .entry(safe_name)
                 .or_insert((*offset, *len, shape.clone(), *data_type));
         }
-        // --- OPTIMIZATION: Reorder ConstantOfShape -> Concat pattern ---
-        // We create a modified list of nodes to pass to body generation
-        let mut nodes: Vec<&NodeProto> = graph.node.iter().collect();
-        // Find Concat nodes that can be optimized
-        let mut changes = Vec::new();
-        for (i, node) in nodes.iter().enumerate() {
-            if node.op_type == "Concat" && node.input.len() >= 2 {
-                // Check inputs
-                for input_name in &node.input {
-                    // Check if this input comes from a ConstantOfShape
-                    if let Some(pos) = nodes
-                        .iter()
-                        .position(|n| !n.output.is_empty() && n.output[0] == *input_name)
-                        && pos < i
-                        && pos != i - 1
-                    {
-                        // If it's before and not immediately before
-                        let producer = nodes[pos];
-                        if producer.op_type == "ConstantOfShape" {
-                            // Check if producer depends on weights (so it can be moved anywhere)
-                            // Or constants?
-                            // ConstantOfShape input[0] is shape. Check if it's a weight or initializer.
-                            let shape_input = &producer.input[0];
-                            // Check against known weights/initializers
-                            // We have weight_lookup keyed by sanitized name, but let's check raw name in offset_map?
-                            // Actually sanitize_name(shape_input) lookup works.
-                            if weight_lookup.contains_key(&sanitize_name(shape_input))
-                                || int64_map.contains_key(shape_input)
-                            {
-                                // Safe to move!
-                                changes.push((pos, i));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Apply moves.
-        // To avoid index invalidation, we rebuild the list
-        if !changes.is_empty() {
-            let mut new_nodes = Vec::new();
-            let mut moved_indices = std::collections::HashSet::new();
-            for (from, _) in &changes {
-                moved_indices.insert(*from);
-            }
-            // Iterate original list
-            for (i, node) in nodes.iter().enumerate() {
-                // Check if `i` is a target destination for some moved node
-                // We want to insert 'from' node right BEFORE 'to' node.
-                // Find all moves where 'to' == i
-                for (from, to) in &changes {
-                    if *to == i && moved_indices.contains(from) {
-                        new_nodes.push(nodes[*from]);
-                        // Remove from set to avoid dups if multiple targets? (Should not happen for unique unique producer)
-                    }
-                }
-                if !moved_indices.contains(&i) {
-                    new_nodes.push(node);
-                }
-            }
-            nodes = new_nodes;
-        }
-        // --- END OPTIMIZATION ---
-
-        {
-            let mut chains: Vec<[usize; 6]> = Vec::new();
-            let mut in_chain: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-            for (i, node) in nodes.iter().enumerate() {
-                if node.op_type != "DynamicQuantizeLinear" || in_chain.contains(&i) {
-                    continue;
-                }
-                if node.output.len() < 3 {
-                    continue;
-                }
-                let q = &node.output[0];
-                let s = &node.output[1];
-                let z = &node.output[2];
-                if q.is_empty() || s.is_empty() || z.is_empty() {
-                    continue;
-                }
-
-                let window = std::cmp::min(i + 30, nodes.len());
-
-                // Find Mul(scale, weight_scale) → combined_scale
-                let mul_scales = (i + 1..window).find(|&j| {
-                    nodes[j].op_type == "Mul" && nodes[j].input.iter().any(|inp| inp == s)
-                });
-                // Find MMI(quantized, ..., zero_point)
-                let mmi = (i + 1..window).find(|&j| {
-                    nodes[j].op_type == "MatMulInteger"
-                        && nodes[j].input.len() >= 3
-                        && nodes[j].input[0] == *q
-                        && nodes[j].input[2] == *z
-                });
-                let (mul_scales_idx, mmi_idx) = match (mul_scales, mmi) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => continue,
-                };
-
-                let mm_out = &nodes[mmi_idx].output[0];
-                let combined_scale = &nodes[mul_scales_idx].output[0];
-
-                // Find Cast(MMI.output)
-                let cast_idx = match (mmi_idx + 1..window)
-                    .find(|&j| nodes[j].op_type == "Cast" && nodes[j].input[0] == *mm_out)
-                {
-                    Some(c) => c,
-                    None => continue,
-                };
-                let cast_out = &nodes[cast_idx].output[0];
-
-                // Find Mul(cast_out, combined_scale)
-                let mul_dq_idx = match (cast_idx + 1..window).find(|&j| {
-                    nodes[j].op_type == "Mul"
-                        && nodes[j].input.iter().any(|inp| inp == cast_out)
-                        && nodes[j].input.iter().any(|inp| inp == combined_scale)
-                }) {
-                    Some(m) => m,
-                    None => continue,
-                };
-                let dequant = &nodes[mul_dq_idx].output[0];
-
-                // Find Add(bias, dequant)
-                let add_idx = match (mul_dq_idx + 1..window).find(|&j| {
-                    nodes[j].op_type == "Add" && nodes[j].input.iter().any(|inp| inp == dequant)
-                }) {
-                    Some(a) => a,
-                    None => continue,
-                };
-
-                let chain = [i, mul_scales_idx, mmi_idx, cast_idx, mul_dq_idx, add_idx];
-
-                // Safety: verify no interleaved node depends on any chain output
-                let chain_set: std::collections::HashSet<usize> = chain.iter().copied().collect();
-                let chain_outputs: std::collections::HashSet<&str> = chain
-                    .iter()
-                    .flat_map(|&idx| nodes[idx].output.iter().map(|s| s.as_str()))
-                    .collect();
-
-                let safe = (i..=add_idx).zip(&nodes[i..=add_idx]).all(|(j, node)| {
-                    chain_set.contains(&j)
-                        || !node
-                            .input
-                            .iter()
-                            .any(|inp| chain_outputs.contains(inp.as_str()))
-                });
-                if safe {
-                    chains.push(chain);
-                    in_chain.extend(chain.iter());
-                }
-            }
-
-            if !chains.is_empty() {
-                let mut result: Vec<&NodeProto> = Vec::with_capacity(nodes.len());
-                let mut emitted = vec![false; nodes.len()];
-
-                for i in 0..nodes.len() {
-                    if emitted[i] {
-                        continue;
-                    }
-                    if let Some(chain) = chains.iter().find(|c| c[0] == i) {
-                        let chain_set: std::collections::HashSet<usize> =
-                            chain.iter().copied().collect();
-                        let chain_end = chain[5];
-                        // Emit non-chain nodes first (in original order)
-                        for j in i..=chain_end {
-                            if !chain_set.contains(&j) && !emitted[j] {
-                                result.push(nodes[j]);
-                                emitted[j] = true;
-                            }
-                        }
-                        // Emit chain nodes consecutively
-                        for &idx in chain {
-                            result.push(nodes[idx]);
-                            emitted[idx] = true;
-                        }
-                    } else {
-                        result.push(nodes[i]);
-                        emitted[i] = true;
-                    }
-                }
-                nodes = result;
-            }
-        }
+        let nodes: Vec<&NodeProto> = graph.node.iter().collect();
 
         // Run Allocation/Liveness FIRST
         let output_names: Vec<String> = graph.output.iter().map(|o| o.name.clone()).collect();
-
-        let mut temp_graph = graph.clone();
-        temp_graph.node = nodes.iter().map(|&n| n.clone()).collect();
-        let (allocator, analysis) = solve_allocation(&temp_graph, &output_names);
+        let (allocator, analysis) = solve_allocation(graph, &output_names);
         let mut chunk_functions = Vec::new(); // Will hold the code for fn chunk_0(...) { ... }
         let mut body_buffer = Vec::new(); // Will hold the code for forward() body
         let mut current_id = 0;

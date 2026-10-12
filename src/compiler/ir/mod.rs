@@ -108,8 +108,10 @@ impl Node {
 
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
-    /// In execution order. Removed nodes leave `None` so ids stay valid.
+    /// Indexed by [`NodeId`]. Removed nodes leave `None` so ids stay valid.
     nodes: Vec<Option<Node>>,
+    /// Execution order. May still list removed nodes, which are skipped.
+    order: Vec<NodeId>,
     values: Vec<Value>,
     by_name: HashMap<String, ValueId>,
     pub inputs: Vec<ValueId>,
@@ -191,10 +193,11 @@ impl Graph {
             .collect();
         let name =
             |v: &Option<ValueId>| v.map_or_else(String::new, |v| values[v.0 as usize].name.clone());
+        let mut nodes = self.nodes;
         proto.node = self
-            .nodes
-            .into_iter()
-            .flatten()
+            .order
+            .iter()
+            .filter_map(|id| nodes[id.0 as usize].take())
             .map(|node| {
                 let mut p = node.proto;
                 p.op_type = node.op.op_type().to_string();
@@ -213,19 +216,35 @@ impl Graph {
     /// Ids of the live nodes in execution order. A snapshot, so the graph can
     /// be edited while iterating it.
     pub fn node_ids(&self) -> Vec<NodeId> {
-        self.nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.is_some())
-            .map(|(i, _)| NodeId(i as u32))
-            .collect()
+        self.nodes().map(|(id, _)| id).collect()
     }
 
+    /// Live nodes in execution order.
     pub fn nodes(&self) -> impl Iterator<Item = (NodeId, &Node)> {
-        self.nodes
+        self.order
             .iter()
-            .enumerate()
-            .filter_map(|(i, n)| Some((NodeId(i as u32), n.as_ref()?)))
+            .filter_map(|&id| Some((id, self.nodes[id.0 as usize].as_ref()?)))
+    }
+
+    /// Replaces the execution order.
+    ///
+    /// # Panics
+    /// If `order` is not a permutation of the live nodes.
+    pub fn set_order(&mut self, order: Vec<NodeId>) {
+        let mut seen = vec![false; self.nodes.len()];
+        for id in &order {
+            let i = id.0 as usize;
+            assert!(
+                self.nodes[i].is_some() && !std::mem::replace(&mut seen[i], true),
+                "order lists {id:?} twice or after its removal"
+            );
+        }
+        assert_eq!(
+            order.len(),
+            self.nodes.iter().flatten().count(),
+            "order misses live nodes"
+        );
+        self.order = order;
     }
 
     /// # Panics
@@ -423,6 +442,7 @@ impl Graph {
             outputs,
             captures,
         }));
+        self.order.push(id);
     }
 
     fn unlink_consumer(&mut self, v: ValueId, node: NodeId) {
