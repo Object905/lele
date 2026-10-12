@@ -288,8 +288,14 @@ fn fold_op(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
             }
         }
         Op::Slice => {
-            // Supports 1-D and 2-D data.
+            // Supports 1-D and 2-D data, unit steps.
             let (x, starts, ends) = (inputs.first()?, inputs.get(1)?, inputs.get(2)?);
+            if inputs
+                .get(4)
+                .is_some_and(|steps| steps.data.iter().any(|&s| s != 1.0))
+            {
+                return None;
+            }
             let (data, shape) = (&x.data, &x.shape);
             let ndim = shape.len();
             let num_slices = starts.data.len();
@@ -432,6 +438,56 @@ mod tests {
         let y = folded(&g);
         assert_eq!(y.data_type, 1);
         assert_eq!(y.float_data, [0.5, 0.5]);
+    }
+
+    /// `Slice([0, 1, 2, 3], starts=[0], ends=[4], axes=[0], steps=[step])`.
+    fn slice(step: i64) -> GraphProto {
+        let ints = |name: &str, v: Vec<i64>| TensorProto {
+            name: name.to_string(),
+            data_type: 7,
+            dims: vec![v.len() as i64],
+            int64_data: v,
+            ..Default::default()
+        };
+        GraphProto {
+            node: vec![NodeProto {
+                op_type: "Slice".to_string(),
+                input: ["x", "starts", "ends", "axes", "steps"]
+                    .map(String::from)
+                    .to_vec(),
+                output: vec!["y".to_string()],
+                ..Default::default()
+            }],
+            initializer: vec![
+                TensorProto {
+                    name: "x".to_string(),
+                    data_type: 1,
+                    dims: vec![4],
+                    float_data: vec![0.0, 1.0, 2.0, 3.0],
+                    ..Default::default()
+                },
+                ints("starts", vec![0]),
+                ints("ends", vec![4]),
+                ints("axes", vec![0]),
+                ints("steps", vec![step]),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn folds_slice_with_unit_step() {
+        let g = fold(slice(1));
+        assert!(g.node.is_empty());
+        let y = g.initializer.iter().find(|t| t.name == "y").unwrap();
+        assert_eq!(y.float_data, [0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn keeps_slice_with_other_steps() {
+        // Folding used to ignore `steps` and return every element.
+        let g = fold(slice(2));
+        assert_eq!(g.node.len(), 1);
     }
 
     #[test]
