@@ -121,18 +121,11 @@ pub(crate) fn infer_variable_types(
         let mut ty_str = "f32".to_string();
 
         if let Some(ty) = &input.r#type
-            && let Some(val) = &ty.value
+            && let Some(crate::model::onnx_proto::type_proto::Value::TensorType(tt)) = &ty.value
+            // 6=INT32, 7=INT64, 9=BOOL
+            && (tt.elem_type == 7 || tt.elem_type == 6 || tt.elem_type == 9)
         {
-            use crate::model::onnx_proto::type_proto::Value;
-            match val {
-                Value::TensorType(tt) => {
-                    // 6=INT32, 7=INT64, 9=BOOL
-                    if tt.elem_type == 7 || tt.elem_type == 6 || tt.elem_type == 9 {
-                        ty_str = "i64".to_string();
-                    }
-                }
-                _ => {}
-            }
+            ty_str = "i64".to_string();
         }
         types.insert(name.clone(), ty_str);
         fixed_types.insert(name);
@@ -601,8 +594,8 @@ pub(crate) fn infer_variable_types(
                     // Input 0 is condition. Only set to i64 if NOT already typed as f32.
                     if !node.input.is_empty() && !node.input[0].is_empty() {
                         let name = sanitize_name(&node.input[0]);
-                        if types.get(&name).is_none() {
-                            types.insert(name, "i64".to_string());
+                        if let std::collections::hash_map::Entry::Vacant(e) = types.entry(name) {
+                            e.insert("i64".to_string());
                             changed = true;
                         }
                     }
@@ -616,24 +609,23 @@ pub(crate) fn infer_variable_types(
     for node in nodes {
         for out in &node.output {
             if !out.is_empty() {
-                let name = sanitize_name(out);
-                if !types.contains_key(&name) {
-                    types.insert(name, "f32".to_string());
-                }
+                types
+                    .entry(sanitize_name(out))
+                    .or_insert_with(|| "f32".to_string());
             }
         }
         for inp in &node.input {
             if !inp.is_empty() {
-                let name = sanitize_name(inp);
-                if !types.contains_key(&name) {
-                    types.insert(name, "f32".to_string());
-                }
+                types
+                    .entry(sanitize_name(inp))
+                    .or_insert_with(|| "f32".to_string());
             }
         }
     }
     types
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_partitioned_graph<W: Write>(
     nodes: &[&NodeProto],           // Top level nodes
     chunk_writer: &mut Vec<String>, // Function definitions
@@ -875,6 +867,7 @@ fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_nodes(
     nodes: &[&NodeProto],
     w: &mut dyn Write,

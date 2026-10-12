@@ -1374,45 +1374,42 @@ fn collect_weights(
             }
         }
 
-        match crate::model::tensor_to_vec_u8(init) {
-            Ok((bytes, shape, data_type)) => {
-                if !bytes.is_empty() {
-                    // Compute content hash for deduplication
-                    let hash = compute_hash(&bytes);
+        if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(init)
+            && !bytes.is_empty()
+        {
+            // Compute content hash for deduplication
+            let hash = compute_hash(&bytes);
 
-                    // Check if we already have identical weight content
-                    if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
-                        // Reuse existing offset, but keep current weight's shape and dtype
-                        offset_map.push((
-                            init.name.clone(),
-                            existing_offset,
-                            existing_len,
-                            shape,
-                            data_type,
-                        ));
-                    } else {
-                        // New weight: align, write, and record
-                        let remainder = *current_offset % 16;
-                        if remainder != 0 {
-                            let padding = 16 - remainder;
-                            bin_data.write_all(&vec![0u8; padding])?;
-                            *current_offset += padding;
-                        }
-
-                        bin_data.write_all(&bytes)?;
-                        offset_map.push((
-                            init.name.clone(),
-                            *current_offset,
-                            bytes.len(),
-                            shape.clone(),
-                            data_type,
-                        ));
-                        content_hash_map.insert(hash, (*current_offset, bytes.len()));
-                        *current_offset += bytes.len();
-                    }
+            // Check if we already have identical weight content
+            if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
+                // Reuse existing offset, but keep current weight's shape and dtype
+                offset_map.push((
+                    init.name.clone(),
+                    existing_offset,
+                    existing_len,
+                    shape,
+                    data_type,
+                ));
+            } else {
+                // New weight: align, write, and record
+                let remainder = *current_offset % 16;
+                if remainder != 0 {
+                    let padding = 16 - remainder;
+                    bin_data.write_all(&vec![0u8; padding])?;
+                    *current_offset += padding;
                 }
+
+                bin_data.write_all(&bytes)?;
+                offset_map.push((
+                    init.name.clone(),
+                    *current_offset,
+                    bytes.len(),
+                    shape.clone(),
+                    data_type,
+                ));
+                content_hash_map.insert(hash, (*current_offset, bytes.len()));
+                *current_offset += bytes.len();
             }
-            Err(_) => {}
         }
     }
     // 2. Constants
@@ -1489,31 +1486,6 @@ fn collect_weights(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod codegen_smoke_tests {
-    use super::*;
-    use crate::model::onnx_proto::ValueInfoProto;
-
-    fn graph(nodes: Vec<NodeProto>, inputs: &[&str]) -> GraphProto {
-        let last = nodes.last().unwrap().output[0].clone();
-        GraphProto {
-            node: nodes,
-            input: inputs
-                .iter()
-                .map(|name| ValueInfoProto {
-                    name: name.to_string(),
-                    ..Default::default()
-                })
-                .collect(),
-            output: vec![ValueInfoProto {
-                name: last,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
 }
 
 #[cfg(test)]

@@ -97,8 +97,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 let s = shape_raw;
                 // Use regex-free approach: split on known patterns
                 let s = s.replace("[0,", "[-1,").replace("[0]", "[-1]");
-                let s = s.replace(", 0,", ", -1,").replace(", 0]", ", -1]");
-                s
+                s.replace(", 0,", ", -1,").replace(", 0]", ", -1]")
             } else {
                 shape_raw
             };

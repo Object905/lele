@@ -2,7 +2,6 @@ use super::super::{
     generate::{OpContext, generate_nodes},
     sanitize_name,
 };
-use std::collections::HashSet;
 use std::io::Write;
 
 pub(crate) fn handle_control_flow_ops(
@@ -66,15 +65,6 @@ pub(crate) fn handle_control_flow_ops(
                 ctx.var_types,
             )?;
 
-            // Collect variables defined in then branch
-            let mut then_defined = HashSet::new();
-            for n in &then_nodes {
-                for out in &n.output {
-                    if !out.is_empty() {
-                        then_defined.insert(sanitize_name(out));
-                    }
-                }
-            }
             let then_outs: Vec<String> = then_branch
                 .output
                 .iter()
@@ -91,8 +81,6 @@ pub(crate) fn handle_control_flow_ops(
                             "self.{}({}, {}, &{:?}).to_owned()",
                             weight_fn, offset, len, shape
                         )
-                    } else if then_defined.contains(&name) {
-                        format!("{}.to_owned()", name)
                     } else {
                         format!("{}.to_owned()", name)
                     }
@@ -116,14 +104,6 @@ pub(crate) fn handle_control_flow_ops(
                 ctx.var_types,
             )?;
 
-            let mut else_defined = HashSet::new();
-            for n in &else_nodes {
-                for out in &n.output {
-                    if !out.is_empty() {
-                        else_defined.insert(sanitize_name(out));
-                    }
-                }
-            }
             let else_outs: Vec<String> = else_branch
                 .output
                 .iter()
@@ -140,8 +120,6 @@ pub(crate) fn handle_control_flow_ops(
                             "self.{}({}, {}, &{:?}).to_owned()",
                             weight_fn, offset, len, shape
                         )
-                    } else if else_defined.contains(&name) {
-                        format!("{}.to_owned()", name)
                     } else {
                         format!("{}.to_owned()", name)
                     }

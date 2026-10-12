@@ -570,10 +570,7 @@ pub fn get_default_patterns() -> Vec<Pattern> {
                 if n0.input.len() > 2 && !n0.input[2].is_empty() {
                     return None;
                 }
-                let conv_out = match n0.output.first() {
-                    Some(o) => o,
-                    None => return None,
-                };
+                let conv_out = n0.output.first()?;
                 let in0_match = n1.input.first().map(|s| s == conv_out).unwrap_or(false);
                 let in1_match = n1.input.get(1).map(|s| s == conv_out).unwrap_or(false);
                 if !in0_match && !in1_match {
