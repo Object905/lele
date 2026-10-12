@@ -1,5 +1,5 @@
 use super::super::{
-    generate::{OpContext, generate_nodes},
+    generate::{OpContext, generate_nodes, weight_expr},
     sanitize_name,
 };
 use std::io::Write;
@@ -33,6 +33,19 @@ pub(crate) fn handle_control_flow_ops(
                 .g
                 .as_ref()
                 .unwrap();
+            // A branch output is either a weight or a variable of the branch.
+            let (known_weights, var_types) = (ctx.known_weights, ctx.var_types);
+            let branch_output = |o: &crate::model::onnx_proto::ValueInfoProto| {
+                let name = sanitize_name(&o.name);
+                match known_weights.get(&name) {
+                    Some((offset, len, shape, data_type)) => {
+                        let ty = var_types.get(&name).map_or("f32", |s| s.as_str());
+                        let weight = weight_expr(*offset, *len, shape, *data_type, ty);
+                        format!("{weight}.to_owned()")
+                    }
+                    None => format!("{name}.to_owned()"),
+                }
+            };
             let cond = &inputs[0];
             let out_vars = outputs.join(", ");
             let cond_is_i64 = ctx.var_types.get(cond).map(|t| t == "i64").unwrap_or(false);
@@ -65,27 +78,7 @@ pub(crate) fn handle_control_flow_ops(
                 ctx.var_types,
             )?;
 
-            let then_outs: Vec<String> = then_branch
-                .output
-                .iter()
-                .map(|o| {
-                    let name = sanitize_name(&o.name);
-                    if let Some((offset, len, shape, dt)) = ctx.known_weights.get(&name) {
-                        let weight_fn = match dt {
-                            1 => "weight",
-                            3 => "weight_i8",
-                            10 => "weight_f16",
-                            _ => "weight",
-                        };
-                        format!(
-                            "self.{}({}, {}, &{:?}).to_owned()",
-                            weight_fn, offset, len, shape
-                        )
-                    } else {
-                        format!("{}.to_owned()", name)
-                    }
-                })
-                .collect();
+            let then_outs: Vec<String> = then_branch.output.iter().map(branch_output).collect();
             writeln!(w, "{}    ({})", tab, then_outs.join(", "))?;
             writeln!(w, "{}}} else {{", tab)?;
 
@@ -104,27 +97,7 @@ pub(crate) fn handle_control_flow_ops(
                 ctx.var_types,
             )?;
 
-            let else_outs: Vec<String> = else_branch
-                .output
-                .iter()
-                .map(|o| {
-                    let name = sanitize_name(&o.name);
-                    if let Some((offset, len, shape, dt)) = ctx.known_weights.get(&name) {
-                        let weight_fn = match dt {
-                            1 => "weight",
-                            3 => "weight_i8",
-                            10 => "weight_f16",
-                            _ => "weight",
-                        };
-                        format!(
-                            "self.{}({}, {}, &{:?}).to_owned()",
-                            weight_fn, offset, len, shape
-                        )
-                    } else {
-                        format!("{}.to_owned()", name)
-                    }
-                })
-                .collect();
+            let else_outs: Vec<String> = else_branch.output.iter().map(branch_output).collect();
             writeln!(w, "{}    ({})", tab, else_outs.join(", "))?;
             writeln!(w, "{}}};", tab)?;
         }

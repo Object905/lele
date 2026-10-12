@@ -808,24 +808,7 @@ impl Compiler {
                 let name = sanitize_name(&o.name);
                 let target_type = var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32");
                 if let Some((offset, len, shape, data_type)) = weight_lookup.get(&name) {
-                    if target_type == "i64" {
-                        match data_type {
-                            7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
-                            6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
-                            9 => format!("self.weight_bool_i64({}, {}, &{:?})", offset, len, shape),
-                            _ => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
-                        }
-                    } else {
-                        match data_type {
-                            1 => format!("self.weight_f32({}, {}, &{:?})", offset, len, shape),
-                            2 => format!("self.weight_u8({}, {}, &{:?})", offset, len, shape),
-                            3 => format!("self.weight_i8({}, {}, &{:?})", offset, len, shape),
-                            6 => format!("self.weight_i32_f32({}, {}, &{:?})", offset, len, shape),
-                            7 => format!("self.weight_i64_f32({}, {}, &{:?})", offset, len, shape),
-                            10 => format!("self.weight_f16({}, {}, &{:?})", offset, len, shape),
-                            _ => format!("self.weight_f32({}, {}, &{:?})", offset, len, shape),
-                        }
-                    }
+                    weight_expr(*offset, *len, shape, *data_type, target_type)
                 } else {
                     name
                 }

@@ -26,6 +26,34 @@ impl<'a> OpContext<'a> {
     }
 }
 
+/// Expression reading a weight of ONNX type `data_type` from the weights
+/// file, as `target_type` (`"i64"`, or f32 otherwise).
+pub(crate) fn weight_expr(
+    offset: usize,
+    len: usize,
+    shape: &[usize],
+    data_type: i32,
+    target_type: &str,
+) -> String {
+    let accessor = if target_type == "i64" {
+        match data_type {
+            6 => "weight_i32_i64",
+            9 => "weight_bool_i64",
+            _ => "weight_i64",
+        }
+    } else {
+        match data_type {
+            2 => "weight_u8",
+            3 => "weight_i8",
+            6 => "weight_i32_f32",
+            7 => "weight_i64_f32",
+            10 => "weight_f16",
+            _ => "weight_f32",
+        }
+    };
+    format!("self.{accessor}({offset}, {len}, &{shape:?})")
+}
+
 pub(crate) fn collect_recursive_metrics(
     nodes: &[&NodeProto],
     defined: &mut HashSet<String>,
@@ -1232,5 +1260,59 @@ mod tests {
         let result = String::from_utf8(output).unwrap();
         assert!(result.contains("let mut buf_c = Vec::<f32>::new();"));
         assert!(result.contains("let c = lele::kernels::add(&a, &b, &mut buf_c);"));
+    }
+
+    /// An `If` branch that returns one of its initializers reads it through
+    /// the weight accessor of its type; it used to call a nonexistent
+    /// `self.weight`.
+    #[test]
+    fn test_if_branch_returning_a_weight() {
+        use crate::model::onnx_proto::{AttributeProto, GraphProto, TensorProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let branch = |name: &str, data_type: i32, raw: Vec<u8>| GraphProto {
+            initializer: vec![TensorProto {
+                name: name.to_string(),
+                data_type,
+                dims: vec![2],
+                raw_data: raw,
+                ..Default::default()
+            }],
+            output: vec![info(name)],
+            ..Default::default()
+        };
+        let graph = GraphProto {
+            node: vec![NodeProto {
+                op_type: "If".to_string(),
+                input: vec!["cond".to_string()],
+                output: vec!["r".to_string()],
+                attribute: vec![
+                    AttributeProto {
+                        name: "then_branch".to_string(),
+                        g: Some(branch(
+                            "w_f32",
+                            1,
+                            [1.0f32, 2.0].map(f32::to_le_bytes).concat(),
+                        )),
+                        ..Default::default()
+                    },
+                    AttributeProto {
+                        name: "else_branch".to_string(),
+                        g: Some(branch("w_i8", 3, vec![3, 4])),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            input: vec![info("cond")],
+            output: vec![info("r")],
+            ..Default::default()
+        };
+        let code = Compiler::new().compile(&graph).unwrap().code;
+        assert!(!code.contains("self.weight("), "{code}");
+        assert!(code.contains("self.weight_f32("), "{code}");
+        assert!(code.contains("self.weight_i8("), "{code}");
     }
 }
