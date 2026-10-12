@@ -444,6 +444,16 @@ fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
     if depth > 64 {
         return false;
     }
+    // Multi-output kernels (`let (a, b) = topk(..)`, `split`, ...) write
+    // buffers local to the chunk.
+    let in_tuple = body.lines().map(str::trim_start).any(|l| {
+        l.strip_prefix("let (")
+            .and_then(|l| l.split_once(") ="))
+            .is_some_and(|(names, _)| names.split(',').any(|n| n.trim() == var))
+    });
+    if in_tuple {
+        return false;
+    }
     let prefix = format!("let {var} = ");
     let defs: Vec<&str> = body
         .lines()
@@ -700,8 +710,13 @@ mod tests {
         let z = lele::kernels::add(&a, &b, &mut ws.buf_4);
         #[cfg(not(target_arch = \"aarch64\"))]
         let z = lele::kernels::add(&a, &b, &mut buf_z);
+        let (values, indices) = lele::kernels::topk(&x, 5, 1, true, true, &mut buf_v, &mut buf_i);
+        let picked = lele::kernels::squeeze(&indices, None);
 ";
         for (var, safe) in [
+            ("values", false),
+            ("indices", false),
+            ("picked", false),
             ("m", false),
             ("m2", false),
             ("m3", false),
