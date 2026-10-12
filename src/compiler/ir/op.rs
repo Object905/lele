@@ -377,6 +377,19 @@ impl Op {
         }
     }
 
+    /// Subgraphs owned by this operator, with the name of their attribute.
+    pub fn named_subgraphs(&self) -> Vec<(&str, &Graph)> {
+        match self {
+            Op::If {
+                then_branch,
+                else_branch,
+            } => vec![("then_branch", then_branch), ("else_branch", else_branch)],
+            Op::Loop { body } => vec![("body", body)],
+            Op::Onnx { graphs, .. } => graphs.iter().map(|(n, g)| (n.as_str(), g)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn subgraphs_mut(&mut self) -> Vec<&mut Graph> {
         match self {
             Op::If {

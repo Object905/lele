@@ -1,7 +1,6 @@
 pub use self::alloc::Allocator;
 pub(crate) use self::alloc::AnalysisData;
 use crate::model::onnx_proto::{GraphProto, NodeProto};
-use crate::model::tensor_to_array;
 use std::collections::HashMap;
 use std::io::Write;
 /// Handler callback for custom operator code generation.
@@ -39,6 +38,7 @@ pub mod generate;
 pub mod ir;
 pub mod ops;
 mod passes;
+mod weights;
 
 pub(crate) use generate::*;
 
@@ -156,30 +156,14 @@ impl Compiler {
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
         let (allocator, analysis) = alloc::solve_allocation(&ir);
+        let weights::Weights {
+            data: weights_data,
+            lookup: weight_lookup,
+            int64: int64_map,
+            ..
+        } = weights::Weights::collect(&ir);
         let graph_storage = ir.into_onnx();
         let graph = &graph_storage;
-        let mut weights_data = Vec::new();
-        let mut offset_map = Vec::new();
-        let mut current_offset = 0usize;
-        let mut int64_map = HashMap::new();
-        let mut content_hash_map = HashMap::new();
-        // 1. Collect Weights
-        collect_weights(
-            graph,
-            &mut weights_data,
-            &mut offset_map,
-            &mut current_offset,
-            &mut int64_map,
-            &mut content_hash_map,
-        )?;
-        // Prepare weight lookup map for body generation
-        let mut weight_lookup = HashMap::new();
-        for (name, offset, len, shape, data_type) in &offset_map {
-            let safe_name = sanitize_name(name);
-            weight_lookup
-                .entry(safe_name)
-                .or_insert((*offset, *len, shape.clone(), *data_type));
-        }
         let nodes: Vec<&NodeProto> = graph.node.iter().collect();
 
         let mut chunk_functions = Vec::new(); // Will hold the code for fn chunk_0(...) { ... }
@@ -406,148 +390,6 @@ pub fn sanitize_name(name: &str) -> String {
     } else {
         s
     }
-}
-
-fn compute_hash(bytes: &[u8]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn collect_weights(
-    graph: &GraphProto,
-    bin_data: &mut Vec<u8>,
-    offset_map: &mut Vec<(String, usize, usize, Vec<usize>, i32)>,
-    current_offset: &mut usize,
-    int64_map: &mut HashMap<String, (Vec<i64>, Vec<usize>)>,
-    content_hash_map: &mut HashMap<u64, (usize, usize)>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initializers
-    for init in &graph.initializer {
-        // Populate int64_map for INT64 types
-        if init.data_type == 7 || init.data_type == 6 {
-            // INT64 or INT32
-            if let Ok((data, dims)) = tensor_to_array(init) {
-                let ints: Vec<i64> = data.iter().map(|&x| x as i64).collect();
-                int64_map.insert(init.name.clone(), (ints, dims));
-            }
-        }
-
-        if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(init)
-            && !bytes.is_empty()
-        {
-            // Compute content hash for deduplication
-            let hash = compute_hash(&bytes);
-
-            // Check if we already have identical weight content
-            if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
-                // Reuse existing offset, but keep current weight's shape and dtype
-                offset_map.push((
-                    init.name.clone(),
-                    existing_offset,
-                    existing_len,
-                    shape,
-                    data_type,
-                ));
-            } else {
-                // New weight: align, write, and record
-                let remainder = *current_offset % 16;
-                if remainder != 0 {
-                    let padding = 16 - remainder;
-                    bin_data.write_all(&vec![0u8; padding])?;
-                    *current_offset += padding;
-                }
-
-                bin_data.write_all(&bytes)?;
-                offset_map.push((
-                    init.name.clone(),
-                    *current_offset,
-                    bytes.len(),
-                    shape.clone(),
-                    data_type,
-                ));
-                content_hash_map.insert(hash, (*current_offset, bytes.len()));
-                *current_offset += bytes.len();
-            }
-        }
-    }
-    // 2. Constants
-    for node in &graph.node {
-        if node.op_type == "Constant"
-            && let Some(attr) = node.attribute.iter().find(|a| a.name == "value")
-            && let Some(t) = &attr.t
-        {
-            // Populate int64_map for INT64 types
-            if t.data_type == 7 || t.data_type == 6 {
-                // INT64 or INT32
-                if let Ok((data, dims)) = tensor_to_array(t) {
-                    let ints: Vec<i64> = data.iter().map(|&x| x as i64).collect();
-                    if let Some(out_name) = node.output.first() {
-                        int64_map.insert(out_name.clone(), (ints, dims));
-                    }
-                }
-            }
-
-            if let Ok((bytes, shape, data_type)) = crate::model::tensor_to_vec_u8(t)
-                && !bytes.is_empty()
-            {
-                // Compute content hash for deduplication
-                let hash = compute_hash(&bytes);
-
-                // Check if we already have identical weight content
-                if let Some(&(existing_offset, existing_len)) = content_hash_map.get(&hash) {
-                    // Reuse existing offset, but keep current weight's shape and dtype
-                    if let Some(out_name) = node.output.first() {
-                        offset_map.push((
-                            out_name.clone(),
-                            existing_offset,
-                            existing_len,
-                            shape,
-                            data_type,
-                        ));
-                    }
-                } else {
-                    // New weight: align, write, and record
-                    let remainder = *current_offset % 16;
-                    if remainder != 0 {
-                        let padding = 16 - remainder;
-                        bin_data.write_all(&vec![0u8; padding])?;
-                        *current_offset += padding;
-                    }
-
-                    bin_data.write_all(&bytes)?;
-                    if let Some(out_name) = node.output.first() {
-                        offset_map.push((
-                            out_name.clone(),
-                            *current_offset,
-                            bytes.len(),
-                            shape.clone(),
-                            data_type,
-                        ));
-                        content_hash_map.insert(hash, (*current_offset, bytes.len()));
-                        *current_offset += bytes.len();
-                    }
-                }
-            }
-        }
-        // 3. Recurse
-        for attr in &node.attribute {
-            if let Some(g) = &attr.g {
-                collect_weights(
-                    g,
-                    bin_data,
-                    offset_map,
-                    current_offset,
-                    int64_map,
-                    content_hash_map,
-                )?;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
