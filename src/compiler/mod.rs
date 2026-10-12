@@ -162,15 +162,20 @@ impl Compiler {
             int64: int64_map,
             ..
         } = weights::Weights::collect(&ir);
-        let graph_storage = ir.into_onnx();
-        let graph = &graph_storage;
-        let nodes: Vec<&NodeProto> = graph.node.iter().collect();
+        let (graph_inputs, graph_outputs) = (ir.input_infos(), ir.output_infos());
+        let (ids, protos) = lower_nodes(&ir);
+        let protos: Vec<&NodeProto> = protos.iter().collect();
+        let nodes = Nodes {
+            graph: &ir,
+            ids: &ids,
+            protos: &protos,
+        };
 
         let mut chunk_functions = Vec::new(); // Will hold the code for fn chunk_0(...) { ... }
         let mut body_buffer = Vec::new(); // Will hold the code for forward() body
         let mut current_id = 0;
         generate_partitioned_graph(
-            &nodes,
+            nodes,
             &mut chunk_functions,
             &mut body_buffer,
             2,
@@ -180,8 +185,8 @@ impl Compiler {
             Some(&analysis),
             &mut current_id,
             self,
-            &graph.input,
-            &graph.output,
+            &graph_inputs,
+            &graph_outputs,
             &var_types,
         )?;
         let body_str =
@@ -272,8 +277,7 @@ impl Compiler {
 
         // Inference Function
         writeln!(&mut code, "\n    // Inference Entry Point")?;
-        let args: Vec<String> = graph
-            .input
+        let args: Vec<String> = graph_inputs
             .iter()
             .map(|i| {
                 let name = sanitize_name(&i.name);
@@ -286,8 +290,7 @@ impl Compiler {
             })
             .collect();
         // Generate return type
-        let ret_types: Vec<String> = graph
-            .output
+        let ret_types: Vec<String> = graph_outputs
             .iter()
             .map(|o| {
                 let name = sanitize_name(&o.name);
@@ -316,8 +319,7 @@ impl Compiler {
             "        let mut ws = {}Workspace::new();",
             struct_name
         )?;
-        let arg_names_str = graph
-            .input
+        let arg_names_str = graph_inputs
             .iter()
             .map(|i| sanitize_name(&i.name))
             .collect::<Vec<_>>()
@@ -327,10 +329,10 @@ impl Compiler {
             "        let res = self.forward_with_workspace(&mut ws, {});",
             arg_names_str
         )?;
-        let ret_vals_owned: Vec<String> = if graph.output.len() == 1 {
+        let ret_vals_owned: Vec<String> = if graph_outputs.len() == 1 {
             vec!["res.to_owned()".to_string()]
         } else {
-            (0..graph.output.len())
+            (0..graph_outputs.len())
                 .map(|i| format!("res.{}.to_owned()", i))
                 .collect()
         };
@@ -353,8 +355,7 @@ impl Compiler {
         // Generate Body
         code.extend_from_slice(body_str.as_bytes());
         // Return outputs
-        let ret_vals: Vec<String> = graph
-            .output
+        let ret_vals: Vec<String> = graph_outputs
             .iter()
             .map(|o| {
                 let name = sanitize_name(&o.name);

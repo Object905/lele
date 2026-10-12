@@ -191,26 +191,36 @@ impl Graph {
                 Some(tensor)
             })
             .collect();
-        let name =
-            |v: &Option<ValueId>| v.map_or_else(String::new, |v| values[v.0 as usize].name.clone());
         let mut nodes = self.nodes;
         proto.node = self
             .order
             .iter()
             .filter_map(|id| nodes[id.0 as usize].take())
-            .map(|node| {
-                let mut p = node.proto;
-                p.op_type = node.op.op_type().to_string();
-                if let Op::Onnx { domain, .. } = &node.op {
-                    p.domain = domain.clone();
-                }
-                p.input = node.inputs.iter().map(name).collect();
-                p.output = node.outputs.iter().map(name).collect();
-                node.op.into_attrs(&mut p.attribute);
-                p
-            })
+            .map(|node| lower_node(node, &values))
             .collect();
         proto
+    }
+
+    /// `node` as the [`NodeProto`] [`Self::into_onnx`] would produce, its
+    /// subgraphs lowered too.
+    pub fn node_proto(&self, id: NodeId) -> NodeProto {
+        lower_node(self.node(id).clone(), &self.values)
+    }
+
+    /// Graph inputs as ONNX value infos.
+    pub fn input_infos(&self) -> Vec<ValueInfoProto> {
+        self.inputs
+            .iter()
+            .map(|&v| self.value_info_proto(v))
+            .collect()
+    }
+
+    /// Graph outputs as ONNX value infos.
+    pub fn output_infos(&self) -> Vec<ValueInfoProto> {
+        self.outputs
+            .iter()
+            .map(|&v| self.value_info_proto(v))
+            .collect()
     }
 
     /// Ids of the live nodes in execution order. A snapshot, so the graph can
@@ -584,6 +594,21 @@ impl Graph {
             ..Default::default()
         }
     }
+}
+
+/// Writes `node`'s operator, operands and modelled attributes into its proto.
+fn lower_node(node: Node, values: &[Value]) -> NodeProto {
+    let name =
+        |v: &Option<ValueId>| v.map_or_else(String::new, |v| values[v.0 as usize].name.clone());
+    let mut p = node.proto;
+    p.op_type = node.op.op_type().to_string();
+    if let Op::Onnx { domain, .. } = &node.op {
+        p.domain = domain.clone();
+    }
+    p.input = node.inputs.iter().map(name).collect();
+    p.output = node.outputs.iter().map(name).collect();
+    node.op.into_attrs(&mut p.attribute);
+    p
 }
 
 /// Appends the names `g` reads but does not define, i.e. those it captures

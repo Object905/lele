@@ -1,10 +1,15 @@
+use super::ir::{Graph, Node, NodeId};
 use super::{Allocator, AnalysisData, Compiler, sanitize_name};
 use crate::model::onnx_proto::{NodeProto, ValueInfoProto};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 pub(crate) struct OpContext<'a> {
+    /// The node, lowered.
     pub node: &'a NodeProto,
+    /// The graph holding the node, and its id there.
+    pub graph: &'a Graph,
+    pub id: NodeId,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub buf_expr: String,
@@ -23,6 +28,11 @@ pub(crate) struct OpContext<'a> {
 impl<'a> OpContext<'a> {
     pub fn tab(&self) -> String {
         "    ".repeat(self.indent)
+    }
+
+    /// The node in the IR.
+    pub fn ir(&self) -> &'a Node {
+        self.graph.node(self.id)
     }
 }
 
@@ -187,9 +197,39 @@ pub(crate) fn variable_types(g: &crate::compiler::ir::Graph) -> HashMap<String, 
     types
 }
 
+/// A run of nodes of one IR graph to generate code for, in execution order:
+/// their ids and their lowered protos, which overrides and patterns see.
+#[derive(Clone, Copy)]
+pub(crate) struct Nodes<'a> {
+    pub graph: &'a Graph,
+    pub ids: &'a [NodeId],
+    pub protos: &'a [&'a NodeProto],
+}
+
+impl<'a> Nodes<'a> {
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn slice(&self, range: std::ops::Range<usize>) -> Nodes<'a> {
+        Nodes {
+            graph: self.graph,
+            ids: &self.ids[range.clone()],
+            protos: &self.protos[range],
+        }
+    }
+}
+
+/// The ids and lowered protos of `g`'s nodes, for [`Nodes`].
+pub(crate) fn lower_nodes(g: &Graph) -> (Vec<NodeId>, Vec<NodeProto>) {
+    let ids = g.node_ids();
+    let protos = ids.iter().map(|&id| g.node_proto(id)).collect();
+    (ids, protos)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_partitioned_graph<W: Write>(
-    nodes: &[&NodeProto],           // Top level nodes
+    nodes: Nodes<'_>,               // Top level nodes
     chunk_writer: &mut Vec<String>, // Function definitions
     body_writer: &mut W,            // Forward body calls
     indent: usize,
@@ -215,7 +255,8 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
     }
     while i < total_nodes {
         let end = std::cmp::min(i + chunk_size, total_nodes);
-        let chunk_nodes = &nodes[i..end];
+        let chunk = nodes.slice(i..end);
+        let chunk_nodes = chunk.protos;
         let nodes_count = chunk_nodes.len();
         // 1. Identify Inputs: Used in chunk, defined BEFORE chunk (or global)
         let mut chunk_inputs_set = HashSet::new();
@@ -314,7 +355,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         )?;
         // Generate body
         generate_nodes(
-            chunk_nodes,
+            chunk,
             &mut f,
             2,
             known_weights,
@@ -431,7 +472,7 @@ fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_nodes(
-    nodes: &[&NodeProto],
+    ir_nodes: Nodes<'_>,
     w: &mut dyn Write,
     indent: usize,
     known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
@@ -443,6 +484,7 @@ pub(crate) fn generate_nodes(
     var_types: &HashMap<String, String>,
 ) -> std::io::Result<()> {
     let tab = "    ".repeat(indent);
+    let nodes = ir_nodes.protos;
     let mut idx = 0;
     while idx < nodes.len() {
         // Try to match patterns first
@@ -463,6 +505,7 @@ pub(crate) fn generate_nodes(
             continue;
         }
         let node = nodes[idx];
+        let id = ir_nodes.ids[idx];
         idx += 1;
         *current_id += 1;
         let op = node.op_type.as_str();
@@ -591,6 +634,8 @@ pub(crate) fn generate_nodes(
         }
         let mut ctx = OpContext {
             node,
+            graph: ir_nodes.graph,
+            id,
             inputs: inputs.clone(),
             outputs: outputs.clone(),
             buf_expr,
@@ -671,6 +716,41 @@ mod tests {
         }
     }
 
+    /// Code generated for `node` alone.
+    fn generate_one(
+        node: &NodeProto,
+        known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
+        compiler: &Compiler,
+        var_types: &HashMap<String, String>,
+    ) -> String {
+        let g = Graph::from_onnx(crate::model::onnx_proto::GraphProto {
+            node: vec![node.clone()],
+            ..Default::default()
+        });
+        let (ids, protos) = lower_nodes(&g);
+        let protos: Vec<&NodeProto> = protos.iter().collect();
+        let nodes = Nodes {
+            graph: &g,
+            ids: &ids,
+            protos: &protos,
+        };
+        let mut output = Vec::new();
+        generate_nodes(
+            nodes,
+            &mut output,
+            0,
+            known_weights,
+            &HashMap::new(),
+            None,
+            None,
+            &mut 0,
+            compiler,
+            var_types,
+        )
+        .unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
     #[test]
     fn test_custom_op_override() {
         let mut compiler = Compiler::new();
@@ -691,27 +771,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut output = Vec::new();
-        let mut current_id = 0;
-        let known_weights = HashMap::new();
-        let int64_map = HashMap::new();
-        let var_types = HashMap::new();
-
-        generate_nodes(
-            &[&node],
-            &mut output,
-            0,
-            &known_weights,
-            &int64_map,
-            None,
-            None,
-            &mut current_id,
-            &compiler,
-            &var_types,
-        )
-        .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
+        let result = generate_one(&node, &HashMap::new(), &compiler, &HashMap::new());
         assert!(result.contains("// Custom implementation for output1"));
         assert!(result.contains("let output1 = custom_kernel(&input1);"));
     }
@@ -746,25 +806,10 @@ mod tests {
         let mut known_weights = HashMap::new();
         known_weights.insert("k".to_string(), (0, 8, vec![1], 7));
         known_weights.insert("classes".to_string(), (8, 8, vec![], 7));
-        let int64_map = HashMap::new();
         assert_eq!(var_types["indices"], "f32");
         assert_eq!(var_types["anchor"], "f32");
 
-        let mut output = Vec::new();
-        generate_nodes(
-            &[&div],
-            &mut output,
-            0,
-            &known_weights,
-            &int64_map,
-            None,
-            None,
-            &mut 0,
-            &Compiler::new(),
-            &var_types,
-        )
-        .unwrap();
-        let result = String::from_utf8(output).unwrap();
+        let result = generate_one(&div, &known_weights, &Compiler::new(), &var_types);
         assert!(
             result.contains(
                 "let anchor = lele::kernels::div_trunc(&indices, &self.weight_i64_f32(8, 8, &[]), &mut buf_anchor);"
@@ -783,27 +828,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut output = Vec::new();
-        let mut current_id = 0;
-        let known_weights = HashMap::new();
-        let int64_map = HashMap::new();
-        let var_types = HashMap::new();
-
-        generate_nodes(
-            &[&node],
-            &mut output,
-            0,
-            &known_weights,
-            &int64_map,
-            None,
-            None,
-            &mut current_id,
-            &compiler,
-            &var_types,
-        )
-        .unwrap();
-
-        let result = String::from_utf8(output).unwrap();
+        let result = generate_one(&node, &HashMap::new(), &compiler, &HashMap::new());
         assert!(result.contains("let mut buf_c = Vec::<f32>::new();"));
         assert!(result.contains("let c = lele::kernels::add(&a, &b, &mut buf_c);"));
     }
