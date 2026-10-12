@@ -1,6 +1,6 @@
 //! Element type inference.
 
-use crate::compiler::ir::{DType, Graph, Op};
+use crate::compiler::ir::{DType, Graph, Op, Unary};
 use std::collections::HashMap;
 
 /// Sets the element type of every value of `g` and its subgraphs whose type
@@ -66,32 +66,22 @@ pub(crate) fn follows_input(op: &Op, i: usize) -> Option<usize> {
         | Op::Constant { .. }
         | Op::ConstantOfShape { .. }
         | Op::ConvInteger(_)
+        | Op::DynamicQuantizeLinear
         | Op::EmbeddingConcat { .. }
+        | Op::MatMulInteger
         | Op::Shape { .. }
+        | Op::Size
+        | Op::Unary(Unary::Not)
         | Op::QuantizeLinear(_)
         | Op::DequantizeLinear(_)
         | Op::QLinearMatMulI8
         | Op::QLinearDynamic { .. }
         | Op::If { .. }
         | Op::Loop { .. } => None,
+        Op::Binary(binary) if binary.is_predicate() => None,
+        Op::Where => Some(1),
         Op::Onnx { op_type, .. } => match op_type.as_str() {
-            "Size"
-            | "ArgMin"
-            | "NonZero"
-            | "Equal"
-            | "Less"
-            | "LessOrEqual"
-            | "Greater"
-            | "GreaterOrEqual"
-            | "And"
-            | "Or"
-            | "Xor"
-            | "Not"
-            | "IsNaN"
-            | "IsInf"
-            | "MatMulInteger"
-            | "DynamicQuantizeLinear" => None,
-            "Where" => Some(1),
+            "ArgMin" | "NonZero" | "IsNaN" | "IsInf" => None,
             _ => Some(0),
         },
         _ => Some(0),
@@ -109,8 +99,10 @@ fn output_dtype(op: &Op, i: usize, input: &dyn Fn(usize) -> DType) -> DType {
         Op::Cast { to } => *to,
         Op::Constant { value } => DType::from_onnx(value.data_type),
         Op::ConstantOfShape { value } | Op::EmbeddingConcat { value } => tensor_type(value),
-        Op::Shape { .. } | Op::ArgMax { .. } | Op::TopK { .. } => I64,
-        Op::ConvInteger(_) => I32,
+        Op::Shape { .. } | Op::Size | Op::ArgMax { .. } | Op::TopK { .. } => I64,
+        Op::ConvInteger(_) | Op::MatMulInteger => I32,
+        Op::DynamicQuantizeLinear => [U8, F32, U8].get(i).copied().unwrap_or(Undefined),
+        Op::Binary(_) | Op::Unary(Unary::Not) => Bool,
         Op::QuantizeLinear(attrs) => attrs.output_dtype.unwrap_or(match input(2) {
             Undefined => U8,
             t => t,
@@ -125,10 +117,7 @@ fn output_dtype(op: &Op, i: usize, input: &dyn Fn(usize) -> DType) -> DType {
             .get(i + 1)
             .map_or(Undefined, |&v| body.value(v).dtype),
         Op::Onnx { op_type, .. } => match op_type.as_str() {
-            "MatMulInteger" => I32,
-            "DynamicQuantizeLinear" => [U8, F32, U8].get(i).copied().unwrap_or(Undefined),
-            "Equal" | "Less" | "LessOrEqual" | "Greater" | "GreaterOrEqual" | "And" | "Or"
-            | "Xor" | "Not" | "IsNaN" | "IsInf" => Bool,
+            "IsNaN" | "IsInf" => Bool,
             _ => I64,
         },
         _ => F32,

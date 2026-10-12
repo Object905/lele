@@ -58,18 +58,14 @@ fn compute_same_pads(
     Some(vec![pad_top, pad_left, pad_bottom, pad_right])
 }
 
-pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
-    let op = ctx.node.op_type.as_str();
+pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<()> {
     let tab = ctx.tab();
     let inputs = &ctx.inputs;
     let outputs = &ctx.outputs;
     let buf_expr = &ctx.buf_expr;
 
-    match op {
-        "Conv" => {
-            let Op::Conv(conv) = &ctx.ir().op else {
-                return Ok(false);
-            };
+    match &ctx.ir().op {
+        Op::Conv(conv) => {
             let dilations = conv.dilations.clone().unwrap_or_default();
             let group = conv.group.unwrap_or(1);
             let auto_pad = conv.auto_pad.as_deref().unwrap_or("NOTSET");
@@ -116,16 +112,12 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 buf_expr
             )?;
         }
-        "Gemm" => {
-            let Op::Gemm {
-                alpha,
-                beta,
-                trans_a,
-                trans_b,
-            } = ctx.ir().op
-            else {
-                return Ok(false);
-            };
+        Op::Gemm {
+            alpha,
+            beta,
+            trans_a,
+            trans_b,
+        } => {
             let c = if inputs.len() > 2 && !inputs[2].is_empty() {
                 format!("Some(&{})", inputs[2])
             } else {
@@ -137,7 +129,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 tab, outputs[0], inputs[0], inputs[1], c, alpha, beta, trans_a, trans_b, buf_expr
             )?;
         }
-        "LSTM" => {
+        Op::Lstm => {
             let bias = if inputs.len() > 3 && !ctx.node.input[3].is_empty() {
                 format!("Some(&{})", inputs[3])
             } else {
@@ -187,7 +179,9 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 outputs[0]
             )?;
         }
-        "GRU" => {
+        Op::Gru {
+            linear_before_reset,
+        } => {
             let bias = if inputs.len() > 3 && !ctx.node.input[3].is_empty() {
                 format!("Some(&{})", inputs[3])
             } else {
@@ -197,12 +191,6 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 format!("Some(&{})", inputs[5])
             } else {
                 "None".to_string()
-            };
-            let Op::Gru {
-                linear_before_reset,
-            } = ctx.ir().op
-            else {
-                return Ok(false);
             };
             writeln!(
                 w,
@@ -244,10 +232,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 )?;
             }
         }
-        "LayerNormalization" => {
-            let Op::LayerNormalization { axis, epsilon } = ctx.ir().op else {
-                return Ok(false);
-            };
+        Op::LayerNormalization { axis, epsilon } => {
             let scale = if ctx.node.input.len() > 1
                 && !ctx.node.input[1].is_empty()
                 && !inputs[1].is_empty()
@@ -290,10 +275,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 )?;
             }
         }
-        "ConvInteger" => {
-            let Op::ConvInteger(conv) = &ctx.ir().op else {
-                return Ok(false);
-            };
+        Op::ConvInteger(conv) => {
             let dilations = conv.dilations.clone().unwrap_or_default();
             let group = conv.group.unwrap_or(1);
             let pads = conv.pads.clone().unwrap_or_default();
@@ -349,10 +331,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 )?,
             }
         }
-        "BatchNormalization" => {
-            let Op::BatchNormalization { epsilon } = ctx.ir().op else {
-                return Ok(false);
-            };
+        Op::BatchNormalization { epsilon } => {
             writeln!(
                 w,
                 "{}let {} = lele::kernels::batch_norm(&{}, &{}, &{}, &{}, &{}, {:?}, {});",
@@ -367,10 +346,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 buf_expr
             )?;
         }
-        "MaxPool" => {
-            let Op::MaxPool(pool) = &ctx.ir().op else {
-                return Ok(false);
-            };
+        Op::MaxPool(pool) => {
             let kernel_shape = pool.kernel_shape.clone().unwrap_or_default();
             let strides = pool.strides.clone().unwrap_or_default();
             let auto_pad = pool.auto_pad.as_deref().unwrap_or("NOTSET");
@@ -395,16 +371,12 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 buf_expr
             )?;
         }
-        "Resize" => {
+        Op::Resize {
+            coordinate_transformation_mode,
+            ..
+        } => {
             // ONNX Resize op: inputs are [X, roi, scales] or [X, roi, scales, sizes]
             // For YOLO, we use scales mode with nearest interpolation
-            let Op::Resize {
-                coordinate_transformation_mode,
-                ..
-            } = &ctx.ir().op
-            else {
-                return Ok(false);
-            };
             let coord_transform = coordinate_transformation_mode
                 .as_deref()
                 .unwrap_or("half_pixel");
@@ -430,21 +402,17 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 panic!("Resize: neither scales nor sizes provided");
             }
         }
-        "GlobalAveragePool" => {
+        Op::GlobalAveragePool => {
             writeln!(
                 w,
                 "{}let {} = lele::kernels::global_average_pool(&{}, {});",
                 tab, outputs[0], inputs[0], buf_expr
             )?;
         }
-        "AveragePool" => {
-            let Op::AveragePool {
-                pool,
-                count_include_pad,
-            } = &ctx.ir().op
-            else {
-                return Ok(false);
-            };
+        Op::AveragePool {
+            pool,
+            count_include_pad,
+        } => {
             let kernel_shape = pool.kernel_shape.clone().unwrap_or_default();
             let strides = pool.strides.clone().unwrap_or_default();
             let pads = pool.pads.clone().unwrap_or_default();
@@ -461,10 +429,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 buf_expr
             )?;
         }
-        "ConvTranspose" => {
-            let Op::ConvTranspose(conv) = &ctx.ir().op else {
-                return Ok(false);
-            };
+        Op::ConvTranspose(conv) => {
             let dilations = conv.dilations.clone().unwrap_or_default();
             let group = conv.group.unwrap_or(1);
             let pads = conv.pads.clone().unwrap_or_default();
@@ -489,7 +454,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 buf_expr
             )?;
         }
-        _ => return Ok(false),
+        op => unreachable!("{} is not a neural network operator", op.op_type()),
     }
-    Ok(true)
+    Ok(())
 }

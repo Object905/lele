@@ -186,36 +186,102 @@ impl Activation {
     }
 }
 
-/// Reduction of a `Reduce*` operator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reduction {
-    L2,
-    Max,
-    Mean,
-    Prod,
-    Sum,
+/// An enum of operators sharing one [`Op`] variant, each named by its
+/// `op_type`.
+macro_rules! op_kinds {
+    ($(#[$meta:meta])* $name:ident { $($kind:ident = $op_type:literal,)* }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum $name {
+            $($kind,)*
+        }
+
+        impl $name {
+            fn from_op_type(op_type: &str) -> Option<Self> {
+                match op_type {
+                    $($op_type => Some(Self::$kind),)*
+                    _ => None,
+                }
+            }
+
+            pub fn op_type(self) -> &'static str {
+                match self {
+                    $(Self::$kind => $op_type,)*
+                }
+            }
+        }
+    };
 }
 
-impl Reduction {
-    fn from_op_type(op_type: &str) -> Option<Self> {
-        Some(match op_type {
-            "ReduceL2" => Self::L2,
-            "ReduceMax" => Self::Max,
-            "ReduceMean" => Self::Mean,
-            "ReduceProd" => Self::Prod,
-            "ReduceSum" => Self::Sum,
-            _ => return None,
-        })
+op_kinds! {
+    /// Reduction of a `Reduce*` operator.
+    Reduction {
+        L2 = "ReduceL2",
+        Max = "ReduceMax",
+        Mean = "ReduceMean",
+        Prod = "ReduceProd",
+        Sum = "ReduceSum",
     }
+}
 
-    pub fn op_type(self) -> &'static str {
-        match self {
-            Self::L2 => "ReduceL2",
-            Self::Max => "ReduceMax",
-            Self::Mean => "ReduceMean",
-            Self::Prod => "ReduceProd",
-            Self::Sum => "ReduceSum",
-        }
+op_kinds! {
+    /// Elementwise operator of one operand, without attributes.
+    Unary {
+        Ceil = "Ceil",
+        Cos = "Cos",
+        Erf = "Erf",
+        Exp = "Exp",
+        Floor = "Floor",
+        Log = "Log",
+        Neg = "Neg",
+        Not = "Not",
+        Reciprocal = "Reciprocal",
+        Relu = "Relu",
+        Round = "Round",
+        Sigmoid = "Sigmoid",
+        Sin = "Sin",
+        Softplus = "Softplus",
+        Sqrt = "Sqrt",
+        Tanh = "Tanh",
+    }
+}
+
+op_kinds! {
+    /// Elementwise operator of two broadcast operands, without attributes.
+    /// `Mod`'s `fmod` attribute stays in the proto.
+    Binary {
+        Add = "Add",
+        And = "And",
+        Div = "Div",
+        Equal = "Equal",
+        Greater = "Greater",
+        GreaterOrEqual = "GreaterOrEqual",
+        Less = "Less",
+        LessOrEqual = "LessOrEqual",
+        Mod = "Mod",
+        Mul = "Mul",
+        Or = "Or",
+        Pow = "Pow",
+        PRelu = "PRelu",
+        Sub = "Sub",
+        Xor = "Xor",
+    }
+}
+
+impl Binary {
+    /// Whether the operator yields booleans.
+    pub fn is_predicate(self) -> bool {
+        matches!(
+            self,
+            Self::And
+                | Self::Equal
+                | Self::Greater
+                | Self::GreaterOrEqual
+                | Self::Less
+                | Self::LessOrEqual
+                | Self::Or
+                | Self::Xor
+        )
     }
 }
 
@@ -240,9 +306,13 @@ pub enum Op {
     BatchNormalization {
         epsilon: f32,
     },
+    Binary(Binary),
     Cast {
         to: DType,
     },
+    /// Opset 11+ form, bounds are operands. The opset 6 attributes stay in
+    /// the proto.
+    Clip,
     Concat {
         axis: i64,
     },
@@ -263,9 +333,11 @@ pub enum Op {
         exclusive: bool,
         reverse: bool,
     },
+    DynamicQuantizeLinear,
     Einsum {
         equation: String,
     },
+    Expand,
     Flatten {
         axis: i64,
     },
@@ -285,6 +357,7 @@ pub enum Op {
         trans_a: bool,
         trans_b: bool,
     },
+    GlobalAveragePool,
     /// The other attributes (`hidden_size`, `direction`, ...) stay in the
     /// proto.
     Gru {
@@ -294,6 +367,7 @@ pub enum Op {
         alpha: f32,
         beta: f32,
     },
+    Identity,
     LayerNormalization {
         axis: i64,
         epsilon: f32,
@@ -306,7 +380,12 @@ pub enum Op {
         /// Absent means 1 before opset 13 and -1 from opset 13.
         axis: Option<i64>,
     },
+    /// Its attributes (`hidden_size`, `direction`, ...) stay in the proto.
+    Lstm,
     MatMul,
+    MatMulInteger,
+    /// Elementwise maximum of any number of operands.
+    Max,
     /// `storage_order` stays in the proto.
     MaxPool(PoolAttrs),
     Pad {
@@ -315,6 +394,7 @@ pub enum Op {
     },
     QuantizeLinear(QuantAttrs),
     DequantizeLinear(QuantAttrs),
+    Range,
     /// `ReduceL2`, `ReduceMax`, `ReduceMean`, `ReduceProd` and `ReduceSum`.
     /// `noop_with_empty_axes` stays in the proto.
     Reduce {
@@ -324,6 +404,8 @@ pub enum Op {
         axes: Option<Vec<i64>>,
         keepdims: bool,
     },
+    /// `allowzero` stays in the proto.
+    Reshape,
     /// The other attributes (`cubic_coeff_a`, `antialias`, ...) stay in the
     /// proto.
     Resize {
@@ -338,6 +420,7 @@ pub enum Op {
         start: Option<i64>,
         end: Option<i64>,
     },
+    Size,
     /// Opset 10+ form, all parameters are operands. The opset 1 attributes
     /// stay in the proto.
     Slice,
@@ -355,6 +438,9 @@ pub enum Op {
         /// Opset 1-12 attribute; later opsets take the axes as an operand.
         axes: Option<Vec<i64>>,
     },
+    /// `onesided` stays in the proto.
+    Stft,
+    Tile,
     TopK {
         axis: i64,
         largest: bool,
@@ -364,10 +450,12 @@ pub enum Op {
         /// Absent means reversing the axes.
         perm: Option<Vec<i64>>,
     },
+    Unary(Unary),
     Unsqueeze {
         /// Opset 1-12 attribute; later opsets take the axes as an operand.
         axes: Option<Vec<i64>>,
     },
+    Where,
     If {
         then_branch: Box<Graph>,
         else_branch: Box<Graph>,
@@ -438,7 +526,27 @@ impl Op {
                 keepdims: attr_i(node, "keepdims").unwrap_or(1) != 0,
             };
         }
+        if let Some(unary) = Unary::from_op_type(&node.op_type) {
+            return Op::Unary(unary);
+        }
+        if let Some(binary) = Binary::from_op_type(&node.op_type) {
+            return Op::Binary(binary);
+        }
         match node.op_type.as_str() {
+            "Clip" => Op::Clip,
+            "DynamicQuantizeLinear" => Op::DynamicQuantizeLinear,
+            "Expand" => Op::Expand,
+            "GlobalAveragePool" => Op::GlobalAveragePool,
+            "Identity" => Op::Identity,
+            "LSTM" => Op::Lstm,
+            "MatMulInteger" => Op::MatMulInteger,
+            "Max" => Op::Max,
+            "Range" => Op::Range,
+            "Reshape" => Op::Reshape,
+            "Size" => Op::Size,
+            "STFT" => Op::Stft,
+            "Tile" => Op::Tile,
+            "Where" => Op::Where,
             "ArgMax" => Op::ArgMax {
                 axis: attr_i(node, "axis").unwrap_or(0),
                 keepdims: attr_i(node, "keepdims").unwrap_or(1) != 0,
@@ -573,7 +681,23 @@ impl Op {
             Op::ArgMax { .. } => "ArgMax",
             Op::AveragePool { .. } => "AveragePool",
             Op::BatchNormalization { .. } => "BatchNormalization",
+            Op::Binary(binary) => binary.op_type(),
             Op::Cast { .. } => "Cast",
+            Op::Clip => "Clip",
+            Op::DynamicQuantizeLinear => "DynamicQuantizeLinear",
+            Op::Expand => "Expand",
+            Op::GlobalAveragePool => "GlobalAveragePool",
+            Op::Identity => "Identity",
+            Op::Lstm => "LSTM",
+            Op::MatMulInteger => "MatMulInteger",
+            Op::Max => "Max",
+            Op::Range => "Range",
+            Op::Reshape => "Reshape",
+            Op::Size => "Size",
+            Op::Stft => "STFT",
+            Op::Tile => "Tile",
+            Op::Unary(unary) => unary.op_type(),
+            Op::Where => "Where",
             Op::Concat { .. } => "Concat",
             Op::Constant { .. } => "Constant",
             Op::ConstantOfShape { .. } => "ConstantOfShape",
@@ -775,7 +899,27 @@ impl Op {
                     set_attr_g(attrs, &name, g);
                 }
             }
-            Op::MatMul | Op::Slice | Op::QLinearMatMulI8 | Op::Silu | Op::Linear => {}
+            Op::Binary(_)
+            | Op::Clip
+            | Op::DynamicQuantizeLinear
+            | Op::Expand
+            | Op::GlobalAveragePool
+            | Op::Identity
+            | Op::Lstm
+            | Op::MatMul
+            | Op::MatMulInteger
+            | Op::Max
+            | Op::Range
+            | Op::Reshape
+            | Op::Size
+            | Op::Slice
+            | Op::Stft
+            | Op::Tile
+            | Op::Unary(_)
+            | Op::Where
+            | Op::QLinearMatMulI8
+            | Op::Silu
+            | Op::Linear => {}
         }
     }
 }

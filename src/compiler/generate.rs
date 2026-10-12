@@ -1,4 +1,4 @@
-use super::ir::{DType, Graph, Node, NodeId, Op};
+use super::ir::{Binary, DType, Graph, Node, NodeId, Op};
 use super::weights::{WeightRef, Weights};
 use super::{Allocator, AnalysisData, Compiler, sanitize_name};
 use crate::model::onnx_proto::{NodeProto, ValueInfoProto};
@@ -194,13 +194,13 @@ pub(crate) fn variable_types(g: &Graph) -> VarTypes {
             }
             for (i, v) in node.outputs().iter().enumerate() {
                 let Some(v) = *v else { continue };
-                let f32_kernel = match &node.op {
-                    Op::Onnx { op_type, .. } => {
-                        matches!(op_type.as_str(), "MatMulInteger" | "Mod")
-                    }
-                    Op::ConvInteger(_) | Op::TopK { .. } => true,
-                    _ => false,
-                };
+                let f32_kernel = matches!(
+                    node.op,
+                    Op::Binary(Binary::Mod)
+                        | Op::ConvInteger(_)
+                        | Op::MatMulInteger
+                        | Op::TopK { .. }
+                );
                 // If and Loop take the representation of their subgraphs'
                 // outputs.
                 let from_subgraph = |sub: &Graph, j: usize, reprs: &HashMap<String, ElemType>| {
@@ -529,14 +529,19 @@ pub(crate) fn generate_nodes(
         idx += 1;
         *current_id += 1;
         let op = node.op_type.as_str();
+        let ir_op = &ir_nodes.graph.node(id).op;
         let outputs: Vec<String> = node.output.iter().map(|s| sanitize_name(s)).collect();
         // Skip Code Generation for Constants that are already in weights
-        if op == "Constant" && !outputs.is_empty() && weights.get(&node.output[0]).is_some() {
+        if matches!(ir_op, Op::Constant { .. })
+            && !outputs.is_empty()
+            && weights.get(&node.output[0]).is_some()
+        {
             continue;
         }
         // Check if Div/Mod output is i64 (e.g. integer division for shape computation)
+        let div_or_mod = matches!(ir_op, Op::Binary(Binary::Div | Binary::Mod));
         let div_mod_output_is_i64 =
-            matches!(op, "Div" | "Mod") && outputs.first().is_some_and(|o| var_types.is_i64(o));
+            div_or_mod && outputs.first().is_some_and(|o| var_types.is_i64(o));
         let inputs: Vec<String> = node
             .input
             .iter()
@@ -545,7 +550,7 @@ pub(crate) fn generate_nodes(
                 if let Some(weight) = weights.get(s) {
                     // For Div/Mod: only force f32 when output is NOT i64.
                     // When output is i64 (integer division), keep i64 types.
-                    let force_f32 = matches!(op, "Div" | "Mod") && !div_mod_output_is_i64;
+                    let force_f32 = div_or_mod && !div_mod_output_is_i64;
                     let target = if force_f32 {
                         ElemType::F32
                     } else {
@@ -559,7 +564,7 @@ pub(crate) fn generate_nodes(
             .collect();
         // Unused check
         let is_unused = if let Some(an) = analysis {
-            if op == "If" || op == "Loop" {
+            if matches!(ir_op, Op::If { .. } | Op::Loop { .. }) {
                 false
             }
             // Conservative for control flow
@@ -582,7 +587,7 @@ pub(crate) fn generate_nodes(
         }
         // For Div and Mod operations, force f32 type for output ONLY when output is not i64.
         // When output is i64 (integer division for shape computation), keep i64.
-        let force_f32 = matches!(op, "Div" | "Mod") && !div_mod_output_is_i64;
+        let force_f32 = div_or_mod && !div_mod_output_is_i64;
         let is_i64 = !force_f32 && outputs.first().is_some_and(|o| var_types.is_i64(o));
         let buf_expr = if let Some(alloc) = allocator {
             if !node.output.is_empty() {
@@ -616,7 +621,10 @@ pub(crate) fn generate_nodes(
             // Built-in handlers might not need Vec<f32> if they don't use buf_expr,
             // but we'll generate it by default if expected.
             // Some ops like Split/LSTM manage their own buffers.
-            if op != "DynamicQuantizeLinear" && op != "LSTM" && op != "Split" {
+            if !matches!(
+                ir_op,
+                Op::DynamicQuantizeLinear | Op::Lstm | Op::Split { .. }
+            ) {
                 writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
             }
         }

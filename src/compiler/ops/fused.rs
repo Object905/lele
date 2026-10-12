@@ -19,7 +19,7 @@ impl ConvAttrs {
     }
 }
 
-pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
+pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<()> {
     let tab = ctx.tab();
     let (inputs, outputs, buf) = (&ctx.inputs, &ctx.outputs, &ctx.buf_expr);
     match &ctx.ir().op {
@@ -70,7 +70,7 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                     ints(&conv.pads, &[0, 0, 0, 0]),
                     ints(&conv.strides, &[1, 1]),
                 )?;
-                return Ok(true);
+                return Ok(());
             }
             let strides = ConvAttrs::per_axis(&conv.strides);
             let dilations = ConvAttrs::per_axis(&conv.dilations);
@@ -182,7 +182,7 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                 }
             }
         }
-        _ => return Ok(false),
+        op => unreachable!("{} is not a fused operator", op.op_type()),
     }
-    Ok(true)
+    Ok(())
 }
