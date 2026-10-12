@@ -1,4 +1,5 @@
 use super::super::generate::OpContext;
+use super::super::ir::{Op, Reduction};
 use super::super::sanitize_name;
 use std::io::Write;
 
@@ -280,96 +281,46 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             "{}let {} = lele::kernels::prelu(&{}, &{}, {});",
             tab, outputs[0], inputs[0], inputs[1], buf_expr
         )?,
-        "ReduceSum" | "ReduceProd" | "ReduceMax" => {
-            let kernel = match op {
-                "ReduceSum" => "reduce_sum",
-                "ReduceProd" => "reduce_prod",
-                _ => "reduce_max",
+        "ReduceSum" | "ReduceProd" | "ReduceMax" | "ReduceMean" | "ReduceL2" => {
+            let Op::Reduce {
+                reduction,
+                axes,
+                keepdims,
+            } = &ctx.ir().op
+            else {
+                return Ok(false);
             };
-            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                if let Some(ints) = ctx.ints(1) {
-                    format!("&{:?}", ints)
-                } else {
-                    format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
+            let attr_axes = format!("&{:?}", axes.as_deref().unwrap_or_default());
+            let axes = match reduction {
+                // These kernels take computed axes too.
+                Reduction::Sum | Reduction::Prod | Reduction::Max => {
+                    if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
+                        match ctx.ints(1) {
+                            Some(ints) => format!("&{:?}", ints),
+                            None => format!("&lele::kernels::to_i64_vec(&{})", inputs[1]),
+                        }
+                    } else {
+                        attr_axes
+                    }
                 }
-            } else {
-                let axes_attr = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "axes")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or(vec![]);
-                format!("&{:?}", axes_attr)
+                Reduction::Mean | Reduction::L2 => match ctx.ints(1) {
+                    Some(ints) if axes.as_ref().is_none_or(|a| a.is_empty()) => {
+                        format!("&{:?}", ints)
+                    }
+                    _ => attr_axes,
+                },
             };
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
+            let kernel = match reduction {
+                Reduction::L2 => "reduce_l2",
+                Reduction::Max => "reduce_max",
+                Reduction::Mean => "reduce_mean",
+                Reduction::Prod => "reduce_prod",
+                Reduction::Sum => "reduce_sum",
+            };
             writeln!(
                 w,
                 "{}let {} = lele::kernels::{}(&{}, {}, {}, {});",
                 tab, outputs[0], kernel, inputs[0], axes, keepdims, buf_expr
-            )?;
-        }
-        "ReduceMean" => {
-            let mut axes = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axes")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            // If axes attribute is empty, check second input
-            if axes.is_empty()
-                && let Some(data) = ctx.ints(1)
-            {
-                axes = data.to_vec();
-            }
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::reduce_mean(&{}, &{:?}, {}, {});",
-                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
-            )?;
-        }
-        "ReduceL2" => {
-            let mut axes = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axes")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
-            // If axes attribute is empty, check second input
-            if axes.is_empty()
-                && let Some(data) = ctx.ints(1)
-            {
-                axes = data.to_vec();
-            }
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::reduce_l2(&{}, &{:?}, {}, {});",
-                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
             )?;
         }
         "Max" => {

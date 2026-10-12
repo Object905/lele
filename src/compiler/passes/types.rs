@@ -60,7 +60,9 @@ fn infer_graph(g: &mut Graph, outer: &Scope) {
 /// output type is that of an input.
 pub(crate) fn follows_input(op: &Op, i: usize) -> Option<usize> {
     match op {
-        Op::Cast { .. }
+        Op::TopK { .. } if i == 1 => None,
+        Op::ArgMax { .. }
+        | Op::Cast { .. }
         | Op::Constant { .. }
         | Op::ConstantOfShape { .. }
         | Op::EmbeddingConcat { .. }
@@ -73,7 +75,6 @@ pub(crate) fn follows_input(op: &Op, i: usize) -> Option<usize> {
         | Op::Loop { .. } => None,
         Op::Onnx { op_type, .. } => match op_type.as_str() {
             "Size"
-            | "ArgMax"
             | "ArgMin"
             | "NonZero"
             | "Equal"
@@ -90,7 +91,6 @@ pub(crate) fn follows_input(op: &Op, i: usize) -> Option<usize> {
             | "MatMulInteger"
             | "ConvInteger"
             | "DynamicQuantizeLinear" => None,
-            "TopK" if i == 1 => None,
             "Where" => Some(1),
             _ => Some(0),
         },
@@ -109,7 +109,7 @@ fn output_dtype(op: &Op, i: usize, input: &dyn Fn(usize) -> DType) -> DType {
         Op::Cast { to } => *to,
         Op::Constant { value } => DType::from_onnx(value.data_type),
         Op::ConstantOfShape { value } | Op::EmbeddingConcat { value } => tensor_type(value),
-        Op::Shape { .. } => I64,
+        Op::Shape { .. } | Op::ArgMax { .. } | Op::TopK { .. } => I64,
         Op::QuantizeLinear(attrs) => attrs.output_dtype.unwrap_or(match input(2) {
             Undefined => U8,
             t => t,

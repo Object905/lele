@@ -166,11 +166,9 @@ pub(crate) fn variable_types(g: &crate::compiler::ir::Graph) -> HashMap<String, 
                 let Some(v) = *v else { continue };
                 let f32_kernel = match &node.op {
                     Op::Onnx { op_type, .. } => {
-                        matches!(
-                            op_type.as_str(),
-                            "MatMulInteger" | "ConvInteger" | "TopK" | "Mod"
-                        )
+                        matches!(op_type.as_str(), "MatMulInteger" | "ConvInteger" | "Mod")
                     }
+                    Op::TopK { .. } => true,
                     _ => false,
                 };
                 // If and Loop take the representation of their subgraphs'

@@ -90,12 +90,14 @@ fn named_after(g: &Graph, id: NodeId) -> NodeProto {
 fn fuse_layer_norm(g: &mut Graph) {
     let reduces_last_axis = |g: &Graph, id: NodeId| {
         let node = g.node(id);
-        let attr = |name: &str| node.proto.attribute.iter().find(|a| a.name == name);
-        let axes = match attr("axes") {
-            Some(a) => Some(a.ints.iter().map(|&x| x as f32).collect()),
+        let Op::Reduce { axes, keepdims, .. } = &node.op else {
+            return false;
+        };
+        let axes = match axes {
+            Some(axes) => Some(axes.iter().map(|&x| x as f32).collect()),
             None => constant(g, node.input(1)),
         };
-        axes.as_deref() == Some(&[-1.0]) && attr("keepdims").is_none_or(|a| a.i == 1)
+        axes.as_deref() == Some(&[-1.0]) && *keepdims
     };
     for add in binary_nodes(g, "Add") {
         if !g.contains(add) {

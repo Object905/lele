@@ -71,13 +71,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
 
     match op {
         "Transpose" => {
-            let perm = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "perm")
-                .map(|a| a.ints.clone())
-                .unwrap_or(vec![]);
+            let Op::Transpose { perm } = &ctx.ir().op else {
+                return Ok(false);
+            };
+            let perm = perm.as_deref().unwrap_or_default();
             writeln!(
                 w,
                 "{}let {} = lele::kernels::transpose(&{}, &{:?}, {});",
@@ -111,13 +108,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
         "Flatten" => {
             // Flatten: reshape to 2D [batch_size, -1]
             // axis parameter determines where to flatten (default is 1)
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(1) as usize;
+            let Op::Flatten { axis } = ctx.ir().op else {
+                return Ok(false);
+            };
+            let axis = axis as usize;
             writeln!(
                 w,
                 "{}let {} = lele::kernels::flatten(&{}, {});",
@@ -172,13 +166,9 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "Gather" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(0);
+            let Op::Gather { axis } = ctx.ir().op else {
+                return Ok(false);
+            };
             writeln!(
                 w,
                 "{}let {} = lele::kernels::gather(&{}, &{}, {}, {});",
@@ -330,27 +320,15 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "Split" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(0);
+            let Op::Split { axis, split } = &ctx.ir().op else {
+                return Ok(false);
+            };
             let splits = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
                 resolve_i64_with_temp(1, ctx, w, &tab)?
             } else {
-                let split_attr = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "split")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or_else(|| {
-                        let num_outputs = outputs.len();
-                        vec![0; num_outputs]
-                    });
-                format!("&{:?}", split_attr)
+                // Without sizes, the kernel splits evenly.
+                let split = split.clone().unwrap_or_else(|| vec![0; outputs.len()]);
+                format!("&{:?}", split)
             };
             // Use split_owned which returns owned TensorViews directly,
             // avoiding the overhead of creating local buffers and cloning
@@ -370,13 +348,10 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             }
         }
         "Pad" => {
-            let mode = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "mode")
-                .map(|a| String::from_utf8_lossy(&a.s))
-                .unwrap_or("constant".into());
+            let Op::Pad { mode } = &ctx.ir().op else {
+                return Ok(false);
+            };
+            let mode = mode.as_deref().unwrap_or("constant");
             let constant_value =
                 if inputs.len() > 2 && !ctx.node.input[2].is_empty() && !inputs[2].is_empty() {
                     format!("Some(&{})", inputs[2])
@@ -623,29 +598,14 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             }
         }
         "TopK" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(-1);
-            let largest = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "largest")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
-            let sorted = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "sorted")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
+            let Op::TopK {
+                axis,
+                largest,
+                sorted,
+            } = ctx.ir().op
+            else {
+                return Ok(false);
+            };
             // inputs[1] is k (as a tensor). We need its value at codegen time.
             // It's typically a constant weight.
             writeln!(
@@ -674,13 +634,9 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "GatherElements" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(0);
+            let Op::GatherElements { axis } = ctx.ir().op else {
+                return Ok(false);
+            };
             writeln!(
                 w,
                 "{}let {} = lele::kernels::gather_elements(&{}, &{}, {}, {});",

@@ -1,4 +1,4 @@
-use super::super::generate::OpContext;
+use super::super::{generate::OpContext, ir::Op};
 use std::io::Write;
 
 pub(crate) fn handle_activation_ops(
@@ -18,13 +18,9 @@ pub(crate) fn handle_activation_ops(
             tab, outputs[0], inputs[0], buf_expr
         )?,
         "LeakyRelu" => {
-            let alpha = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "alpha")
-                .map(|a| a.f)
-                .unwrap_or(0.01);
+            let Op::LeakyRelu { alpha } = ctx.ir().op else {
+                return Ok(false);
+            };
             writeln!(
                 w,
                 "{}let {} = lele::kernels::leaky_relu(&{}, {}, {});",
@@ -37,13 +33,11 @@ pub(crate) fn handle_activation_ops(
             tab, outputs[0], inputs[0], buf_expr
         )?,
         "Softmax" | "LogSoftmax" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(-1);
+            let (Op::Softmax { axis } | Op::LogSoftmax { axis }) = ctx.ir().op else {
+                return Ok(false);
+            };
+            // The opset 13+ default; before 13 it was 1.
+            let axis = axis.unwrap_or(-1);
             let kernel = if op == "Softmax" {
                 "softmax"
             } else {
@@ -56,24 +50,13 @@ pub(crate) fn handle_activation_ops(
             )?;
         }
         "ArgMax" => {
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(0);
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1);
+            let Op::ArgMax { axis, keepdims } = ctx.ir().op else {
+                return Ok(false);
+            };
             writeln!(
                 w,
                 "{}let {} = lele::kernels::argmax(&{}, {}, {}, {});",
-                tab, outputs[0], inputs[0], axis, keepdims, buf_expr
+                tab, outputs[0], inputs[0], axis, keepdims as i64, buf_expr
             )?;
         }
         "Tanh" => writeln!(
@@ -82,20 +65,9 @@ pub(crate) fn handle_activation_ops(
             tab, outputs[0], inputs[0], buf_expr
         )?,
         "HardSigmoid" => {
-            let alpha = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "alpha")
-                .map(|a| a.f)
-                .unwrap_or(0.2);
-            let beta = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "beta")
-                .map(|a| a.f)
-                .unwrap_or(0.5);
+            let Op::HardSigmoid { alpha, beta } = ctx.ir().op else {
+                return Ok(false);
+            };
             writeln!(
                 w,
                 "{}let {} = lele::kernels::hard_sigmoid(&{}, {:?}, {:?}, {});",

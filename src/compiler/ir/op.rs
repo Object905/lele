@@ -130,15 +130,7 @@ impl ConvAttrs {
     }
 
     fn write(self, attrs: &mut Vec<AttributeProto>) {
-        match self.auto_pad {
-            Some(s) => set_attr(
-                attrs,
-                "auto_pad",
-                3, /* STRING */
-                |a| a.s = s.into_bytes(),
-            ),
-            None => attrs.retain(|a| a.name != "auto_pad"),
-        }
+        set_attr_opt_s(attrs, "auto_pad", self.auto_pad);
         set_attr_ints(attrs, "dilations", self.dilations);
         set_attr_opt_i(attrs, "group", self.group);
         set_attr_ints(attrs, "kernel_shape", self.kernel_shape);
@@ -164,6 +156,39 @@ impl Activation {
     }
 }
 
+/// Reduction of a `Reduce*` operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reduction {
+    L2,
+    Max,
+    Mean,
+    Prod,
+    Sum,
+}
+
+impl Reduction {
+    fn from_op_type(op_type: &str) -> Option<Self> {
+        Some(match op_type {
+            "ReduceL2" => Self::L2,
+            "ReduceMax" => Self::Max,
+            "ReduceMean" => Self::Mean,
+            "ReduceProd" => Self::Prod,
+            "ReduceSum" => Self::Sum,
+            _ => return None,
+        })
+    }
+
+    pub fn op_type(self) -> &'static str {
+        match self {
+            Self::L2 => "ReduceL2",
+            Self::Max => "ReduceMax",
+            Self::Mean => "ReduceMean",
+            Self::Prod => "ReduceProd",
+            Self::Sum => "ReduceSum",
+        }
+    }
+}
+
 /// An operator together with its parsed attributes.
 ///
 /// A typed variant owns the attributes it models: they are parsed once when
@@ -173,6 +198,10 @@ impl Activation {
 #[derive(Clone, Debug)]
 pub enum Op {
     // Standard ONNX operators.
+    ArgMax {
+        axis: i64,
+        keepdims: bool,
+    },
     Cast {
         to: DType,
     },
@@ -189,17 +218,51 @@ pub enum Op {
         value: Option<TensorProto>,
     },
     Conv(ConvAttrs),
+    Flatten {
+        axis: i64,
+    },
+    Gather {
+        axis: i64,
+    },
+    GatherElements {
+        axis: i64,
+    },
     Gelu {
         /// `"none"` (the default, exact erf form) or `"tanh"`.
         approximate: Option<String>,
+    },
+    HardSigmoid {
+        alpha: f32,
+        beta: f32,
     },
     LayerNormalization {
         axis: i64,
         epsilon: f32,
     },
+    LeakyRelu {
+        alpha: f32,
+    },
+    /// Softmax in log space.
+    LogSoftmax {
+        /// Absent means 1 before opset 13 and -1 from opset 13.
+        axis: Option<i64>,
+    },
     MatMul,
+    Pad {
+        /// `"constant"` (the default), `"reflect"`, `"edge"` or `"wrap"`.
+        mode: Option<String>,
+    },
     QuantizeLinear(QuantAttrs),
     DequantizeLinear(QuantAttrs),
+    /// `ReduceL2`, `ReduceMax`, `ReduceMean`, `ReduceProd` and `ReduceSum`.
+    /// `noop_with_empty_axes` stays in the proto.
+    Reduce {
+        reduction: Reduction,
+        /// Attribute up to opset 12 for `ReduceSum` and 17 for the others;
+        /// later opsets take the axes as an operand.
+        axes: Option<Vec<i64>>,
+        keepdims: bool,
+    },
     Shape {
         start: Option<i64>,
         end: Option<i64>,
@@ -207,9 +270,28 @@ pub enum Op {
     /// Opset 10+ form, all parameters are operands. The opset 1 attributes
     /// stay in the proto.
     Slice,
+    Softmax {
+        /// Absent means 1 before opset 13 and -1 from opset 13.
+        axis: Option<i64>,
+    },
+    /// `num_outputs` (opset 18) stays in the proto.
+    Split {
+        axis: i64,
+        /// Opset 1-12 attribute; later opsets take the sizes as an operand.
+        split: Option<Vec<i64>>,
+    },
     Squeeze {
         /// Opset 1-12 attribute; later opsets take the axes as an operand.
         axes: Option<Vec<i64>>,
+    },
+    TopK {
+        axis: i64,
+        largest: bool,
+        sorted: bool,
+    },
+    Transpose {
+        /// Absent means reversing the axes.
+        perm: Option<Vec<i64>>,
     },
     Unsqueeze {
         /// Opset 1-12 attribute; later opsets take the axes as an operand.
@@ -278,7 +360,18 @@ impl Op {
         if !(node.domain.is_empty() || node.domain == "ai.onnx") {
             return fallback(node);
         }
+        if let Some(reduction) = Reduction::from_op_type(&node.op_type) {
+            return Op::Reduce {
+                reduction,
+                axes: attr_ints(node, "axes"),
+                keepdims: attr_i(node, "keepdims").unwrap_or(1) != 0,
+            };
+        }
         match node.op_type.as_str() {
+            "ArgMax" => Op::ArgMax {
+                axis: attr_i(node, "axis").unwrap_or(0),
+                keepdims: attr_i(node, "keepdims").unwrap_or(1) != 0,
+            },
             "Cast" => match attr_i(node, "to") {
                 Some(to) => Op::Cast {
                     to: DType::from_onnx(to as i32),
@@ -296,14 +389,36 @@ impl Op {
                 value: take_attr_t(node, "value"),
             },
             "Conv" => Op::Conv(ConvAttrs::parse(node)),
+            "Flatten" => Op::Flatten {
+                axis: attr_i(node, "axis").unwrap_or(1),
+            },
+            "Gather" => Op::Gather {
+                axis: attr_i(node, "axis").unwrap_or(0),
+            },
+            "GatherElements" => Op::GatherElements {
+                axis: attr_i(node, "axis").unwrap_or(0),
+            },
             "Gelu" => Op::Gelu {
                 approximate: attr_s(node, "approximate"),
+            },
+            "HardSigmoid" => Op::HardSigmoid {
+                alpha: attr_f(node, "alpha").unwrap_or(0.2),
+                beta: attr_f(node, "beta").unwrap_or(0.5),
             },
             "LayerNormalization" => Op::LayerNormalization {
                 axis: attr_i(node, "axis").unwrap_or(-1),
                 epsilon: attr_f(node, "epsilon").unwrap_or(1e-5),
             },
+            "LeakyRelu" => Op::LeakyRelu {
+                alpha: attr_f(node, "alpha").unwrap_or(0.01),
+            },
+            "LogSoftmax" => Op::LogSoftmax {
+                axis: attr_i(node, "axis"),
+            },
             "MatMul" => Op::MatMul,
+            "Pad" => Op::Pad {
+                mode: attr_s(node, "mode"),
+            },
             "QuantizeLinear" => Op::QuantizeLinear(QuantAttrs::parse(node)),
             "DequantizeLinear" => Op::DequantizeLinear(QuantAttrs::parse(node)),
             "Shape" => Op::Shape {
@@ -311,8 +426,23 @@ impl Op {
                 end: attr_i(node, "end"),
             },
             "Slice" => Op::Slice,
+            "Softmax" => Op::Softmax {
+                axis: attr_i(node, "axis"),
+            },
+            "Split" => Op::Split {
+                axis: attr_i(node, "axis").unwrap_or(0),
+                split: attr_ints(node, "split"),
+            },
             "Squeeze" => Op::Squeeze {
                 axes: attr_ints(node, "axes"),
+            },
+            "TopK" => Op::TopK {
+                axis: attr_i(node, "axis").unwrap_or(-1),
+                largest: attr_i(node, "largest").unwrap_or(1) != 0,
+                sorted: attr_i(node, "sorted").unwrap_or(1) != 0,
+            },
+            "Transpose" => Op::Transpose {
+                perm: attr_ints(node, "perm"),
             },
             "Unsqueeze" => Op::Unsqueeze {
                 axes: attr_ints(node, "axes"),
@@ -337,19 +467,32 @@ impl Op {
     /// The `op_type` the node lowers to.
     pub fn op_type(&self) -> &str {
         match self {
+            Op::ArgMax { .. } => "ArgMax",
             Op::Cast { .. } => "Cast",
             Op::Concat { .. } => "Concat",
             Op::Constant { .. } => "Constant",
             Op::ConstantOfShape { .. } => "ConstantOfShape",
             Op::Conv(_) => "Conv",
+            Op::Flatten { .. } => "Flatten",
+            Op::Gather { .. } => "Gather",
+            Op::GatherElements { .. } => "GatherElements",
             Op::Gelu { .. } => "Gelu",
+            Op::HardSigmoid { .. } => "HardSigmoid",
             Op::LayerNormalization { .. } => "LayerNormalization",
+            Op::LeakyRelu { .. } => "LeakyRelu",
+            Op::LogSoftmax { .. } => "LogSoftmax",
             Op::MatMul => "MatMul",
+            Op::Pad { .. } => "Pad",
             Op::QuantizeLinear(_) => "QuantizeLinear",
             Op::DequantizeLinear(_) => "DequantizeLinear",
+            Op::Reduce { reduction, .. } => reduction.op_type(),
             Op::Shape { .. } => "Shape",
             Op::Slice => "Slice",
+            Op::Softmax { .. } => "Softmax",
+            Op::Split { .. } => "Split",
             Op::Squeeze { .. } => "Squeeze",
+            Op::TopK { .. } => "TopK",
+            Op::Transpose { .. } => "Transpose",
             Op::Unsqueeze { .. } => "Unsqueeze",
             Op::If { .. } => "If",
             Op::Loop { .. } => "Loop",
@@ -419,28 +562,42 @@ impl Op {
                     a.s = act.name().as_bytes().to_vec()
                 });
             }
-            Op::Gelu { approximate } => match approximate {
-                Some(s) => set_attr(
-                    attrs,
-                    "approximate",
-                    3, /* STRING */
-                    |a| a.s = s.into_bytes(),
-                ),
-                None => attrs.retain(|a| a.name != "approximate"),
-            },
+            Op::ArgMax { axis, keepdims } => {
+                set_attr_i(attrs, "axis", axis, 0);
+                set_attr_i(attrs, "keepdims", keepdims as i64, 1);
+            }
+            Op::Flatten { axis } => set_attr_i(attrs, "axis", axis, 1),
+            Op::Gather { axis } | Op::GatherElements { axis } => set_attr_i(attrs, "axis", axis, 0),
+            Op::Gelu { approximate } => set_attr_opt_s(attrs, "approximate", approximate),
+            Op::HardSigmoid { alpha, beta } => {
+                set_attr_f(attrs, "alpha", alpha, 0.2);
+                set_attr_f(attrs, "beta", beta, 0.5);
+            }
             Op::LayerNormalization { axis, epsilon } => {
                 set_attr_i(attrs, "axis", axis, -1);
-                match attrs.iter_mut().find(|a| a.name == "epsilon") {
-                    Some(a) => a.f = epsilon,
-                    None if epsilon != 1e-5 => attrs.push(AttributeProto {
-                        name: "epsilon".to_string(),
-                        r#type: 1, // FLOAT
-                        f: epsilon,
-                        ..Default::default()
-                    }),
-                    None => {}
-                }
+                set_attr_f(attrs, "epsilon", epsilon, 1e-5);
             }
+            Op::LeakyRelu { alpha } => set_attr_f(attrs, "alpha", alpha, 0.01),
+            Op::Softmax { axis } | Op::LogSoftmax { axis } => set_attr_opt_i(attrs, "axis", axis),
+            Op::Pad { mode } => set_attr_opt_s(attrs, "mode", mode),
+            Op::Reduce { axes, keepdims, .. } => {
+                set_attr_ints(attrs, "axes", axes);
+                set_attr_i(attrs, "keepdims", keepdims as i64, 1);
+            }
+            Op::Split { axis, split } => {
+                set_attr_i(attrs, "axis", axis, 0);
+                set_attr_ints(attrs, "split", split);
+            }
+            Op::TopK {
+                axis,
+                largest,
+                sorted,
+            } => {
+                set_attr_i(attrs, "axis", axis, -1);
+                set_attr_i(attrs, "largest", largest as i64, 1);
+                set_attr_i(attrs, "sorted", sorted as i64, 1);
+            }
+            Op::Transpose { perm } => set_attr_ints(attrs, "perm", perm),
             Op::QLinearDynamic { relu } => set_attr_i(attrs, "relu", relu as i64, 0),
             Op::QuantizeLinear(a) | Op::DequantizeLinear(a) | Op::FakeQuantizeLinear(a) => {
                 a.write(attrs)
@@ -513,6 +670,28 @@ fn set_attr_i(attrs: &mut Vec<AttributeProto>, name: &str, value: i64, default: 
     }
 }
 
+/// [`set_attr_i`] for a float attribute.
+fn set_attr_f(attrs: &mut Vec<AttributeProto>, name: &str, value: f32, default: f32) {
+    match attrs.iter_mut().find(|a| a.name == name) {
+        Some(a) => a.f = value,
+        None if value != default => attrs.push(AttributeProto {
+            name: name.to_string(),
+            r#type: 1, // FLOAT
+            f: value,
+            ..Default::default()
+        }),
+        None => {}
+    }
+}
+
+/// Sets attribute `name` to `value`, or removes it if `value` is `None`.
+fn set_attr_opt_s(attrs: &mut Vec<AttributeProto>, name: &str, value: Option<String>) {
+    match value {
+        Some(s) => set_attr(attrs, name, 3 /* STRING */, |a| a.s = s.into_bytes()),
+        None => attrs.retain(|a| a.name != name),
+    }
+}
+
 /// Sets attribute `name` to `value`, or removes it if `value` is `None`.
 fn set_attr_opt_i(attrs: &mut Vec<AttributeProto>, name: &str, value: Option<i64>) {
     match value {
@@ -558,5 +737,103 @@ fn set_attr(
             set(&mut a);
             attrs.push(a);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::onnx_proto::GraphProto;
+
+    fn int(name: &str, i: i64) -> AttributeProto {
+        AttributeProto {
+            name: name.to_string(),
+            r#type: 2,
+            i,
+            ..Default::default()
+        }
+    }
+
+    fn float(name: &str, f: f32) -> AttributeProto {
+        AttributeProto {
+            name: name.to_string(),
+            r#type: 1,
+            f,
+            ..Default::default()
+        }
+    }
+
+    fn ints(name: &str, ints: &[i64]) -> AttributeProto {
+        AttributeProto {
+            name: name.to_string(),
+            r#type: 7,
+            ints: ints.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn string(name: &str, s: &str) -> AttributeProto {
+        AttributeProto {
+            name: name.to_string(),
+            r#type: 3,
+            s: s.as_bytes().to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// Typed operators lower to the node they were parsed from, whether it
+    /// spells out its attributes, defaults included, or leaves them out.
+    #[test]
+    fn typed_ops_round_trip() {
+        let cases: Vec<(&str, Vec<AttributeProto>)> = vec![
+            ("ArgMax", vec![int("axis", 0), int("keepdims", 0)]),
+            ("Flatten", vec![int("axis", 2)]),
+            ("Gather", vec![int("axis", 1)]),
+            ("GatherElements", vec![int("axis", 0)]),
+            ("HardSigmoid", vec![float("alpha", 0.2), float("beta", 0.6)]),
+            ("LeakyRelu", vec![float("alpha", 0.1)]),
+            ("LogSoftmax", vec![int("axis", 1)]),
+            ("Pad", vec![string("mode", "reflect")]),
+            ("ReduceMean", vec![ints("axes", &[-1]), int("keepdims", 1)]),
+            (
+                "ReduceSum",
+                vec![int("keepdims", 0), int("noop_with_empty_axes", 1)],
+            ),
+            ("Softmax", vec![int("axis", -1)]),
+            ("Split", vec![int("axis", 1), ints("split", &[2, 3])]),
+            (
+                "TopK",
+                vec![int("axis", 1), int("largest", 0), int("sorted", 1)],
+            ),
+            ("Transpose", vec![ints("perm", &[0, 2, 1])]),
+        ];
+        let mut nodes = Vec::new();
+        for (op_type, attribute) in cases {
+            nodes.push(NodeProto {
+                op_type: op_type.to_string(),
+                input: vec!["x".to_string()],
+                output: vec![format!("{op_type}_set")],
+                attribute,
+                ..Default::default()
+            });
+            nodes.push(NodeProto {
+                op_type: op_type.to_string(),
+                input: vec!["x".to_string()],
+                output: vec![format!("{op_type}_default")],
+                ..Default::default()
+            });
+        }
+        let g = Graph::from_onnx(GraphProto {
+            node: nodes.clone(),
+            ..Default::default()
+        });
+        for (_, node) in g.nodes() {
+            assert!(
+                !matches!(node.op, Op::Onnx { .. }),
+                "{} is untyped",
+                node.op.op_type()
+            );
+        }
+        assert_eq!(g.into_onnx().node, nodes);
     }
 }
