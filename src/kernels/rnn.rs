@@ -216,8 +216,8 @@ fn lstm_cell<S: Simd>(simd: S, gates: &[f32], c: &mut [f32], h: &mut [f32]) {
         let input = vm::sigmoid(load(simd, &i[k..e])) * vm::tanh(load(simd, &g[k..e]));
         let ct = vm::sigmoid(load(simd, &f[k..e])).mul_add(load(simd, &c[k..e]), input);
         let ht = vm::sigmoid(load(simd, &o[k..e])) * vm::tanh(ct);
-        store(ct, &mut c[k..e]);
-        store(ht, &mut h[k..e]);
+        store(flush_subnormals(ct), &mut c[k..e]);
+        store(flush_subnormals(ht), &mut h[k..e]);
     }
 }
 
@@ -243,7 +243,7 @@ fn gru_update<S: Simd>(simd: S, z: &[f32], x: &[f32], h: &mut [f32]) {
         let e = n.min(k + 16);
         let cand = vm::tanh(load(simd, &x[k..e]));
         let ht = load(simd, &z[k..e]).mul_add(load(simd, &h[k..e]) - cand, cand);
-        store(ht, &mut h[k..e]);
+        store(flush_subnormals(ht), &mut h[k..e]);
     }
 }
 
@@ -260,8 +260,18 @@ fn gru_cell_linear<S: Simd>(simd: S, zr: &[f32], rh: &[f32], rb: &[f32], x: &[f3
         let pre = reset.mul_add(load(simd, &rh[k..e]) + load(simd, &rb[k..e]), load(simd, &x[k..e]));
         let cand = vm::tanh(pre);
         let z = vm::sigmoid(load(simd, &z[k..e]));
-        store(z.mul_add(load(simd, &h[k..e]) - cand, cand), &mut h[k..e]);
+        store(flush_subnormals(z.mul_add(load(simd, &h[k..e]) - cand, cand)), &mut h[k..e]);
     }
+}
+
+/// `v` with its subnormal lanes set to 0. A saturated gate leaves state
+/// values like `σ(-88) ≈ 6e-39`, which persist from step to step; on Intel
+/// every multiply-add they reach takes a microcode assist (silero VAD ran 3x
+/// slower). Zero is less than `f32::MIN_POSITIVE` away from each of them.
+#[inline(always)]
+fn flush_subnormals<S: Simd>(v: f32x16<S>) -> f32x16<S> {
+    let zero = f32x16::splat(v.simd, 0.0);
+    v.abs().simd_lt(f32x16::splat(v.simd, f32::MIN_POSITIVE)).select(zero, v)
 }
 
 /// Up to 16 elements of `x`, the missing lanes 0.
@@ -427,6 +437,55 @@ mod tests {
                     assert_close(&y, &y_ref, &format!("{what} Y"));
                     assert_close(&h, &y_ref[(seq - 1) * hs..], &format!("{what} Y_h"));
                 }
+            }
+        }
+    }
+
+    /// Saturated gates and decaying state would leave subnormal state values;
+    /// they come out as 0 instead.
+    #[test]
+    fn test_rnn_state_has_no_subnormals() {
+        let (seq, is, hs) = (3, 2, 20);
+        let x = vec![0.0f32; seq * is];
+        let no_subnormals = |v: &[f32], what: &str| {
+            assert!(v.iter().all(|x| !x.is_subnormal()), "{what}: {v:?}");
+        };
+        // LSTM: i, o and f at σ(-100), so c = σ(-100)·(1 + tanh(1)) and h
+        // below it.
+        let mut b = vec![0.0f32; 8 * hs];
+        b[..3 * hs].fill(-100.0);
+        b[3 * hs..4 * hs].fill(1.0);
+        let (w, r, ones) = (vec![0.0f32; 4 * hs * is], vec![0.0f32; 4 * hs * hs], vec![1.0f32; hs]);
+        let views = (
+            TensorView::from_slice(&x, vec![seq, 1, is]),
+            TensorView::from_slice(&w, vec![1, 4 * hs, is]),
+            TensorView::from_slice(&r, vec![1, 4 * hs, hs]),
+            TensorView::from_slice(&b, vec![1, 8 * hs]),
+            TensorView::from_slice(&ones, vec![1, 1, hs]),
+        );
+        for level in levels() {
+            let (mut y, mut h, mut c) = (Vec::new(), Vec::new(), Vec::new());
+            let (xv, wv, rv, bv, ov) = &views;
+            lstm_at(level, xv, wv, rv, Some(bv), Some(ov), Some(ov), &mut y, &mut h, &mut c);
+            no_subnormals(&y, &format!("{level:?} LSTM Y"));
+            no_subnormals(&c, &format!("{level:?} LSTM Y_c"));
+        }
+        // GRU: z = σ(0) and a zero candidate halve h0 = 1e-38 to 5e-39.
+        let (w, r, b) = (vec![0.0f32; 3 * hs * is], vec![0.0f32; 3 * hs * hs], vec![0.0f32; 6 * hs]);
+        let h0 = vec![1e-38f32; hs];
+        let views = (
+            TensorView::from_slice(&x, vec![seq, 1, is]),
+            TensorView::from_slice(&w, vec![1, 3 * hs, is]),
+            TensorView::from_slice(&r, vec![1, 3 * hs, hs]),
+            TensorView::from_slice(&b, vec![1, 6 * hs]),
+            TensorView::from_slice(&h0, vec![1, 1, hs]),
+        );
+        for linear in [false, true] {
+            for level in levels() {
+                let (mut y, mut h) = (Vec::new(), Vec::new());
+                let (xv, wv, rv, bv, hv) = &views;
+                gru_at(level, xv, wv, rv, Some(bv), Some(hv), linear, &mut y, &mut h);
+                no_subnormals(&y, &format!("{level:?} GRU linear_before_reset={linear} Y"));
             }
         }
     }
