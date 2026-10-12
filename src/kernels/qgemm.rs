@@ -720,8 +720,12 @@ fn quantize_rows_f32_simd<S: Simd>(simd: S, src: &[f32], len: usize, scale: f32,
 
 /// `c = a * b` for row-major `m x k` and `k x n` operands.
 fn sgemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32]) {
+    use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
+    assert!(a.len() >= m * k && b.len() >= k * n && c.len() >= m * n);
+    // Accelerate aborts the process on an empty product (it requires
+    // `lda >= max(1, k)`), so those stay on the portable kernel.
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
+    if m > 0 && n > 0 && k > 0 {
         crate::kernels::gemm::accelerate_init();
         // SAFETY: the slices hold the row-major operands of the sizes given.
         unsafe {
@@ -730,18 +734,14 @@ fn sgemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32]) {
                 c.as_mut_ptr(), n as i32,
             );
         }
+        return;
     }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    {
-        use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
-        assert!(a.len() >= m * k && b.len() >= k * n && c.len() >= m * n);
-        // SAFETY: the slices hold the row-major operands of the sizes given.
-        unsafe {
-            let a = MatRef::<f32>::from_raw_parts(a.as_ptr(), m, k, k as isize, 1);
-            let b = MatRef::<f32>::from_raw_parts(b.as_ptr(), k, n, n as isize, 1);
-            let c = MatMut::<f32>::from_raw_parts_mut(c.as_mut_ptr(), m, n, n as isize, 1);
-            matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
-        }
+    // SAFETY: the slices hold the row-major operands of the sizes given.
+    unsafe {
+        let a = MatRef::<f32>::from_raw_parts(a.as_ptr(), m, k, k as isize, 1);
+        let b = MatRef::<f32>::from_raw_parts(b.as_ptr(), k, n, n as isize, 1);
+        let c = MatMut::<f32>::from_raw_parts_mut(c.as_mut_ptr(), m, n, n as isize, 1);
+        matmul(c, Accum::Replace, a, b, 1.0, Par::Seq);
     }
 }
 
