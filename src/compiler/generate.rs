@@ -187,7 +187,8 @@ pub(crate) fn infer_variable_types(
             let op = node.op_type.as_str();
 
             match op {
-                "ConstantOfShape" => {
+                // Both are typed by their fill value.
+                "ConstantOfShape" | "EmbeddingConcat" => {
                     // ConstantOfShape output type depends on the "value" attribute.
                     // Default is float (f32) if not specified.
                     let mut out_type = "f32".to_string();

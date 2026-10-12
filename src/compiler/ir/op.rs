@@ -101,6 +101,69 @@ impl QuantAttrs {
     }
 }
 
+/// Attributes of `Conv`, also carried by the fused [`Op::ConvAct`]. Each is
+/// `None` when the node omits it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConvAttrs {
+    pub auto_pad: Option<String>,
+    pub dilations: Option<Vec<i64>>,
+    pub group: Option<i64>,
+    pub kernel_shape: Option<Vec<i64>>,
+    pub pads: Option<Vec<i64>>,
+    pub strides: Option<Vec<i64>>,
+}
+
+impl ConvAttrs {
+    fn parse(node: &NodeProto) -> Self {
+        Self {
+            auto_pad: node
+                .attribute
+                .iter()
+                .find(|a| a.name == "auto_pad")
+                .map(|a| String::from_utf8_lossy(&a.s).into_owned()),
+            dilations: attr_ints(node, "dilations"),
+            group: attr_i(node, "group"),
+            kernel_shape: attr_ints(node, "kernel_shape"),
+            pads: attr_ints(node, "pads"),
+            strides: attr_ints(node, "strides"),
+        }
+    }
+
+    fn write(self, attrs: &mut Vec<AttributeProto>) {
+        match self.auto_pad {
+            Some(s) => set_attr(
+                attrs,
+                "auto_pad",
+                3, /* STRING */
+                |a| a.s = s.into_bytes(),
+            ),
+            None => attrs.retain(|a| a.name != "auto_pad"),
+        }
+        set_attr_ints(attrs, "dilations", self.dilations);
+        set_attr_opt_i(attrs, "group", self.group);
+        set_attr_ints(attrs, "kernel_shape", self.kernel_shape);
+        set_attr_ints(attrs, "pads", self.pads);
+        set_attr_ints(attrs, "strides", self.strides);
+    }
+}
+
+/// Activation fused into a preceding operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    Relu,
+    /// `x * sigmoid(x)`.
+    Silu,
+}
+
+impl Activation {
+    pub fn name(self) -> &'static str {
+        match self {
+            Activation::Relu => "Relu",
+            Activation::Silu => "Silu",
+        }
+    }
+}
+
 /// An operator together with its parsed attributes.
 ///
 /// A typed variant owns the attributes it models: they are parsed once when
@@ -124,6 +187,15 @@ pub enum Op {
     ConstantOfShape {
         /// Fill value; zero f32 when absent.
         value: Option<TensorProto>,
+    },
+    Conv(ConvAttrs),
+    Gelu {
+        /// `"none"` (the default, exact erf form) or `"tanh"`.
+        approximate: Option<String>,
+    },
+    LayerNormalization {
+        axis: i64,
+        epsilon: f32,
     },
     MatMul,
     QuantizeLinear(QuantAttrs),
@@ -158,6 +230,27 @@ pub enum Op {
     /// `MatMul` of a uint8-quantized activation against a symmetric int8
     /// weight. Inputs: `[a, a_scale, a_zero_point, w, w_scale]`.
     QLinearMatMulI8,
+    /// `Conv` followed by an activation. Inputs are those of the `Conv`.
+    ConvAct {
+        conv: ConvAttrs,
+        act: Activation,
+    },
+    /// `x * sigmoid(x)`.
+    Silu,
+    /// `MatMul` + `Add`. Inputs: `[a, b, bias]`.
+    Linear,
+    /// Dynamically quantized linear layer: `DynamicQuantizeLinear` of the
+    /// activation, `MatMulInteger` against a quantized weight, rescale and
+    /// bias, optionally ReLU. Inputs:
+    /// `[x, weight, weight_scale, weight_zero_point, bias]`.
+    QLinearDynamic {
+        relu: bool,
+    },
+    /// `Concat([weight, ConstantOfShape(shape, value)], axis = 0)`. Inputs:
+    /// `[shape, weight]`.
+    EmbeddingConcat {
+        value: Option<TensorProto>,
+    },
 
     /// Any operator without a typed variant yet. Its graph attributes are
     /// built into `graphs` so passes see into them; every other attribute
@@ -202,6 +295,14 @@ impl Op {
             "ConstantOfShape" => Op::ConstantOfShape {
                 value: take_attr_t(node, "value"),
             },
+            "Conv" => Op::Conv(ConvAttrs::parse(node)),
+            "Gelu" => Op::Gelu {
+                approximate: attr_s(node, "approximate"),
+            },
+            "LayerNormalization" => Op::LayerNormalization {
+                axis: attr_i(node, "axis").unwrap_or(-1),
+                epsilon: attr_f(node, "epsilon").unwrap_or(1e-5),
+            },
             "MatMul" => Op::MatMul,
             "QuantizeLinear" => Op::QuantizeLinear(QuantAttrs::parse(node)),
             "DequantizeLinear" => Op::DequantizeLinear(QuantAttrs::parse(node)),
@@ -240,6 +341,9 @@ impl Op {
             Op::Concat { .. } => "Concat",
             Op::Constant { .. } => "Constant",
             Op::ConstantOfShape { .. } => "ConstantOfShape",
+            Op::Conv(_) => "Conv",
+            Op::Gelu { .. } => "Gelu",
+            Op::LayerNormalization { .. } => "LayerNormalization",
             Op::MatMul => "MatMul",
             Op::QuantizeLinear(_) => "QuantizeLinear",
             Op::DequantizeLinear(_) => "DequantizeLinear",
@@ -251,6 +355,11 @@ impl Op {
             Op::Loop { .. } => "Loop",
             Op::FakeQuantizeLinear(_) => "FakeQuantizeLinear",
             Op::QLinearMatMulI8 => "QLinearMatMulI8",
+            Op::ConvAct { .. } => "ConvAct",
+            Op::Silu => "Silu",
+            Op::Linear => "Linear",
+            Op::QLinearDynamic { .. } => "QLinearDynamic",
+            Op::EmbeddingConcat { .. } => "EmbeddingConcat",
             Op::Onnx { op_type, .. } => op_type,
         }
     }
@@ -287,7 +396,39 @@ impl Op {
             Op::Cast { to } => set_attr_opt_i(attrs, "to", Some(to.to_onnx() as i64)),
             Op::Concat { axis } => set_attr_i(attrs, "axis", axis, 0),
             Op::Constant { value } => set_attr_t(attrs, "value", Some(value)),
-            Op::ConstantOfShape { value } => set_attr_t(attrs, "value", value),
+            Op::ConstantOfShape { value } | Op::EmbeddingConcat { value } => {
+                set_attr_t(attrs, "value", value)
+            }
+            Op::Conv(conv) => conv.write(attrs),
+            Op::ConvAct { conv, act } => {
+                conv.write(attrs);
+                set_attr(attrs, "activation", 3 /* STRING */, |a| {
+                    a.s = act.name().as_bytes().to_vec()
+                });
+            }
+            Op::Gelu { approximate } => match approximate {
+                Some(s) => set_attr(
+                    attrs,
+                    "approximate",
+                    3, /* STRING */
+                    |a| a.s = s.into_bytes(),
+                ),
+                None => attrs.retain(|a| a.name != "approximate"),
+            },
+            Op::LayerNormalization { axis, epsilon } => {
+                set_attr_i(attrs, "axis", axis, -1);
+                match attrs.iter_mut().find(|a| a.name == "epsilon") {
+                    Some(a) => a.f = epsilon,
+                    None if epsilon != 1e-5 => attrs.push(AttributeProto {
+                        name: "epsilon".to_string(),
+                        r#type: 1, // FLOAT
+                        f: epsilon,
+                        ..Default::default()
+                    }),
+                    None => {}
+                }
+            }
+            Op::QLinearDynamic { relu } => set_attr_i(attrs, "relu", relu as i64, 0),
             Op::QuantizeLinear(a) | Op::DequantizeLinear(a) | Op::FakeQuantizeLinear(a) => {
                 a.write(attrs)
             }
@@ -309,13 +450,24 @@ impl Op {
                     set_attr_g(attrs, &name, g);
                 }
             }
-            Op::MatMul | Op::Slice | Op::QLinearMatMulI8 => {}
+            Op::MatMul | Op::Slice | Op::QLinearMatMulI8 | Op::Silu | Op::Linear => {}
         }
     }
 }
 
 fn attr_i(node: &NodeProto, name: &str) -> Option<i64> {
     node.attribute.iter().find(|a| a.name == name).map(|a| a.i)
+}
+
+fn attr_f(node: &NodeProto, name: &str) -> Option<f32> {
+    node.attribute.iter().find(|a| a.name == name).map(|a| a.f)
+}
+
+fn attr_s(node: &NodeProto, name: &str) -> Option<String> {
+    node.attribute
+        .iter()
+        .find(|a| a.name == name)
+        .map(|a| String::from_utf8_lossy(&a.s).into_owned())
 }
 
 fn attr_ints(node: &NodeProto, name: &str) -> Option<Vec<i64>> {

@@ -290,7 +290,6 @@ pub mod generate;
 pub mod ir;
 pub mod ops;
 mod passes;
-pub mod patterns;
 
 pub(crate) use generate::*;
 
@@ -316,6 +315,7 @@ pub struct Compiler {
     pub(crate) patterns: Vec<Pattern>,
     pub(crate) custom_methods: Vec<String>,
     pub constant_folding: bool,
+    pub(crate) fusion: bool,
 }
 
 impl Default for Compiler {
@@ -332,6 +332,7 @@ impl Compiler {
             patterns: Vec::new(),
             custom_methods: Vec::new(),
             constant_folding: false,
+            fusion: false,
         }
     }
     /// Register a custom code generator for an operator type.
@@ -370,10 +371,11 @@ impl Compiler {
         self
     }
 
+    /// Fuses operator chains (LayerNorm, GELU, SiLU, Conv + bias/activation,
+    /// MatMul + Add, dynamically quantized linear layers, ...) into single
+    /// operators with fused kernels.
     pub fn with_default_optimizations(mut self) -> Self {
-        for p in patterns::get_default_patterns() {
-            self.patterns.push(p);
-        }
+        self.fusion = true;
         self
     }
 
@@ -399,8 +401,9 @@ impl Compiler {
         }
         // Runs after folding so that only the activation pairs are left.
         passes::fuse_qdq(&mut ir);
-        passes::sink_constant_of_shape(&mut ir);
-        passes::group_dynamic_quant_matmul(&mut ir);
+        if self.fusion {
+            passes::fuse(&mut ir);
+        }
         let graph_storage = ir.into_onnx();
         let graph = &graph_storage;
         let mut weights_data = Vec::new();

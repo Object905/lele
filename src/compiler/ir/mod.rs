@@ -15,7 +15,7 @@
 
 mod op;
 
-pub use op::{DType, Op, QuantAttrs};
+pub use op::{Activation, ConvAttrs, DType, Op, QuantAttrs};
 
 use crate::model::onnx_proto::{
     GraphProto, NodeProto, TensorProto, TensorShapeProto, TypeProto, ValueInfoProto,
@@ -247,6 +247,11 @@ impl Graph {
         self.order = order;
     }
 
+    /// Whether `id` has not been removed.
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.nodes[id.0 as usize].is_some()
+    }
+
     /// # Panics
     /// If the node has been removed.
     pub fn node(&self, id: NodeId) -> &Node {
@@ -343,6 +348,78 @@ impl Graph {
         if let Some(v) = old {
             self.values[v.0 as usize].producer = None;
         }
+    }
+
+    /// Adds a node running right before `anchor` and returns its id.
+    /// `proto` carries the name and any attributes `op` does not model.
+    ///
+    /// # Panics
+    /// If one of `outputs` already has a producer.
+    pub fn insert_node(
+        &mut self,
+        anchor: NodeId,
+        op: Op,
+        proto: NodeProto,
+        inputs: Vec<Option<ValueId>>,
+        outputs: Vec<Option<ValueId>>,
+    ) -> NodeId {
+        let id = NodeId(self.nodes.len() as u32);
+        for &v in outputs.iter().flatten() {
+            let value = &mut self.values[v.0 as usize];
+            assert!(
+                value.producer.is_none(),
+                "{} already has a producer",
+                value.name
+            );
+            value.producer = Some(id);
+        }
+        for &v in inputs.iter().flatten() {
+            self.values[v.0 as usize].consumers.push(id);
+        }
+        self.nodes.push(Some(Node {
+            op,
+            proto: NodeProto {
+                input: Vec::new(),
+                output: Vec::new(),
+                ..proto
+            },
+            inputs,
+            outputs,
+            captures: Vec::new(),
+        }));
+        let pos = self
+            .order
+            .iter()
+            .position(|&n| n == anchor)
+            .expect("anchor is not scheduled");
+        self.order.insert(pos, id);
+        id
+    }
+
+    /// Replaces `nodes` by one node running `op` where the last of them ran.
+    /// The new node takes `inputs` and produces what the last node produced.
+    /// `proto` carries the name and any attributes `op` does not model.
+    ///
+    /// The caller must make sure nothing outside `nodes` reads their other
+    /// outputs.
+    pub fn fuse(
+        &mut self,
+        nodes: &[NodeId],
+        op: Op,
+        proto: NodeProto,
+        inputs: Vec<Option<ValueId>>,
+    ) -> NodeId {
+        let last = *nodes
+            .iter()
+            .max_by_key(|&&n| self.order.iter().position(|&o| o == n))
+            .expect("nothing to fuse");
+        let outputs = self.node(last).outputs.clone();
+        for &n in nodes {
+            self.remove_node(n);
+        }
+        let id = self.insert_node(last, op, proto, inputs, outputs);
+        self.order.retain(|&n| n != last);
+        id
     }
 
     /// Removes `node`. Its outputs are left without a producer.
