@@ -1,17 +1,17 @@
 //! Constant folding.
 
-use crate::compiler::ir::{Dim, Graph, Op, QuantAttrs};
+use crate::compiler::ir::{DType, Dim, Graph, Op, QuantAttrs};
 use crate::model::onnx_proto::TensorProto;
 use crate::model::tensor_to_array;
 use std::collections::{HashMap, HashSet};
 
 /// A tensor known at compile time. Values are held as f32 whatever the
-/// element type; `dtype` is the ONNX type they stand for.
+/// element type; `dtype` is the type they stand for.
 #[derive(Clone, Debug)]
 struct Const {
     data: Vec<f32>,
     shape: Vec<usize>,
-    dtype: i32,
+    dtype: DType,
 }
 
 /// Known tensors by name, so that subgraphs can look up those of their
@@ -34,7 +34,7 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
         if let Ok((data, shape)) = tensor_to_array(t)
             && !data.is_empty()
         {
-            let dtype = t.data_type;
+            let dtype = DType::from_onnx(t.data_type);
             consts.insert(g.value(v).name.clone(), Const { data, shape, dtype });
         }
     }
@@ -61,7 +61,7 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
             Const {
                 data,
                 shape,
-                dtype: 7,
+                dtype: DType::I64,
             },
         );
     }
@@ -72,7 +72,7 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
             && let Ok((data, shape)) = tensor_to_array(value)
             && !data.is_empty()
         {
-            let dtype = value.data_type;
+            let dtype = DType::from_onnx(value.data_type);
             consts.insert(g.value(out).name.clone(), Const { data, shape, dtype });
         }
     }
@@ -108,11 +108,11 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
         };
 
         let name = g.value(out).name.clone();
-        let tensor = if dtype == 7 {
+        let tensor = if dtype == DType::I64 {
             TensorProto {
                 name: name.clone(),
                 dims: shape.iter().map(|&s| s as i64).collect(),
-                data_type: 7,
+                data_type: DType::I64.to_onnx(),
                 int64_data: data.iter().map(|&x| x as i64).collect(),
                 ..Default::default()
             }
@@ -121,7 +121,7 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
             TensorProto {
                 name: name.clone(),
                 dims: shape.iter().map(|&s| s as i64).collect(),
-                data_type: 1,
+                data_type: DType::F32.to_onnx(),
                 float_data: data.clone(),
                 ..Default::default()
             }
@@ -141,28 +141,29 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
 
 /// ONNX type of `op`'s output: that of the first input unless the operator
 /// sets it.
-fn output_dtype(op: &Op, inputs: &[&Const]) -> i32 {
+fn output_dtype(op: &Op, inputs: &[&Const]) -> DType {
     match op {
-        Op::Shape { .. } => 7,
-        Op::Cast { to } => to.to_onnx(),
+        Op::Shape { .. } => DType::I64,
+        Op::Cast { to } => *to,
         // Typed by its fill value, not by the int64 shape it consumes.
-        Op::ConstantOfShape { value } => value.as_ref().map_or(1, |t| t.data_type),
+        Op::ConstantOfShape { value } => value
+            .as_ref()
+            .map_or(DType::F32, |t| DType::from_onnx(t.data_type)),
         // QDQ weights fold back to plain float initializers.
-        Op::DequantizeLinear(_) => 1,
+        Op::DequantizeLinear(_) => DType::F32,
         Op::QuantizeLinear(attrs) => quantize_output_dtype(attrs, inputs.get(2).copied()),
-        _ => inputs.first().map_or(1, |c| c.dtype),
+        _ => inputs.first().map_or(DType::F32, |c| c.dtype),
     }
 }
 
 /// Resolves the integer element type a `QuantizeLinear` node saturates to:
 /// the `output_dtype` attribute (opset 21+), else the zero-point dtype, else
 /// the ONNX default of uint8.
-fn quantize_output_dtype(attrs: &QuantAttrs, zero_point: Option<&Const>) -> i32 {
+fn quantize_output_dtype(attrs: &QuantAttrs, zero_point: Option<&Const>) -> DType {
     attrs
         .output_dtype
-        .map(|t| t.to_onnx())
         .or(zero_point.map(|c| c.dtype))
-        .unwrap_or(2)
+        .unwrap_or(DType::U8)
 }
 
 /// Evaluates `op` on known `inputs`. Returns the data and shape of its first
@@ -190,9 +191,9 @@ fn fold_op(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
                     &mut out,
                 );
             } else {
+                let out_dtype = quantize_output_dtype(attrs, zp.copied());
                 let (qmin, qmax) =
-                    crate::kernels::quant_range(quantize_output_dtype(attrs, zp.copied()))
-                        .unwrap_or((0.0, 255.0));
+                    crate::kernels::quant_range(out_dtype.to_onnx()).unwrap_or((0.0, 255.0));
                 crate::kernels::quantize_linear(
                     &xv,
                     &sv,
@@ -391,7 +392,7 @@ mod tests {
             }],
             initializer: vec![TensorProto {
                 name: "shape".to_string(),
-                data_type: 7,
+                data_type: DType::I64.to_onnx(),
                 dims: vec![1],
                 int64_data: vec![2],
                 ..Default::default()
@@ -416,13 +417,13 @@ mod tests {
         // PyTorch's exporter writes the fill value as raw bytes; reading only
         // the typed fields used to fold this to zeros.
         let g = fold(constant_of_shape(TensorProto {
-            data_type: 7,
+            data_type: DType::I64.to_onnx(),
             dims: vec![1],
             raw_data: 1i64.to_le_bytes().to_vec(),
             ..Default::default()
         }));
         let y = folded(&g);
-        assert_eq!(y.data_type, 7);
+        assert_eq!(DType::from_onnx(y.data_type), DType::I64);
         assert_eq!(y.int64_data, [1, 1]);
     }
 
@@ -430,13 +431,13 @@ mod tests {
     fn folds_constant_of_shape_with_float_value_as_float() {
         // The output takes the value's type, not the int64 shape's.
         let g = fold(constant_of_shape(TensorProto {
-            data_type: 1,
+            data_type: DType::F32.to_onnx(),
             dims: vec![1],
             raw_data: 0.5f32.to_le_bytes().to_vec(),
             ..Default::default()
         }));
         let y = folded(&g);
-        assert_eq!(y.data_type, 1);
+        assert_eq!(DType::from_onnx(y.data_type), DType::F32);
         assert_eq!(y.float_data, [0.5, 0.5]);
     }
 
@@ -444,7 +445,7 @@ mod tests {
     fn slice(step: i64) -> GraphProto {
         let ints = |name: &str, v: Vec<i64>| TensorProto {
             name: name.to_string(),
-            data_type: 7,
+            data_type: DType::I64.to_onnx(),
             dims: vec![v.len() as i64],
             int64_data: v,
             ..Default::default()
@@ -461,7 +462,7 @@ mod tests {
             initializer: vec![
                 TensorProto {
                     name: "x".to_string(),
-                    data_type: 1,
+                    data_type: DType::F32.to_onnx(),
                     dims: vec![4],
                     float_data: vec![0.0, 1.0, 2.0, 3.0],
                     ..Default::default()
@@ -523,7 +524,7 @@ mod tests {
             }],
             initializer: vec![TensorProto {
                 name: "c".to_string(),
-                data_type: 1,
+                data_type: DType::F32.to_onnx(),
                 dims: vec![3, 2],
                 float_data: vec![0.0; 6],
                 ..Default::default()

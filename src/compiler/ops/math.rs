@@ -1,5 +1,5 @@
-use super::super::generate::OpContext;
-use super::super::ir::{Op, Reduction};
+use super::super::generate::{ElemType, OpContext};
+use super::super::ir::{DType, Op, Reduction};
 use super::super::sanitize_name;
 use std::io::Write;
 
@@ -30,9 +30,11 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             // ONNX Div takes operands of one type, so an integer initializer
             // makes it an integer division. When it runs in f32 (e.g. on the
             // f32 indices of TopK) the quotient still has to be truncated.
-            let integer_in_f32 = ctx.var_types.get(&outputs[0]).map(|t| t.as_str()) != Some("i64")
-                && (0..ctx.node.input.len())
-                    .any(|i| ctx.weight(i).is_some_and(|w| matches!(w.3, 6 | 7)));
+            let integer_in_f32 = !ctx.var_types.is_i64(&outputs[0])
+                && (0..ctx.node.input.len()).any(|i| {
+                    ctx.weight(i)
+                        .is_some_and(|w| matches!(w.dtype, DType::I32 | DType::I64))
+                });
             let kernel = if integer_in_f32 { "div_trunc" } else { "div" };
             writeln!(
                 w,
@@ -63,21 +65,21 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 "None".to_string()
             };
             // A static B is packed once for the integer GEMM.
-            if let Some((o, l, sh, dt)) = ctx.weight(1) {
-                if (*dt == 2 || *dt == 3) && sh.len() == 2 {
-                    let k = sh[0];
-                    let n = sh[1];
+            if let Some(b) = ctx.weight(1) {
+                if matches!(b.dtype, DType::U8 | DType::I8) && b.shape.len() == 2 {
+                    let k = b.shape[0];
+                    let n = b.shape[1];
                     writeln!(
                         w,
                         "{}let {} = self.mat_mul_integer_packed(&{}, {}, {}, {}, {}, {}, {}, {}, {});",
                         tab,
                         outputs[0],
                         inputs[0],
-                        *o,
-                        *l,
+                        b.offset,
+                        b.len,
                         k,
                         n,
-                        *dt == 3,
+                        b.dtype == DType::I8,
                         a_zp,
                         b_zp,
                         buf_expr
@@ -163,27 +165,13 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             tab, outputs[0], inputs[0], buf_expr
         )?,
         "Equal" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&ctx.outputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&ctx.inputs[0])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-            if is_i64 {
+            let types = ctx.var_types;
+            if types.is_i64(&ctx.outputs[0]) || types.is_i64(&ctx.inputs[0]) {
                 let a_is_weight_f32 = inputs[0].contains("weight_f32");
                 let b_is_weight_f32 = inputs.len() > 1 && inputs[1].contains("weight_f32");
-                let raw_a = sanitize_name(&ctx.node.input[0]);
-                let type_a = ctx
-                    .var_types
-                    .get(&raw_a)
-                    .map(|s| s.as_str())
-                    .unwrap_or("f32");
+                let type_a = types.get(&sanitize_name(&ctx.node.input[0]));
                 if b_is_weight_f32 {
-                    let func = if type_a == "i64" {
+                    let func = if type_a == ElemType::I64 {
                         "equal_i64_f32_r_i64"
                     } else {
                         "equal_i64_f32_r"
@@ -194,12 +182,9 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                         tab, outputs[0], func, inputs[0], inputs[1], buf_expr
                     )?;
                 } else if a_is_weight_f32
-                    || type_a == "f32"
+                    || type_a == ElemType::F32
                         && (inputs[1].contains("weight_i64")
-                            || ctx
-                                .var_types
-                                .get(&sanitize_name(&ctx.node.input[1]))
-                                .is_some_and(|t| t == "i64"))
+                            || types.is_i64(&sanitize_name(&ctx.node.input[1])))
                 {
                     writeln!(
                         w,
@@ -222,16 +207,7 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             }
         }
         "Less" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
+            let is_i64 = ctx.var_types.is_i64(&inputs[0]) || ctx.var_types.is_i64(&inputs[1]);
             if is_i64 {
                 writeln!(
                     w,
@@ -247,16 +223,7 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             }
         }
         "LessOrEqual" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
+            let is_i64 = ctx.var_types.is_i64(&inputs[0]) || ctx.var_types.is_i64(&inputs[1]);
             if is_i64 {
                 writeln!(
                     w,
@@ -354,21 +321,7 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             }
         }
         "Range" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[2])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
+            let is_i64 = inputs[..3].iter().any(|i| ctx.var_types.is_i64(i));
             if is_i64 {
                 writeln!(w, "{}let mut buf_{} = Vec::<i64>::new();", tab, outputs[0])?;
                 writeln!(
@@ -402,16 +355,7 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             )?;
         }
         "Greater" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
+            let is_i64 = ctx.var_types.is_i64(&inputs[0]) || ctx.var_types.is_i64(&inputs[1]);
             if is_i64 {
                 writeln!(
                     w,
@@ -431,7 +375,8 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             let frame_step = ctx.ints(1).map_or(160, |ints| ints[0] as usize);
             let n_fft = ctx.ints(3).map_or(512, |ints| ints[0] as usize);
             let window = if ctx.node.input.len() > 2 && !ctx.node.input[2].is_empty() {
-                if let Some((o, l, s, _dt)) = ctx.weight(2) {
+                if let Some(window) = ctx.weight(2) {
+                    let (o, l, s) = (window.offset, window.len, &window.shape);
                     format!("Some(&self.weight_f32({}, {}, &{:?}))", o, l, s)
                 } else {
                     format!("Some(&{})", inputs[2])
@@ -461,16 +406,7 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             tab, outputs[0], inputs[0], inputs[1], buf_expr
         )?,
         "GreaterOrEqual" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&inputs[0])
-                .map(|t| t == "i64")
-                .unwrap_or(false)
-                || ctx
-                    .var_types
-                    .get(&inputs[1])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
+            let is_i64 = ctx.var_types.is_i64(&inputs[0]) || ctx.var_types.is_i64(&inputs[1]);
             if is_i64 {
                 writeln!(
                     w,

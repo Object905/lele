@@ -399,7 +399,7 @@ mod tests {
     fn scalar(name: &str, v: f32) -> TensorProto {
         TensorProto {
             name: name.to_string(),
-            data_type: 1,
+            data_type: crate::compiler::ir::DType::F32.to_onnx(),
             float_data: vec![v],
             ..Default::default()
         }

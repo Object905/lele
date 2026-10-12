@@ -15,10 +15,13 @@ pub type OpHandler = Box<
     dyn Fn(&NodeProto, &[String], &[String], &str, &mut dyn Write, usize) -> std::io::Result<()>,
 >;
 pub type PatternMatcher = Box<dyn Fn(&[&NodeProto]) -> Option<usize>>;
+/// Weights by sanitized name, as `(byte offset, byte length, shape, ONNX data
+/// type)`.
+pub type WeightTable = HashMap<String, (usize, usize, Vec<usize>, i32)>;
 pub type PatternGenerator = Box<
     dyn Fn(
         &[&NodeProto],
-        &HashMap<String, (usize, usize, Vec<usize>, i32)>,
+        &WeightTable,
         Option<&Allocator>,
         &mut dyn Write,
         usize,
@@ -100,7 +103,7 @@ impl Compiler {
         M: Fn(&[&NodeProto]) -> Option<usize> + 'static,
         G: Fn(
                 &[&NodeProto],
-                &HashMap<String, (usize, usize, Vec<usize>, i32)>,
+                &WeightTable,
                 Option<&Allocator>,
                 &mut dyn Write,
                 usize,
@@ -275,11 +278,9 @@ impl Compiler {
             .iter()
             .map(|i| {
                 let name = sanitize_name(&i.name);
-                let ty = var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32");
-                if ty == "f32" {
-                    format!("{}: TensorView<'a>", name)
-                } else {
-                    format!("{}: TensorView<'a, {}>", name, ty)
+                match var_types.get(&name) {
+                    ElemType::F32 => format!("{}: TensorView<'a>", name),
+                    ty => format!("{}: TensorView<'a, {}>", name, ty),
                 }
             })
             .collect();
@@ -287,12 +288,9 @@ impl Compiler {
         let ret_types: Vec<String> = graph_outputs
             .iter()
             .map(|o| {
-                let name = sanitize_name(&o.name);
-                let ty = var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32");
-                if ty == "f32" {
-                    "TensorView<'a>".to_string()
-                } else {
-                    format!("TensorView<'a, {}>", ty)
+                match var_types.get(&sanitize_name(&o.name)) {
+                    ElemType::F32 => "TensorView<'a>".to_string(),
+                    ty => format!("TensorView<'a, {}>", ty),
                 }
             })
             .collect();
@@ -353,9 +351,8 @@ impl Compiler {
             .iter()
             .map(|o| {
                 let name = sanitize_name(&o.name);
-                let target_type = var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32");
-                if let Some((offset, len, shape, data_type)) = weights.get(&o.name) {
-                    weight_expr(*offset, *len, shape, *data_type, target_type)
+                if let Some(weight) = weights.get(&o.name) {
+                    weight_expr(weight, var_types.get(&name))
                 } else {
                     name
                 }
@@ -427,7 +424,7 @@ mod conv_pattern_tests {
         };
         let init = |name: &str, dims: &[i64]| TensorProto {
             name: name.to_string(),
-            data_type: 1,
+            data_type: ir::DType::F32.to_onnx(),
             dims: dims.to_vec(),
             raw_data: vec![0u8; 4 * dims.iter().product::<i64>() as usize],
             ..Default::default()

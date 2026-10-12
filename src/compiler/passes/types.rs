@@ -185,7 +185,7 @@ mod tests {
         let mut cast = node("Cast", &["s"], &["c"]);
         cast.attribute.push(AttributeProto {
             name: "to".to_string(),
-            i: 6,
+            i: DType::I32.to_onnx() as i64,
             ..Default::default()
         });
         let types = dtypes(
@@ -210,7 +210,7 @@ mod tests {
         let mut cast = node("Cast", &["x"], &["xi"]);
         cast.attribute.push(AttributeProto {
             name: "to".to_string(),
-            i: 7,
+            i: DType::I64.to_onnx() as i64,
             ..Default::default()
         });
         let branch = GraphProto {

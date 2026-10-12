@@ -1,4 +1,7 @@
-use super::super::{generate::OpContext, ir::Op};
+use super::super::{
+    generate::OpContext,
+    ir::{DType, Op},
+};
 use std::io::Write;
 
 /// Compute explicit pads from auto_pad attribute for SAME_UPPER/SAME_LOWER.
@@ -72,7 +75,8 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             let auto_pad = conv.auto_pad.as_deref().unwrap_or("NOTSET");
             let kernel_shape: Vec<i64> = ctx
                 .weight(1)
-                .and_then(|(_, _, shape, _)| {
+                .and_then(|weight| {
+                    let shape = &weight.shape;
                     if shape.len() >= 4 {
                         Some(vec![shape[2] as i64, shape[3] as i64])
                     } else if shape.len() == 3 {
@@ -94,10 +98,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 "None".to_string()
             };
             // Determine conv1d vs conv2d based on weight tensor rank
-            let weight_rank = ctx
-                .weight(1)
-                .map(|(_, _, shape, _)| shape.len())
-                .unwrap_or(3);
+            let weight_rank = ctx.weight(1).map(|weight| weight.shape.len()).unwrap_or(3);
             let kernel_fn = if weight_rank >= 4 { "conv2d" } else { "conv1d" };
             writeln!(
                 w,
@@ -308,19 +309,20 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 "None".to_string()
             };
             // A static weight is prepared once, on first use.
-            let weight = ctx.weight(1);
-            match weight {
-                Some((offset, len, shape, dt)) if (*dt == 2 || *dt == 3) && shape.len() == 4 => {
+            match ctx.weight(1) {
+                Some(weight)
+                    if matches!(weight.dtype, DType::U8 | DType::I8) && weight.shape.len() == 4 =>
+                {
                     writeln!(
                         w,
                         "{}let {} = self.conv_integer_packed(&{}, {}, {}, {:?}, {}, {}, {}, {}, &{:?}, &{:?}, &{:?}, {});",
                         tab,
                         outputs[0],
                         inputs[0],
-                        offset,
-                        len,
-                        shape,
-                        *dt == 3,
+                        weight.offset,
+                        weight.len,
+                        weight.shape,
+                        weight.dtype == DType::I8,
                         group,
                         x_zero_point,
                         w_zero_point,

@@ -1,5 +1,5 @@
 use super::super::{
-    generate::OpContext,
+    generate::{ElemType, OpContext},
     ir::{DType, Op},
 };
 use std::io::Write;
@@ -21,12 +21,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             if let Some(ints) = ctx.ints(idx) {
                 Ok(format!("&{:?}", ints))
             } else {
-                let is_i64 = ctx
-                    .var_types
-                    .get(&ctx.inputs[idx])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-                if is_i64 {
+                if ctx.var_types.is_i64(&ctx.inputs[idx]) {
                     // For i64 tensors, use .data directly
                     Ok(format!("&{}.data[..]", ctx.inputs[idx]))
                 } else {
@@ -50,12 +45,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             if let Some(ints) = ctx.ints(idx) {
                 Ok(format!("Some(&{:?})", ints))
             } else {
-                let is_i64 = ctx
-                    .var_types
-                    .get(&ctx.inputs[idx])
-                    .map(|t| t == "i64")
-                    .unwrap_or(false);
-                if is_i64 {
+                if ctx.var_types.is_i64(&ctx.inputs[idx]) {
                     Ok(format!("Some(&{}.data[..])", ctx.inputs[idx]))
                 } else {
                     let temp_name = format!("temp_i64_{}", idx);
@@ -205,7 +195,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
         )?,
         "Cast" => {
             let to = match ctx.ir().op {
-                Op::Cast { to } => Some(to.to_onnx() as i64),
+                Op::Cast { to } => Some(to),
                 _ => None,
             };
 
@@ -214,7 +204,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             // can lead to borrowing issues when the input TensorView holds a reference
             // to the same buffer we're trying to mutably borrow for output
 
-            if to == Some(7) || to == Some(6) || to == Some(9) {
+            if let Some(DType::I64 | DType::I32 | DType::Bool) = to {
                 writeln!(
                     w,
                     "{}let mut temp_cast_buf_{} = Vec::<i64>::new();",
@@ -225,14 +215,9 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     "{}let {} = lele::kernels::utils::cast_to_i64(&{}, &mut temp_cast_buf_{});",
                     tab, outputs[0], inputs[0], outputs[0]
                 )?;
-            } else if to == Some(1) {
+            } else if to == Some(DType::F32) {
                 // Check if input is already f32, in which case cast is a no-op
-                let input_type = ctx
-                    .var_types
-                    .get(&ctx.inputs[0])
-                    .map(|s| s.as_str())
-                    .unwrap_or("f32");
-                if input_type == "f32" {
+                if ctx.var_types.get(&ctx.inputs[0]) == ElemType::F32 {
                     writeln!(
                         w,
                         "{}let {} = {}.clone(); // Cast f32->f32 is no-op",
@@ -259,11 +244,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             }
         }
         "ConstantOfShape" => {
-            let is_i64 = ctx
-                .var_types
-                .get(&ctx.outputs[0])
-                .map(|s| s == "i64")
-                .unwrap_or(false);
+            let is_i64 = ctx.var_types.is_i64(&ctx.outputs[0]);
             let value = match &ctx.ir().op {
                 Op::ConstantOfShape { value } => value.as_ref(),
                 _ => None,
@@ -364,12 +345,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     format!("&{:?}", ints)
                 } else {
                     // pads is a computed tensor, we need to extract data
-                    let is_i64 = ctx
-                        .var_types
-                        .get(&ctx.inputs[1])
-                        .map(|t| t == "i64")
-                        .unwrap_or(false);
-                    if is_i64 {
+                    if ctx.var_types.is_i64(&ctx.inputs[1]) {
                         format!("&{}.data[..]", inputs[1])
                     } else {
                         // Need to convert f32 to i64
@@ -415,8 +391,8 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     .map(|zp| ctx.graph.value(zp).dtype)
                     .filter(|&t| t != DType::Undefined);
                 let out_dt = match (attrs.output_dtype, zp_dt, zero_point) {
-                    (Some(t), _, _) | (None, Some(t), _) => t.to_onnx(),
-                    (None, None, None) => 2,
+                    (Some(t), _, _) | (None, Some(t), _) => t,
+                    (None, None, None) => DType::U8,
                     // Guessing uint8 would silently clamp every negative code
                     // to 0 on an int8 model, so refuse to compile instead.
                     (None, None, Some(zp)) => panic!(
@@ -427,7 +403,8 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                         ctx.graph.value(zp).name
                     ),
                 };
-                let (qmin, qmax) = crate::kernels::quant_range(out_dt).unwrap_or((0.0, 255.0));
+                let (qmin, qmax) =
+                    crate::kernels::quant_range(out_dt.to_onnx()).unwrap_or((0.0, 255.0));
                 let kernel = if op == "FakeQuantizeLinear" {
                     "fake_quantize_linear"
                 } else {
@@ -455,12 +432,13 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             // an int8 initializer with a known blob offset. It is passed by
             // offset rather than as a `TensorView` because the runtime packs it
             // into an architecture-specific layout once and caches that.
-            let Some((offset, len, shape, _)) = ctx.weight(3) else {
+            let Some(weight) = ctx.weight(3) else {
                 panic!(
                     "QLinearMatMulI8 weight {} is not a known initializer",
                     ctx.node.input[3]
                 );
             };
+            let (offset, len, shape) = (weight.offset, weight.len, &weight.shape);
             writeln!(
                 w,
                 "{}let {} = self.qmatmul_i8(&{}, &{}, &{}, {}, {}, {}, {}, &{}, {});",
@@ -513,20 +491,19 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "Identity" | "Constant" => {
-            if let Some((offset, len, shape, dt)) = ctx.weights.get(&ctx.node.output[0]) {
-                let weight_fn = match dt {
-                    1 => "weight_f32",
-                    2 => "weight_u8",
-                    3 => "weight_i8",
-                    6 => "weight_i32",
-                    7 => "weight_i64",
-                    10 => "weight_f16",
+            if let Some(weight) = ctx.weights.get(&ctx.node.output[0]) {
+                let weight_fn = match weight.dtype {
+                    DType::U8 => "weight_u8",
+                    DType::I8 => "weight_i8",
+                    DType::I32 => "weight_i32",
+                    DType::I64 => "weight_i64",
+                    DType::F16 => "weight_f16",
                     _ => "weight_f32",
                 };
                 writeln!(
                     w,
                     "{}let {} = self.{}({}, {}, &{:?});",
-                    tab, outputs[0], weight_fn, offset, len, shape
+                    tab, outputs[0], weight_fn, weight.offset, weight.len, weight.shape
                 )?;
             } else if let Some((ints, shape)) = ctx.weights.int64.get(&ctx.node.output[0]) {
                 let floats: Vec<String> =

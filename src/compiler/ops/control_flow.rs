@@ -33,9 +33,8 @@ pub(crate) fn handle_control_flow_ops(
                     .map(|&o| {
                         let name = sanitize_name(&branch.value(o).name);
                         match weights.get(&name) {
-                            Some((offset, len, shape, data_type)) => {
-                                let ty = var_types.get(&name).map_or("f32", |s| s.as_str());
-                                let weight = weight_expr(*offset, *len, shape, *data_type, ty);
+                            Some(weight) => {
+                                let weight = weight_expr(weight, var_types.get(&name));
                                 format!("{weight}.to_owned()")
                             }
                             None => format!("{name}.to_owned()"),
@@ -45,8 +44,7 @@ pub(crate) fn handle_control_flow_ops(
             };
             let cond = &inputs[0];
             let out_vars = outputs.join(", ");
-            let cond_is_i64 = ctx.var_types.get(cond).map(|t| t == "i64").unwrap_or(false);
-            if cond_is_i64 {
+            if ctx.var_types.is_i64(cond) {
                 writeln!(
                     w,
                     "{}let ({}) = if {}.data.first().is_some_and(|&v| v != 0) {{",
