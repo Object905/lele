@@ -404,6 +404,8 @@ impl Compiler {
         if self.fusion {
             passes::fuse(&mut ir);
         }
+        passes::infer_dtypes(&mut ir);
+        let var_types = variable_types(&ir);
         let graph_storage = ir.into_onnx();
         let graph = &graph_storage;
         let mut weights_data = Vec::new();
@@ -436,7 +438,7 @@ impl Compiler {
         let mut chunk_functions = Vec::new(); // Will hold the code for fn chunk_0(...) { ... }
         let mut body_buffer = Vec::new(); // Will hold the code for forward() body
         let mut current_id = 0;
-        let var_types = generate_partitioned_graph(
+        generate_partitioned_graph(
             &nodes,
             &mut chunk_functions,
             &mut body_buffer,
@@ -449,6 +451,7 @@ impl Compiler {
             self,
             &graph.input,
             &graph.output,
+            &var_types,
         )?;
         let body_str =
             String::from_utf8(body_buffer).map_err(|e| format!("UTF-8 error in body: {}", e))?;

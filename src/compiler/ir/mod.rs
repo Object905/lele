@@ -269,6 +269,11 @@ impl Graph {
             .expect("node was removed")
     }
 
+    /// Every value of this graph, subgraphs excluded.
+    pub fn value_ids(&self) -> impl Iterator<Item = ValueId> + use<> {
+        (0..self.values.len() as u32).map(ValueId)
+    }
+
     pub fn value(&self, id: ValueId) -> &Value {
         &self.values[id.0 as usize]
     }
