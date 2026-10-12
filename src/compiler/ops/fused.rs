@@ -1,59 +1,41 @@
 //! Code generation for the operators the fusion passes create.
 
-use super::super::{generate::OpContext, generate::weight_expr, sanitize_name};
-use crate::model::onnx_proto::NodeProto;
+use super::super::{
+    generate::OpContext,
+    generate::weight_expr,
+    ir::{Activation, ConvAttrs, Op},
+    sanitize_name,
+};
 use std::io::Write;
 
-/// A Conv node's `strides`, `dilations`, `group`, `pads` and `auto_pad`.
-/// Strides and dilations come out with one entry per spatial axis of a 2D
-/// convolution (a single value covers both); each axis keeps its own, so a
-/// stride of `[2, 1]` stays `[2, 1]`.
-fn conv_attributes(conv: &NodeProto) -> (Vec<i64>, Vec<i64>, usize, Vec<i64>, String) {
-    let per_axis = |ints: &[i64]| match ints {
-        [] => vec![1, 1],
-        [v] => vec![*v, *v],
-        _ => ints.to_vec(),
-    };
-    let (mut strides, mut dilations) = (vec![1, 1], vec![1, 1]);
-    let (mut groups, mut pads, mut auto_pad) = (1, Vec::new(), String::new());
-    for attr in &conv.attribute {
-        match attr.name.as_str() {
-            "strides" => strides = per_axis(&attr.ints),
-            "dilations" => dilations = per_axis(&attr.ints),
-            "group" => groups = attr.i as usize,
-            "pads" => pads = attr.ints.clone(),
-            "auto_pad" => auto_pad = String::from_utf8_lossy(&attr.s).to_string(),
-            _ => {}
+impl ConvAttrs {
+    /// Strides and dilations with one entry per spatial axis of a 2D
+    /// convolution (a single value covers both, none means 1); each axis
+    /// keeps its own, so a stride of `[2, 1]` stays `[2, 1]`.
+    fn per_axis(ints: &Option<Vec<i64>>) -> Vec<i64> {
+        match ints.as_deref() {
+            None | Some([]) => vec![1, 1],
+            Some([v]) => vec![*v, *v],
+            Some(ints) => ints.to_vec(),
         }
     }
-    (strides, dilations, groups, pads, auto_pad)
-}
-
-fn attr<'n>(
-    node: &'n NodeProto,
-    name: &str,
-) -> Option<&'n crate::model::onnx_proto::AttributeProto> {
-    node.attribute.iter().find(|a| a.name == name)
 }
 
 pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
     let tab = ctx.tab();
     let (inputs, outputs, buf) = (&ctx.inputs, &ctx.outputs, &ctx.buf_expr);
     let node = ctx.node;
-    match node.op_type.as_str() {
-        "Silu" => writeln!(
+    match &ctx.ir().op {
+        Op::Silu => writeln!(
             w,
             "{tab}let {} = lele::kernels::silu(&{}, {buf});",
             outputs[0], inputs[0]
         )?,
-        "Gelu" => {
-            let kernel = match attr(node, "approximate").map(|a| a.s.as_slice()) {
-                None | Some(b"none") => "gelu_erf",
-                Some(b"tanh") => "fast_gelu",
-                Some(other) => panic!(
-                    "Gelu approximate={:?} is not supported",
-                    String::from_utf8_lossy(other)
-                ),
+        Op::Gelu { approximate } => {
+            let kernel = match approximate.as_deref() {
+                None | Some("none") => "gelu_erf",
+                Some("tanh") => "fast_gelu",
+                Some(other) => panic!("Gelu approximate={other:?} is not supported"),
             };
             writeln!(
                 w,
@@ -61,41 +43,44 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                 outputs[0], inputs[0]
             )?;
         }
-        "Linear" => writeln!(
+        Op::Linear => writeln!(
             w,
             "{tab}let {} = self.linear(&{}, &{}, &{}, {buf});",
             outputs[0], inputs[0], inputs[1], inputs[2]
         )?,
-        "ConvAct" => {
+        Op::ConvAct { conv, act } => {
             let weight_shape = ctx
                 .known_weights
                 .get(&sanitize_name(&node.input[1]))
                 .map(|(_, _, shape, _)| shape.clone())
                 .unwrap_or(vec![3, 3, 3, 3]);
-            let bias = match node.input.get(2) {
-                Some(b) if !b.is_empty() => format!("Some(&{})", inputs[2]),
-                _ => "None".to_string(),
+            let bias = match ctx.ir().input(2) {
+                Some(_) => format!("Some(&{})", inputs[2]),
+                None => "None".to_string(),
             };
-            let act = attr(node, "activation").map(|a| a.s.as_slice());
-            if act == Some(b"Silu") {
+            if *act == Activation::Silu {
                 // Attributes as written, with ONNX defaults.
-                let ints = |name: &str, default: &[i64]| {
-                    attr(node, name).map_or(default.to_vec(), |a| a.ints.clone())
+                let ints = |v: &Option<Vec<i64>>, default: &[i64]| {
+                    v.clone().unwrap_or_else(|| default.to_vec())
                 };
-                let group = attr(node, "group").map_or(1, |a| a.i);
                 writeln!(
                     w,
-                    "{tab}let {} = lele::kernels::conv2d_silu(&{}, &{}, {bias}, &{:?}, {group}, &{:?}, &{:?}, {buf});",
+                    "{tab}let {} = lele::kernels::conv2d_silu(&{}, &{}, {bias}, &{:?}, {}, &{:?}, &{:?}, {buf});",
                     outputs[0],
                     inputs[0],
                     inputs[1],
-                    ints("dilations", &[1, 1]),
-                    ints("pads", &[0, 0, 0, 0]),
-                    ints("strides", &[1, 1]),
+                    ints(&conv.dilations, &[1, 1]),
+                    conv.group.unwrap_or(1),
+                    ints(&conv.pads, &[0, 0, 0, 0]),
+                    ints(&conv.strides, &[1, 1]),
                 )?;
                 return Ok(true);
             }
-            let (strides, dilations, groups, mut pads, auto_pad) = conv_attributes(node);
+            let strides = ConvAttrs::per_axis(&conv.strides);
+            let dilations = ConvAttrs::per_axis(&conv.dilations);
+            let groups = conv.group.unwrap_or(1) as usize;
+            let mut pads = conv.pads.clone().unwrap_or_default();
+            let auto_pad = conv.auto_pad.as_deref().unwrap_or("");
             if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads.is_empty() {
                 let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
                 let kw = weight_shape.get(3).copied().unwrap_or(kh as usize) as i64;
@@ -128,8 +113,7 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                 )?;
             }
         }
-        "QLinearDynamic" => {
-            let relu = attr(node, "relu").is_some_and(|a| a.i != 0);
+        Op::QLinearDynamic { relu } => {
             let (x, scale, zero_point, bias) = (&inputs[0], &inputs[2], &inputs[3], &inputs[4]);
             // A static weight is packed once for the integer GEMM.
             match ctx.known_weights.get(&sanitize_name(&node.input[1])) {
@@ -144,7 +128,7 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                     )?
                 }
                 _ => {
-                    let method = if relu {
+                    let method = if *relu {
                         "linear_quantized_relu"
                     } else {
                         "linear_quantized"
@@ -157,9 +141,8 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                 }
             }
         }
-        "EmbeddingConcat" => {
-            let value = attr(node, "value").and_then(|a| a.t.as_ref());
-            let int_value = value.and_then(|t| {
+        Op::EmbeddingConcat { value } => {
+            let int_value = value.as_ref().and_then(|t| {
                 let int = t.data_type == 6
                     || t.data_type == 7
                     || !t.int64_data.is_empty()
@@ -190,6 +173,7 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                 )?,
                 None => {
                     let v = value
+                        .as_ref()
                         .and_then(|t| t.float_data.first())
                         .copied()
                         .unwrap_or(0.0);

@@ -114,7 +114,7 @@ pub struct ConvAttrs {
 }
 
 impl ConvAttrs {
-    fn parse(node: &NodeProto) -> Self {
+    pub(crate) fn parse(node: &NodeProto) -> Self {
         Self {
             auto_pad: node
                 .attribute
