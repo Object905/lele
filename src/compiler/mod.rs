@@ -1,7 +1,8 @@
+pub use self::alloc::Allocator;
+pub(crate) use self::alloc::AnalysisData;
 use crate::model::onnx_proto::{GraphProto, NodeProto};
 use crate::model::tensor_to_array;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::io::Write;
 /// Handler callback for custom operator code generation.
 /// Args:
@@ -33,259 +34,7 @@ pub struct CompilationResult {
     pub code: String,
     pub weights: Vec<u8>,
 }
-pub struct Allocator {
-    // Maps tensor name -> Buffer Index
-    pub tensor_to_buffer: HashMap<String, usize>,
-    pub num_buffers: usize,
-}
-// Helper to identify nodes uniquely across recursion
-struct NodeVisitor<'a> {
-    id_counter: usize,
-    // Map tensor name -> List of Node IDs that use it
-    uses: HashMap<String, Vec<usize>>,
-    // Map Node ID -> NodeProto
-    node_map: HashMap<usize, &'a NodeProto>,
-    // Map Node ID -> outputs
-    node_outputs: HashMap<usize, Vec<String>>,
-    // Map Node ID -> inputs
-    node_inputs: HashMap<usize, Vec<String>>,
-    // Map alias -> sources (e.g. If_out -> [Then_out, Else_out])
-    aliases: HashMap<String, Vec<String>>,
-}
-impl<'a> NodeVisitor<'a> {
-    fn new() -> Self {
-        Self {
-            id_counter: 0,
-            uses: HashMap::new(),
-            node_map: HashMap::new(),
-            node_outputs: HashMap::new(),
-            node_inputs: HashMap::new(),
-            aliases: HashMap::new(),
-        }
-    }
-    fn visit(&mut self, graph: &'a GraphProto) {
-        for node in &graph.node {
-            let id = self.id_counter;
-            self.id_counter += 1;
-            self.node_map.insert(id, node);
-            self.node_outputs.insert(id, node.output.clone());
-            self.node_inputs.insert(id, node.input.clone());
-            for input in &node.input {
-                self.uses.entry(input.clone()).or_default().push(id);
-            }
-            // Recurse for subgraphs (If, Loop, Scan) in DETERMINISTIC ORDER matching generation
-            if node.op_type == "If" {
-                let then_g = node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "then_branch")
-                    .and_then(|a| a.g.as_ref());
-                let else_g = node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "else_branch")
-                    .and_then(|a| a.g.as_ref());
-                // Record aliases
-                for (i, out_name) in node.output.iter().enumerate() {
-                    let mut sources = Vec::new();
-                    if let Some(g) = then_g
-                        && i < g.output.len()
-                    {
-                        sources.push(g.output[i].name.clone());
-                    }
-                    if let Some(g) = else_g
-                        && i < g.output.len()
-                    {
-                        sources.push(g.output[i].name.clone());
-                    }
-                    if !sources.is_empty() {
-                        self.aliases.insert(out_name.clone(), sources);
-                    }
-                }
-                if let Some(g) = then_g {
-                    self.visit(g);
-                }
-                if let Some(g) = else_g {
-                    self.visit(g);
-                }
-            } else if node.op_type == "Loop" {
-                let body = node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "body")
-                    .and_then(|a| a.g.as_ref());
-                // For Loop, output [i] corresponds to scan_output.
-                // The main outputs are N iteration outputs + K scan outputs?
-                // For simplicity, just aliasing implicit body outputs is harder because naming convention relies on scan_outputs.
-                // Silero VAD mostly uses If, let's stick to If for now. Code generation for Loop is complex.
-                if let Some(g) = body {
-                    self.visit(g);
-                }
-            } else {
-                // Record Zero-Copy Aliases
-                if matches!(
-                    node.op_type.as_str(),
-                    "Squeeze" | "Unsqueeze" | "Reshape" | "Identity" | "Flatten" | "Cast"
-                ) && !node.input.is_empty()
-                    && !node.output.is_empty()
-                {
-                    self.aliases
-                        .insert(node.output[0].clone(), vec![node.input[0].clone()]);
-                }
-                for attr in &node.attribute {
-                    if let Some(g) = &attr.g {
-                        self.visit(g);
-                    }
-                }
-            }
-        }
-    }
-}
-pub(crate) struct AnalysisData {
-    pub death_time: HashMap<String, usize>,
-    pub uses: HashMap<String, Vec<usize>>,
-}
-fn solve_allocation(graph: &GraphProto, outputs: &[String]) -> (Allocator, AnalysisData) {
-    let mut visitor = NodeVisitor::new();
-    visitor.visit(graph);
-    // Add graph outputs as "uses" at infinity (max_id)
-    let max_id = visitor.id_counter;
-    for out in outputs {
-        visitor.uses.entry(out.clone()).or_default().push(max_id);
-    }
-    // Liveness Analysis
-    let mut death_time = HashMap::new();
-    for (name, uses) in &visitor.uses {
-        if let Some(max) = uses.iter().max() {
-            death_time.insert(name.clone(), *max);
-        }
-    }
-    // Propagate aliases backwards
-    // If output X aliases Y, then Y must live as long as X.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (alias, sources) in &visitor.aliases {
-            let alias_death = *death_time.get(alias).unwrap_or(&0);
-            for source in sources {
-                let source_death = *death_time.get(source).unwrap_or(&0);
-                if alias_death > source_death {
-                    death_time.insert(source.clone(), alias_death);
-                    changed = true;
-                }
-            }
-        }
-    }
-    let mut free_buffers: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
-    let mut active_allocations: HashMap<String, usize> = HashMap::new();
-    let mut all_allocations: HashMap<String, usize> = HashMap::new();
-    let mut max_buffers = 0;
-    for id in 0..visitor.id_counter {
-        // Release buffers
-        let mut to_remove = Vec::new();
-        for (tensor, &buf_idx) in &active_allocations {
-            let die_at = *death_time.get(tensor).unwrap_or(&usize::MAX);
-            if die_at < id {
-                to_remove.push((tensor.clone(), buf_idx));
-            }
-        }
-        for (t, b) in to_remove {
-            active_allocations.remove(&t);
-            free_buffers.push(Reverse(b));
-        }
-        // Allocate output buffers
-        if let Some(node_outputs) = visitor.node_outputs.get(&id) {
-            for out in node_outputs {
-                if out.is_empty() {
-                    continue;
-                }
-                // Check if this output aliases a source
-                let mut alias_idx = None;
-                if let Some(sources) = visitor.aliases.get(out) {
-                    // Try to find the buffer of the source
-                    // Since we propagated liveness, the source buffer should be active
-                    // For single source aliases (Identity etc)
-                    if let Some(src) = sources.first() {
-                        if let Some(&idx) = active_allocations.get(src) {
-                            alias_idx = Some(idx);
-                        } else if let Some(&_idx) = all_allocations.get(src) {
-                            // Source might be dead but consistent?
-                            // But we need it to be active to reserve it.
-                            // If it's not active, maybe it was freed?
-                            // But we propagated lifetime, so it SHOULD be active.
-                            // Unless it's a constant or weight which has no buffer?
-                            // Weights used to be handled separately.
-                            // If source is not in active/all allocations, it might be an input or weight.
-                            // In that case, we can't alias into a workspace buffer number??
-                            // Wait, weights don't use workspace.
-                            // Input tensors don't use workspace logic here?
-                            // If source is weight, Alias is view of weight.
-                            // The generator will handle view of weight.
-                            // We just need to ensure we don't allocate a NEW buffer for it.
-                        }
-                    }
-                }
-                if let Some(idx) = alias_idx {
-                    // It's an alias to an existing buffer.
-                    // Do NOT mark as active allocation (owner responsible for freeing)
-                    all_allocations.insert(out.clone(), idx);
-                } else {
-                    // Allocate new
-                    // Check inputs to avoid reusing their buffers for the same node (Borrow Checker)
-                    let mut input_bufs = std::collections::HashSet::new();
-                    if let Some(inps) = visitor.node_inputs.get(&id) {
-                        input_bufs
-                            .extend(inps.iter().filter_map(|n| all_allocations.get(n)).cloned());
-                    }
-                    // Check inputs of preceding nodes to avoid buffer conflicts in fused
-                    // patterns (e.g. Conv+Sigmoid+Mul → Conv2d+SiLU consumes 3 nodes,
-                    // Triple SiLU consumes 6 nodes)
-                    for prev in 1..=5 {
-                        if id >= prev
-                            && let Some(inps) = visitor.node_inputs.get(&(id - prev))
-                        {
-                            input_bufs.extend(
-                                inps.iter().filter_map(|n| all_allocations.get(n)).cloned(),
-                            );
-                        }
-                    }
-                    let mut deferred = Vec::new();
-                    let mut selected_buf = None;
-                    while let Some(Reverse(b)) = free_buffers.pop() {
-                        if input_bufs.contains(&b) {
-                            deferred.push(b);
-                        } else {
-                            selected_buf = Some(b);
-                            break;
-                        }
-                    }
-                    for b in deferred {
-                        free_buffers.push(Reverse(b));
-                    }
-                    let buf_idx = if let Some(b) = selected_buf {
-                        b
-                    } else {
-                        let b = max_buffers;
-                        max_buffers += 1;
-                        b
-                    };
-                    active_allocations.insert(out.clone(), buf_idx);
-                    all_allocations.insert(out.clone(), buf_idx);
-                }
-            }
-        }
-    }
-    (
-        Allocator {
-            tensor_to_buffer: all_allocations,
-            num_buffers: max_buffers,
-        },
-        AnalysisData {
-            death_time,
-            uses: visitor.uses,
-        },
-    )
-}
+mod alloc;
 pub mod generate;
 pub mod ir;
 pub mod ops;
@@ -406,6 +155,7 @@ impl Compiler {
         }
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
+        let (allocator, analysis) = alloc::solve_allocation(&ir);
         let graph_storage = ir.into_onnx();
         let graph = &graph_storage;
         let mut weights_data = Vec::new();
@@ -432,9 +182,6 @@ impl Compiler {
         }
         let nodes: Vec<&NodeProto> = graph.node.iter().collect();
 
-        // Run Allocation/Liveness FIRST
-        let output_names: Vec<String> = graph.output.iter().map(|o| o.name.clone()).collect();
-        let (allocator, analysis) = solve_allocation(graph, &output_names);
         let mut chunk_functions = Vec::new(); // Will hold the code for fn chunk_0(...) { ... }
         let mut body_buffer = Vec::new(); // Will hold the code for forward() body
         let mut current_id = 0;
