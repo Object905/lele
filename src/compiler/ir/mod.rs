@@ -267,6 +267,29 @@ impl Graph {
         self.value(v).data.as_ref()
     }
 
+    /// Initializers in model order.
+    pub fn initializers(&self) -> &[ValueId] {
+        &self.initializers
+    }
+
+    /// Turns `v` into an initializer holding `tensor`, appended after the
+    /// existing ones.
+    ///
+    /// # Panics
+    /// If `v` has a producer or already holds data.
+    pub fn add_initializer(&mut self, v: ValueId, tensor: TensorProto) {
+        let value = &mut self.values[v.0 as usize];
+        assert!(
+            value.producer.is_none() && value.data.is_none(),
+            "{} is already defined",
+            value.name
+        );
+        value.dtype = DType::from_onnx(tensor.data_type);
+        value.shape = Some(tensor.dims.iter().map(|&d| Dim::Fixed(d)).collect());
+        value.data = Some(tensor);
+        self.initializers.push(v);
+    }
+
     /// Number of reads of `v`, counting each graph output it is as one.
     pub fn uses(&self, v: ValueId) -> usize {
         self.value(v).consumers.len() + self.outputs.iter().filter(|&&o| o == v).count()
@@ -346,19 +369,22 @@ impl Graph {
 
     fn push_node(&mut self, mut proto: NodeProto) {
         let id = NodeId(self.nodes.len() as u32);
-        // Hand graph attributes to the parser; whatever it does not take
-        // stays in the proto.
+        // Hand graph attributes to the parser. An untyped operator keeps the
+        // ones it did not take as IR too; a typed one leaves them in the
+        // proto.
         let mut graphs: Vec<(String, GraphProto)> = proto
             .attribute
             .iter_mut()
             .filter_map(|a| Some((a.name.clone(), a.g.take()?)))
             .collect();
-        let op = Op::parse(&proto, |name| {
+        let mut op = Op::parse(&mut proto, |name| {
             let i = graphs.iter().position(|(n, _)| n == name)?;
             Some(Graph::from_onnx(graphs.swap_remove(i).1))
         });
         for (name, g) in graphs {
-            if let Some(a) = proto.attribute.iter_mut().find(|a| a.name == name) {
+            if let Op::Onnx { graphs, .. } = &mut op {
+                graphs.push((name, Graph::from_onnx(g)));
+            } else if let Some(a) = proto.attribute.iter_mut().find(|a| a.name == name) {
                 a.g = Some(g);
             }
         }
