@@ -35,6 +35,22 @@ impl Weights {
         weights
     }
 
+    /// The weight holding the tensor `name`.
+    pub(crate) fn get(&self, name: &str) -> Option<&WeightRef> {
+        self.lookup.get(&sanitize_name(name))
+    }
+
+    /// The values of `name`, if it is an int64 or int32 weight.
+    pub(crate) fn ints(&self, name: &str) -> Option<&[i64]> {
+        self.int64.get(name).map(|(ints, _)| ints.as_slice())
+    }
+
+    /// Whether the tensor `name` is read from the weights rather than
+    /// computed.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some() || self.int64.contains_key(name)
+    }
+
     fn add_graph(&mut self, g: &Graph) {
         for &v in g.initializers() {
             if let Some(t) = g.data(v) {

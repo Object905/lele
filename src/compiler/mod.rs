@@ -156,12 +156,7 @@ impl Compiler {
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
         let (allocator, analysis) = alloc::solve_allocation(&ir);
-        let weights::Weights {
-            data: weights_data,
-            lookup: weight_lookup,
-            int64: int64_map,
-            ..
-        } = weights::Weights::collect(&ir);
+        let weights = weights::Weights::collect(&ir);
         let (graph_inputs, graph_outputs) = (ir.input_infos(), ir.output_infos());
         let (ids, protos) = lower_nodes(&ir);
         let protos: Vec<&NodeProto> = protos.iter().collect();
@@ -179,8 +174,7 @@ impl Compiler {
             &mut chunk_functions,
             &mut body_buffer,
             2,
-            &weight_lookup,
-            &int64_map,
+            &weights,
             Some(&allocator),
             Some(&analysis),
             &mut current_id,
@@ -360,7 +354,7 @@ impl Compiler {
             .map(|o| {
                 let name = sanitize_name(&o.name);
                 let target_type = var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32");
-                if let Some((offset, len, shape, data_type)) = weight_lookup.get(&name) {
+                if let Some((offset, len, shape, data_type)) = weights.get(&o.name) {
                     weight_expr(*offset, *len, shape, *data_type, target_type)
                 } else {
                     name
@@ -376,7 +370,7 @@ impl Compiler {
         writeln!(&mut code, "}}")?; // End impl
         Ok(CompilationResult {
             code: String::from_utf8(code).map_err(|e| format!("UTF-8 error: {}", e))?,
-            weights: weights_data,
+            weights: weights.data,
         })
     }
 }

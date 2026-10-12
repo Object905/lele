@@ -30,11 +30,8 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             // makes it an integer division. When it runs in f32 (e.g. on the
             // f32 indices of TopK) the quotient still has to be truncated.
             let integer_in_f32 = ctx.var_types.get(&outputs[0]).map(|t| t.as_str()) != Some("i64")
-                && ctx.node.input.iter().any(|name| {
-                    ctx.known_weights
-                        .get(&sanitize_name(name))
-                        .is_some_and(|w| matches!(w.3, 6 | 7))
-                });
+                && (0..ctx.node.input.len())
+                    .any(|i| ctx.weight(i).is_some_and(|w| matches!(w.3, 6 | 7)));
             let kernel = if integer_in_f32 { "div_trunc" } else { "div" };
             writeln!(
                 w,
@@ -65,8 +62,7 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 "None".to_string()
             };
             // A static B is packed once for the integer GEMM.
-            let b_weight_name = super::super::sanitize_name(&ctx.node.input[1]);
-            if let Some((o, l, sh, dt)) = ctx.known_weights.get(&b_weight_name) {
+            if let Some((o, l, sh, dt)) = ctx.weight(1) {
                 if (*dt == 2 || *dt == 3) && sh.len() == 2 {
                     let k = sh[0];
                     let n = sh[1];
@@ -284,10 +280,14 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             "{}let {} = lele::kernels::prelu(&{}, &{}, {});",
             tab, outputs[0], inputs[0], inputs[1], buf_expr
         )?,
-        "ReduceSum" => {
+        "ReduceSum" | "ReduceProd" | "ReduceMax" => {
+            let kernel = match op {
+                "ReduceSum" => "reduce_sum",
+                "ReduceProd" => "reduce_prod",
+                _ => "reduce_max",
+            };
             let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                let name = &ctx.node.input[1];
-                if let Some((ints, _)) = ctx.int64_map.get(name) {
+                if let Some(ints) = ctx.ints(1) {
                     format!("&{:?}", ints)
                 } else {
                     format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
@@ -312,72 +312,8 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 != 0;
             writeln!(
                 w,
-                "{}let {} = lele::kernels::reduce_sum(&{}, {}, {}, {});",
-                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
-            )?;
-        }
-        "ReduceProd" => {
-            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                let name = &ctx.node.input[1];
-                if let Some((ints, _)) = ctx.int64_map.get(name) {
-                    format!("&{:?}", ints)
-                } else {
-                    format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
-                }
-            } else {
-                let axes_attr = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "axes")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or(vec![]);
-                format!("&{:?}", axes_attr)
-            };
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::reduce_prod(&{}, {}, {}, {});",
-                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
-            )?;
-        }
-        "ReduceMax" => {
-            let axes = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                let name = &ctx.node.input[1];
-                if let Some((ints, _)) = ctx.int64_map.get(name) {
-                    format!("&{:?}", ints)
-                } else {
-                    format!("&lele::kernels::to_i64_vec(&{})", inputs[1])
-                }
-            } else {
-                let axes_attr = ctx
-                    .node
-                    .attribute
-                    .iter()
-                    .find(|a| a.name == "axes")
-                    .map(|a| a.ints.clone())
-                    .unwrap_or(vec![]);
-                format!("&{:?}", axes_attr)
-            };
-            let keepdims = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "keepdims")
-                .map(|a| a.i)
-                .unwrap_or(1)
-                != 0;
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::reduce_max(&{}, {}, {}, {});",
-                tab, outputs[0], inputs[0], axes, keepdims, buf_expr
+                "{}let {} = lele::kernels::{}(&{}, {}, {}, {});",
+                tab, outputs[0], kernel, inputs[0], axes, keepdims, buf_expr
             )?;
         }
         "ReduceMean" => {
@@ -390,11 +326,9 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 .unwrap_or(vec![]);
             // If axes attribute is empty, check second input
             if axes.is_empty()
-                && inputs.len() > 1
-                && !ctx.node.input[1].is_empty()
-                && let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1])
+                && let Some(data) = ctx.ints(1)
             {
-                axes = data.clone();
+                axes = data.to_vec();
             }
             let keepdims = ctx
                 .node
@@ -420,11 +354,9 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
                 .unwrap_or(vec![]);
             // If axes attribute is empty, check second input
             if axes.is_empty()
-                && inputs.len() > 1
-                && !ctx.node.input[1].is_empty()
-                && let Some((data, _shape)) = ctx.int64_map.get(&ctx.node.input[1])
+                && let Some(data) = ctx.ints(1)
             {
-                axes = data.clone();
+                axes = data.to_vec();
             }
             let keepdims = ctx
                 .node
@@ -545,27 +477,10 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
         }
         "STFT" => {
             // ONNX STFT: inputs[0]=signal, inputs[1]=frame_step, inputs[2]=window, inputs[3]=frame_length
-            let frame_step = if ctx.node.input.len() > 1 {
-                if let Some((ints, _)) = ctx.int64_map.get(&ctx.node.input[1]) {
-                    ints[0] as usize
-                } else {
-                    160
-                }
-            } else {
-                160
-            };
-            let n_fft = if ctx.node.input.len() > 3 && !ctx.node.input[3].is_empty() {
-                if let Some((ints, _)) = ctx.int64_map.get(&ctx.node.input[3]) {
-                    ints[0] as usize
-                } else {
-                    512
-                }
-            } else {
-                512
-            };
+            let frame_step = ctx.ints(1).map_or(160, |ints| ints[0] as usize);
+            let n_fft = ctx.ints(3).map_or(512, |ints| ints[0] as usize);
             let window = if ctx.node.input.len() > 2 && !ctx.node.input[2].is_empty() {
-                let wname = sanitize_name(&ctx.node.input[2]);
-                if let Some((o, l, s, _dt)) = ctx.known_weights.get(&wname) {
+                if let Some((o, l, s, _dt)) = ctx.weight(2) {
                     format!("Some(&self.weight_f32({}, {}, &{:?}))", o, l, s)
                 } else {
                     format!("Some(&{})", inputs[2])
@@ -620,13 +535,8 @@ pub(crate) fn handle_math_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io
             }
         }
         "CumSum" => {
-            let axis = if !ctx.node.input.is_empty() && ctx.node.input.len() > 1 {
-                let name = &ctx.node.input[1];
-                if let Some((ints, _)) = ctx.int64_map.get(name) {
-                    ints[0]
-                } else {
-                    0
-                }
+            let axis = if ctx.node.input.len() > 1 {
+                ctx.ints(1).map_or(0, |ints| ints[0])
             } else {
                 ctx.node
                     .attribute

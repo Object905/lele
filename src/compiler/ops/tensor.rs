@@ -18,8 +18,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             if idx >= ctx.node.input.len() || ctx.node.input[idx].is_empty() {
                 return Ok("&[]".to_string());
             }
-            let name = &ctx.node.input[idx];
-            if let Some((ints, _)) = ctx.int64_map.get(name) {
+            if let Some(ints) = ctx.ints(idx) {
                 Ok(format!("&{:?}", ints))
             } else {
                 let is_i64 = ctx
@@ -48,8 +47,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             if idx >= ctx.node.input.len() || ctx.node.input[idx].is_empty() {
                 return Ok("None".to_string());
             }
-            let name = &ctx.node.input[idx];
-            if let Some((ints, _)) = ctx.int64_map.get(name) {
+            if let Some(ints) = ctx.ints(idx) {
                 Ok(format!("Some(&{:?})", ints))
             } else {
                 let is_i64 = ctx
@@ -387,8 +385,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                 };
             // For pad operation, we need pads as &[i64]
             let pads_expr = if ctx.node.input.len() > 1 && !ctx.node.input[1].is_empty() {
-                let name = &ctx.node.input[1];
-                if let Some((ints, _)) = ctx.int64_map.get(name) {
+                if let Some(ints) = ctx.ints(1) {
                     format!("&{:?}", ints)
                 } else {
                     // pads is a computed tensor, we need to extract data
@@ -483,9 +480,11 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             // an int8 initializer with a known blob offset. It is passed by
             // offset rather than as a `TensorView` because the runtime packs it
             // into an architecture-specific layout once and caches that.
-            let weight = crate::compiler::sanitize_name(&ctx.node.input[3]);
-            let Some((offset, len, shape, _)) = ctx.known_weights.get(&weight) else {
-                panic!("QLinearMatMulI8 weight {weight} is not a known initializer");
+            let Some((offset, len, shape, _)) = ctx.weight(3) else {
+                panic!(
+                    "QLinearMatMulI8 weight {} is not a known initializer",
+                    ctx.node.input[3]
+                );
             };
             writeln!(
                 w,
@@ -539,7 +538,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
             )?;
         }
         "Identity" | "Constant" => {
-            if let Some((offset, len, shape, dt)) = ctx.known_weights.get(&outputs[0]) {
+            if let Some((offset, len, shape, dt)) = ctx.weights.get(&ctx.node.output[0]) {
                 let weight_fn = match dt {
                     1 => "weight_f32",
                     2 => "weight_u8",
@@ -554,7 +553,7 @@ pub(crate) fn handle_tensor_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::
                     "{}let {} = self.{}({}, {}, &{:?});",
                     tab, outputs[0], weight_fn, offset, len, shape
                 )?;
-            } else if let Some((ints, shape)) = ctx.int64_map.get(&ctx.node.output[0]) {
+            } else if let Some((ints, shape)) = ctx.weights.int64.get(&ctx.node.output[0]) {
                 let floats: Vec<String> =
                     ints.iter().map(|&x| format!("{:.1}", x as f32)).collect();
                 writeln!(

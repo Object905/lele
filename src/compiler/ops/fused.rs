@@ -4,7 +4,6 @@ use super::super::{
     generate::OpContext,
     generate::weight_expr,
     ir::{Activation, ConvAttrs, Op},
-    sanitize_name,
 };
 use std::io::Write;
 
@@ -24,7 +23,6 @@ impl ConvAttrs {
 pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<bool> {
     let tab = ctx.tab();
     let (inputs, outputs, buf) = (&ctx.inputs, &ctx.outputs, &ctx.buf_expr);
-    let node = ctx.node;
     match &ctx.ir().op {
         Op::Silu => writeln!(
             w,
@@ -50,8 +48,7 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         )?,
         Op::ConvAct { conv, act } => {
             let weight_shape = ctx
-                .known_weights
-                .get(&sanitize_name(&node.input[1]))
+                .weight(1)
                 .map(|(_, _, shape, _)| shape.clone())
                 .unwrap_or(vec![3, 3, 3, 3]);
             let bias = match ctx.ir().input(2) {
@@ -116,7 +113,7 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         Op::QLinearDynamic { relu } => {
             let (x, scale, zero_point, bias) = (&inputs[0], &inputs[2], &inputs[3], &inputs[4]);
             // A static weight is packed once for the integer GEMM.
-            match ctx.known_weights.get(&sanitize_name(&node.input[1])) {
+            match ctx.weight(1) {
                 Some((offset, len, shape, dt)) if (*dt == 2 || *dt == 3) && shape.len() == 2 => {
                     writeln!(
                         w,
@@ -156,12 +153,9 @@ pub(crate) fn handle_fused_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
                 })
             });
             // Weights are read as the type of the fill value.
-            let operand = |i: usize, ty: &str| {
-                let name = sanitize_name(&node.input[i]);
-                match ctx.known_weights.get(&name) {
-                    Some((offset, len, shape, dt)) => weight_expr(*offset, *len, shape, *dt, ty),
-                    None => name,
-                }
+            let operand = |i: usize, ty: &str| match ctx.weight(i) {
+                Some((offset, len, shape, dt)) => weight_expr(*offset, *len, shape, *dt, ty),
+                None => inputs[i].clone(),
             };
             let shape = operand(0, "i64");
             match int_value {

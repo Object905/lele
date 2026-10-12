@@ -1,4 +1,5 @@
 use super::ir::{Graph, Node, NodeId};
+use super::weights::{WeightRef, Weights};
 use super::{Allocator, AnalysisData, Compiler, sanitize_name};
 use crate::model::onnx_proto::{NodeProto, ValueInfoProto};
 use std::collections::{HashMap, HashSet};
@@ -14,8 +15,7 @@ pub(crate) struct OpContext<'a> {
     pub outputs: Vec<String>,
     pub buf_expr: String,
     pub indent: usize,
-    pub known_weights: &'a HashMap<String, (usize, usize, Vec<usize>, i32)>,
-    pub int64_map: &'a HashMap<String, (Vec<i64>, Vec<usize>)>,
+    pub weights: &'a Weights,
     #[allow(dead_code)]
     pub allocator: Option<&'a Allocator>,
     #[allow(dead_code)]
@@ -33,6 +33,16 @@ impl<'a> OpContext<'a> {
     /// The node in the IR.
     pub fn ir(&self) -> &'a Node {
         self.graph.node(self.id)
+    }
+
+    /// The weight input `i` reads, if it reads one.
+    pub fn weight(&self, i: usize) -> Option<&'a WeightRef> {
+        self.weights.get(self.node.input.get(i)?)
+    }
+
+    /// The values of input `i`, if it is an int64 or int32 weight.
+    pub fn ints(&self, i: usize) -> Option<&'a [i64]> {
+        self.weights.ints(self.node.input.get(i)?)
     }
 }
 
@@ -233,8 +243,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
     chunk_writer: &mut Vec<String>, // Function definitions
     body_writer: &mut W,            // Forward body calls
     indent: usize,
-    known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
-    int64_map: &HashMap<String, (Vec<i64>, Vec<usize>)>,
+    weights: &Weights,
     allocator: Option<&Allocator>,
     analysis: Option<&AnalysisData>,
     current_id: &mut usize,
@@ -269,13 +278,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         }
         for inp in &used_raw {
             let name = sanitize_name(inp);
-            if name.is_empty() {
-                continue;
-            }
-            if known_weights.contains_key(&name) {
-                continue;
-            }
-            if int64_map.contains_key(inp) {
+            if name.is_empty() || weights.contains(inp) {
                 continue;
             }
             if !defined_sanitized_chunk.contains(&name) {
@@ -301,11 +304,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         if let Some(an) = analysis {
             for raw in potent_live {
                 let sanitized = sanitize_name(&raw);
-                // Filter weights
-                if known_weights.contains_key(&sanitized) {
-                    continue;
-                }
-                if int64_map.contains_key(&raw) {
+                if weights.contains(&raw) {
                     continue;
                 }
                 // If defined in this chunk OR is an input arg
@@ -355,16 +354,7 @@ pub(crate) fn generate_partitioned_graph<W: Write>(
         )?;
         // Generate body
         generate_nodes(
-            chunk,
-            &mut f,
-            2,
-            known_weights,
-            int64_map,
-            allocator,
-            analysis,
-            current_id,
-            compiler,
-            var_types,
+            chunk, &mut f, 2, weights, allocator, analysis, current_id, compiler, var_types,
         )?;
         // Return — detach_or_own (zero-copy) for f32 views of the workspace or the weights,
         // which outlive the chunk; to_owned for everything else, i64 and views of buffers
@@ -485,8 +475,7 @@ pub(crate) fn generate_nodes(
     ir_nodes: Nodes<'_>,
     w: &mut dyn Write,
     indent: usize,
-    known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
-    int64_map: &HashMap<String, (Vec<i64>, Vec<usize>)>,
+    weights: &Weights,
     allocator: Option<&Allocator>,
     analysis: Option<&AnalysisData>,
     current_id: &mut usize,
@@ -502,7 +491,7 @@ pub(crate) fn generate_nodes(
         let remaining_nodes = &nodes[idx..];
         for pattern in &compiler.patterns {
             if let Some(len) = (pattern.matcher)(remaining_nodes) {
-                (pattern.generator)(remaining_nodes, known_weights, allocator, w, indent)?;
+                (pattern.generator)(remaining_nodes, &weights.lookup, allocator, w, indent)?;
                 matched_len = len;
                 break;
             }
@@ -521,7 +510,7 @@ pub(crate) fn generate_nodes(
         let op = node.op_type.as_str();
         let outputs: Vec<String> = node.output.iter().map(|s| sanitize_name(s)).collect();
         // Skip Code Generation for Constants that are already in weights
-        if op == "Constant" && !outputs.is_empty() && known_weights.contains_key(&outputs[0]) {
+        if op == "Constant" && !outputs.is_empty() && weights.get(&node.output[0]).is_some() {
             continue;
         }
         // Check if Div/Mod output is i64 (e.g. integer division for shape computation)
@@ -539,7 +528,7 @@ pub(crate) fn generate_nodes(
             .iter()
             .map(|s| {
                 let name = sanitize_name(s);
-                if let Some((offset, len, shape, data_type)) = known_weights.get(&name) {
+                if let Some((offset, len, shape, data_type)) = weights.get(s) {
                     // For Div/Mod: only force f32 when output is NOT i64.
                     // When output is i64 (integer division), keep i64 types.
                     let force_f32 = matches!(op, "Div" | "Mod") && !div_mod_output_is_i64;
@@ -548,24 +537,7 @@ pub(crate) fn generate_nodes(
                     } else {
                         var_types.get(&name).map(|s| s.as_str()).unwrap_or("f32")
                     };
-                    if target_type == "i64" {
-                        match data_type {
-                            7 => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape),
-                            6 => format!("self.weight_i32_i64({}, {}, &{:?})", offset, len, shape),
-                            9 => format!("self.weight_bool_i64({}, {}, &{:?})", offset, len, shape),
-                            _ => format!("self.weight_i64({}, {}, &{:?})", offset, len, shape), // fallback
-                        }
-                    } else {
-                        match data_type {
-                            1 => format!("self.weight_f32({}, {}, &{:?})", offset, len, shape),
-                            2 => format!("self.weight_u8({}, {}, &{:?})", offset, len, shape),
-                            3 => format!("self.weight_i8({}, {}, &{:?})", offset, len, shape),
-                            6 => format!("self.weight_i32_f32({}, {}, &{:?})", offset, len, shape),
-                            7 => format!("self.weight_i64_f32({}, {}, &{:?})", offset, len, shape),
-                            10 => format!("self.weight_f16({}, {}, &{:?})", offset, len, shape),
-                            _ => format!("self.weight_f32({}, {}, &{:?})", offset, len, shape),
-                        }
-                    }
+                    weight_expr(*offset, *len, shape, *data_type, target_type)
                 } else {
                     name
                 }
@@ -650,8 +622,7 @@ pub(crate) fn generate_nodes(
             outputs: outputs.clone(),
             buf_expr,
             indent,
-            known_weights,
-            int64_map,
+            weights,
             allocator,
             analysis,
             current_id,
@@ -734,7 +705,7 @@ mod tests {
     /// Code generated for `node` alone.
     fn generate_one(
         node: &NodeProto,
-        known_weights: &HashMap<String, (usize, usize, Vec<usize>, i32)>,
+        weights: &Weights,
         compiler: &Compiler,
         var_types: &HashMap<String, String>,
     ) -> String {
@@ -754,8 +725,7 @@ mod tests {
             nodes,
             &mut output,
             0,
-            known_weights,
-            &HashMap::new(),
+            weights,
             None,
             None,
             &mut 0,
@@ -786,7 +756,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = generate_one(&node, &HashMap::new(), &compiler, &HashMap::new());
+        let result = generate_one(&node, &Weights::default(), &compiler, &HashMap::new());
         assert!(result.contains("// Custom implementation for output1"));
         assert!(result.contains("let output1 = custom_kernel(&input1);"));
     }
@@ -818,16 +788,14 @@ mod tests {
         let mut ir = crate::compiler::ir::Graph::from_onnx(graph);
         crate::compiler::passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
-        let mut known_weights = HashMap::new();
-        known_weights.insert("k".to_string(), (0, 8, vec![1], 7));
-        known_weights.insert("classes".to_string(), (8, 8, vec![], 7));
+        let weights = Weights::collect(&ir);
         assert_eq!(var_types["indices"], "f32");
         assert_eq!(var_types["anchor"], "f32");
 
-        let result = generate_one(&div, &known_weights, &Compiler::new(), &var_types);
+        let result = generate_one(&div, &weights, &Compiler::new(), &var_types);
         assert!(
             result.contains(
-                "let anchor = lele::kernels::div_trunc(&indices, &self.weight_i64_f32(8, 8, &[]), &mut buf_anchor);"
+                "let anchor = lele::kernels::div_trunc(&indices, &self.weight_i64_f32(16, 8, &[]), &mut buf_anchor);"
             ),
             "{result}"
         );
@@ -843,7 +811,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = generate_one(&node, &HashMap::new(), &compiler, &HashMap::new());
+        let result = generate_one(&node, &Weights::default(), &compiler, &HashMap::new());
         assert!(result.contains("let mut buf_c = Vec::<f32>::new();"));
         assert!(result.contains("let c = lele::kernels::add(&a, &b, &mut buf_c);"));
     }

@@ -75,22 +75,18 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             let dilations = conv.dilations.clone().unwrap_or_default();
             let group = conv.group.unwrap_or(1);
             let auto_pad = conv.auto_pad.as_deref().unwrap_or("NOTSET");
-            let kernel_shape: Vec<i64> = {
-                let weight_name = &ctx.node.input[1];
-                let weight_name_s = super::super::sanitize_name(weight_name);
-                ctx.known_weights
-                    .get(&weight_name_s)
-                    .and_then(|(_, _, shape, _)| {
-                        if shape.len() >= 4 {
-                            Some(vec![shape[2] as i64, shape[3] as i64])
-                        } else if shape.len() == 3 {
-                            Some(vec![shape[2] as i64])
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default()
-            };
+            let kernel_shape: Vec<i64> = ctx
+                .weight(1)
+                .and_then(|(_, _, shape, _)| {
+                    if shape.len() >= 4 {
+                        Some(vec![shape[2] as i64, shape[3] as i64])
+                    } else if shape.len() == 3 {
+                        Some(vec![shape[2] as i64])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
             let pads = if auto_pad != "NOTSET" && !auto_pad.is_empty() {
                 compute_same_pads(&kernel_shape, &[1, 1], &dilations, auto_pad).unwrap_or_default()
             } else {
@@ -103,11 +99,8 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 "None".to_string()
             };
             // Determine conv1d vs conv2d based on weight tensor rank
-            let weight_name = &ctx.node.input[1];
-            let weight_name_s = super::super::sanitize_name(weight_name);
             let weight_rank = ctx
-                .known_weights
-                .get(&weight_name_s)
+                .weight(1)
                 .map(|(_, _, shape, _)| shape.len())
                 .unwrap_or(3);
             let kernel_fn = if weight_rank >= 4 { "conv2d" } else { "conv1d" };
@@ -368,9 +361,7 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
                 "None".to_string()
             };
             // A static weight is prepared once, on first use.
-            let weight = ctx
-                .known_weights
-                .get(&super::super::sanitize_name(&ctx.node.input[1]));
+            let weight = ctx.weight(1);
             match weight {
                 Some((offset, len, shape, dt)) if (*dt == 2 || *dt == 3) && shape.len() == 4 => {
                     writeln!(

@@ -25,14 +25,14 @@ pub(crate) fn handle_control_flow_ops(
                 panic!("If node {} without both branches", ctx.node.name);
             };
             // A branch output is either a weight or a variable of the branch.
-            let (known_weights, var_types) = (ctx.known_weights, ctx.var_types);
+            let (weights, var_types) = (ctx.weights, ctx.var_types);
             let branch_outputs = |branch: &Graph| -> Vec<String> {
                 branch
                     .outputs
                     .iter()
                     .map(|&o| {
                         let name = sanitize_name(&branch.value(o).name);
-                        match known_weights.get(&name) {
+                        match weights.get(&name) {
                             Some((offset, len, shape, data_type)) => {
                                 let ty = var_types.get(&name).map_or("f32", |s| s.as_str());
                                 let weight = weight_expr(*offset, *len, shape, *data_type, ty);
@@ -75,8 +75,7 @@ pub(crate) fn handle_control_flow_ops(
                     nodes,
                     w,
                     ctx.indent + 1,
-                    ctx.known_weights,
-                    ctx.int64_map,
+                    ctx.weights,
                     ctx.allocator,
                     None, // Subgraphs have their own scope
                     ctx.current_id,
