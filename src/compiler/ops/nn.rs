@@ -279,20 +279,13 @@ pub(crate) fn handle_nn_ops(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::
             }
         }
         "LayerNormalization" => {
-            let epsilon = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "epsilon")
-                .map(|a| a.f)
-                .unwrap_or(1e-5);
-            let axis = ctx
-                .node
-                .attribute
-                .iter()
-                .find(|a| a.name == "axis")
-                .map(|a| a.i)
-                .unwrap_or(-1);
+            let (axis, epsilon) = match ctx.ir().op {
+                Op::LayerNormalization { axis, epsilon } => (axis, epsilon),
+                _ => panic!(
+                    "LayerNormalization '{}' outside the default domain",
+                    ctx.node.name
+                ),
+            };
             let scale = if ctx.node.input.len() > 1
                 && !ctx.node.input[1].is_empty()
                 && !inputs[1].is_empty()
