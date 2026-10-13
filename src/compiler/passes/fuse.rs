@@ -370,6 +370,13 @@ fn fuse_linear(g: &mut Graph) {
         let fused = (0..2).find_map(|k| {
             let node = g.node(add);
             let mm = sole_producer(g, node.input(k), |op| matches!(op, Op::MatMul))?;
+            // `Linear` computes the product's shape: not an `Add` that broadcasts
+            // it to more (when shape inference knows both).
+            let shape = |v: Option<ValueId>| v.and_then(|v| g.value(v).shape.clone());
+            match (shape(node.input(k)), shape(node.output(0))) {
+                (Some(product), Some(sum)) if product != sum => return None,
+                _ => {}
+            }
             Some((mm, node.input(1 - k)))
         });
         if let Some((mm, bias)) = fused {
@@ -596,6 +603,53 @@ mod tests {
             node("Add", &["m", "s"], "y"),
         ];
         assert_eq!(fused(nodes, vec![]), ["Sigmoid", "Mul", "Add"]);
+    }
+
+    /// `MatMul` + `Add` of shaped inputs fuses when the sum has the product's shape,
+    /// and not when the `Add` broadcasts the product to more (a bias with extra
+    /// leading dimensions), which `Linear` cannot compute.
+    #[test]
+    fn fuses_linear_only_when_the_bias_keeps_the_product_shape() {
+        use crate::model::onnx_proto::{TensorShapeProto, TypeProto, tensor_shape_proto, type_proto};
+        let input = |name: &str, dims: &[i64]| ValueInfoProto {
+            name: name.to_string(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: crate::compiler::ir::DType::F32.to_onnx(),
+                    shape: Some(TensorShapeProto {
+                        dim: dims
+                            .iter()
+                            .map(|&d| tensor_shape_proto::Dimension {
+                                value: Some(tensor_shape_proto::dimension::Value::DimValue(d)),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fused = |bias: &[i64]| {
+            let g = GraphProto {
+                node: vec![node("MatMul", &["x", "w"], "m"), node("Add", &["m", "b"], "y")],
+                input: vec![input("x", &[2, 3]), input("w", &[3, 4]), input("b", bias)],
+                output: vec![ValueInfoProto {
+                    name: "y".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let mut ir = Graph::from_onnx(g);
+            crate::compiler::passes::infer_dtypes(&mut ir);
+            crate::compiler::passes::fold_shapes(&mut ir);
+            fuse(&mut ir);
+            ir.into_onnx().node.into_iter().map(|n| n.op_type).collect::<Vec<_>>()
+        };
+        assert_eq!(fused(&[4]), ["Linear"]);
+        assert_eq!(fused(&[2, 4]), ["Linear"]);
+        assert_eq!(fused(&[5, 1, 4]), ["MatMul", "Add"]);
+        assert_eq!(fused(&[1, 2, 4]), ["MatMul", "Add"]);
     }
 
     #[test]
