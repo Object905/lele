@@ -1660,6 +1660,35 @@ pub fn reduce_l2<'b, 'a>(
         out.resize(out_numel, 0.0);
     }
     out.fill(0.0);
+    // Fast path: the reduced axes are consecutive, so the input is `[outer, reduced,
+    // inner]` and each output the norm of `reduced` elements `inner` apart; squares
+    // summed row by row of `inner` elements, or along a run when `inner` is 1.
+    if let (Some(&first), Some(&last)) = (resolved_axes.first(), resolved_axes.last())
+        && last - first + 1 == resolved_axes.len()
+    {
+        let reduced: usize = input.shape[first..=last].iter().product();
+        let inner: usize = input.shape[last + 1..].iter().product();
+        let data = &input.data[..];
+        for (o, out_block) in out[..out_numel].chunks_mut(inner.max(1)).enumerate() {
+            let block = &data[o * reduced * inner..][..reduced * inner];
+            if inner == 1 {
+                out_block[0] = sum_squares(block).sqrt();
+            } else {
+                for row in block.chunks_exact(inner) {
+                    for (s, &v) in out_block.iter_mut().zip(row) {
+                        *s += v * v;
+                    }
+                }
+                for s in out_block.iter_mut() {
+                    *s = s.sqrt();
+                }
+            }
+        }
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(out_shape),
+        };
+    }
     let real_out_strides = utils::compute_strides(&out_shape);
     let mut input_to_out_strides = vec![0; dims];
     let mut out_dim_idx = 0;
@@ -1702,6 +1731,23 @@ pub fn reduce_l2<'b, 'a>(
         data: Cow::Borrowed(out),
         shape: Cow::Owned(out_shape),
     }
+}
+
+/// The sum of the squares of `run`, in eight independent accumulators (f32 addition is
+/// not associative, so a single one would keep the loop serial on the add latency).
+fn sum_squares(run: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let (chunks, rest) = run.as_chunks::<8>();
+    for c in chunks {
+        for (a, &v) in acc.iter_mut().zip(c) {
+            *a += v * v;
+        }
+    }
+    let mut s = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    for &v in rest {
+        s += v * v;
+    }
+    s
 }
 
 pub fn max<'b, 'a>(
@@ -2337,6 +2383,7 @@ pub fn stft_power_spectrum<'b, 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernels::test_util::assert_close;
     use crate::tensor::TensorView;
 
     /// Every set of axes of a `[2, 3, 4, 5]` tensor (consecutive ones take the fast
@@ -2371,6 +2418,43 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(got.shape.as_ref(), &want_shape[..], "axes {axes:?}");
+            }
+        }
+    }
+
+    /// Every set of axes of a `[2, 3, 4, 11]` tensor (consecutive ones take the fast
+    /// path; a last axis of 11 sums one chunk of eight and a remainder), with and
+    /// without kept dimensions, against a reference in f64.
+    #[test]
+    fn test_reduce_l2_matches_reference_on_every_axis_set() {
+        let shape = [2usize, 3, 4, 11];
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| ((i * 37) % n) as f32 / 10.0 - 13.0).collect();
+        let t = TensorView::from_slice(&data, shape.to_vec());
+        for mask in 1u32..16 {
+            let axes: Vec<i64> = (0..4).filter(|d| mask & (1 << d) != 0).collect();
+            for keepdims in [false, true] {
+                let mut out = Vec::new();
+                let got = reduce_l2(&t, &axes, keepdims, &mut out);
+                let kept: Vec<usize> = (0..4).filter(|&d| mask & (1 << d) == 0).collect();
+                let out_n: usize = kept.iter().map(|&d| shape[d]).product();
+                let mut want = vec![0.0f64; out_n];
+                for (i, &v) in data.iter().enumerate() {
+                    let idx = [i / 132, i / 44 % 3, i / 11 % 4, i % 11];
+                    let o = kept.iter().fold(0, |o, &d| o * shape[d] + idx[d]);
+                    want[o] += v as f64 * v as f64;
+                }
+                let want: Vec<f64> = want.iter().map(|s| s.sqrt()).collect();
+                let what = format!("axes {axes:?} keepdims {keepdims}");
+                assert_close(&got.data, &want, 1e-6, &what);
+                let want_shape: Vec<usize> = (0..4)
+                    .filter_map(|d| match (mask & (1 << d) != 0, keepdims) {
+                        (false, _) => Some(shape[d]),
+                        (true, true) => Some(1),
+                        (true, false) => None,
+                    })
+                    .collect();
+                assert_eq!(got.shape.as_ref(), &want_shape[..], "{what}");
             }
         }
     }
