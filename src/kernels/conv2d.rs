@@ -820,15 +820,29 @@ fn resize_nearest_inner<'b, 'a>(
         })
         .collect();
 
+    // Each input column twice, as an upsampling by 2 gives.
+    let doubled = out_w == 2 * in_w && col_map.iter().enumerate().all(|(ow, &iw)| iw == ow / 2);
     for n in 0..batch {
         for c in 0..channels {
             let in_offset = (n * channels + c) * in_h * in_w;
             let out_offset = (n * channels + c) * out_h * out_w;
+            let plane = &mut out[out_offset..][..out_h * out_w];
             for (oh, &ih) in row_map.iter().enumerate() {
+                // A row from the same input row as the one above is a copy of it.
+                if oh > 0 && row_map[oh - 1] == ih {
+                    plane.copy_within((oh - 1) * out_w..oh * out_w, oh * out_w);
+                    continue;
+                }
                 let in_row = &data[in_offset + ih * in_w..][..in_w];
-                let out_row = &mut out[out_offset + oh * out_w..][..out_w];
-                for (o, &iw) in out_row.iter_mut().zip(&col_map) {
-                    *o = in_row[iw];
+                let out_row = &mut plane[oh * out_w..][..out_w];
+                if doubled {
+                    for (pair, &v) in out_row.as_chunks_mut::<2>().0.iter_mut().zip(in_row) {
+                        *pair = [v, v];
+                    }
+                } else {
+                    for (o, &iw) in out_row.iter_mut().zip(&col_map) {
+                        *o = in_row[iw];
+                    }
                 }
             }
         }
@@ -1904,6 +1918,40 @@ mod tests {
     }
 
     // ==================== resize_nearest tests ====================
+
+    #[test]
+    fn test_resize_nearest_matches_gather() {
+        // Upsampling by 2 (rows copied, columns doubled), by 3 and 1.5 (rows copied),
+        // and downsampling, in both coordinate modes.
+        let (c, h, w) = (3usize, 5usize, 7usize);
+        let data: Vec<f32> = (0..c * h * w).map(|v| v as f32).collect();
+        let input = TensorView::from_slice(&data, vec![1, c, h, w]);
+        for scale in [2.0f32, 3.0, 1.5, 0.5] {
+            for mode in ["asymmetric", "half_pixel"] {
+                let mut out = Vec::new();
+                let got = resize_nearest_inner(&input, Some(&[1.0, 1.0, scale, scale]), None, mode, &mut out);
+                let (oh_n, ow_n) = (got.shape[2], got.shape[3]);
+                let src = |o: usize, n_in: usize, n_out: usize| -> usize {
+                    let s = n_in as f32 / n_out as f32;
+                    let v = if mode == "asymmetric" {
+                        (o as f32 * s).floor()
+                    } else {
+                        ((o as f32 + 0.5) * s - 0.5).round().max(0.0)
+                    };
+                    v.min((n_in - 1) as f32) as usize
+                };
+                let mut want = Vec::new();
+                for ch in 0..c {
+                    for oh in 0..oh_n {
+                        for ow in 0..ow_n {
+                            want.push(data[(ch * h + src(oh, h, oh_n)) * w + src(ow, w, ow_n)]);
+                        }
+                    }
+                }
+                assert_eq!(got.data.as_ref(), &want[..], "scale {scale} {mode}");
+            }
+        }
+    }
 
     #[test]
     fn test_resize_nearest_identity() {
