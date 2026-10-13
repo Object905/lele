@@ -34,6 +34,16 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             "{tab}let {} = lele::kernels::scale_norm(&{}, &{}, {scale:?}, {epsilon:?}, {buf});",
             outputs[0], inputs[0], inputs[1]
         )?,
+        Op::SimAm {
+            axes,
+            lambda,
+            scale,
+            shift,
+        } => writeln!(
+            w,
+            "{tab}let {} = lele::kernels::simam(&{}, &{}, {axes}, {lambda:?}, {scale:?}, {shift:?}, {buf});",
+            outputs[0], inputs[0], inputs[1]
+        )?,
         Op::Gelu { approximate } => {
             let kernel = match approximate.as_deref() {
                 None | Some("none") => "gelu_erf",

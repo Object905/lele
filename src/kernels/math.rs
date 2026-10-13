@@ -1190,6 +1190,100 @@ fn reduced_shape(shape: &[usize], axes: &[usize], keepdims: bool) -> Vec<usize> 
     out
 }
 
+/// The sum of `run`, in the order the reductions add a contiguous run.
+fn sum_run<T: Copy + std::ops::AddAssign>(run: &[T], zero: T) -> T {
+    // Eight independent accumulators: f32 addition is not associative, so a
+    // single one would keep the loop serial on the add latency.
+    let mut acc = [zero; 8];
+    let (chunks, rest) = run.as_chunks::<8>();
+    for c in chunks {
+        for (a, &v) in acc.iter_mut().zip(c) {
+            *a += v;
+        }
+    }
+    let [mut s, mut s1, mut s2, mut s3, s4, s5, s6, s7] = acc;
+    s += s4;
+    s1 += s5;
+    s2 += s6;
+    s3 += s7;
+    s += s1;
+    s2 += s3;
+    s += s2;
+    for &v in rest {
+        s += v;
+    }
+    s
+}
+
+/// SimAM attention over the planes of the last `axes` axes of `input`:
+/// `x * sigmoid(d / ((Σd / n + lambda) * scale) + shift)` with `d = (x - mean)²`
+/// and `n` a scalar (models pass the plane size less one). Each step rounds as
+/// the `ReduceMean`, `Sub`, `Pow`, `ReduceSum`, `Div`, `Add`, `Mul`, `Div`,
+/// `Add`, `Sigmoid` and `Mul` it replaces do, so the result is theirs bit for
+/// bit, in one pass over each plane where they take eleven over the tensor.
+pub fn simam<'a>(
+    input: &TensorView<'_>,
+    n: &TensorView<'_>,
+    axes: usize,
+    lambda: f32,
+    scale: f32,
+    shift: f32,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let rank = input.shape.len();
+    assert!((1..=rank).contains(&axes), "simam: {axes} axes of a rank-{rank} input");
+    let [n] = n.data[..] else {
+        panic!("simam: n of {} elements", n.data.len())
+    };
+    let plane: usize = input.shape[rank - axes..].iter().product();
+    let len = input.data.len();
+    // SAFETY: every plane is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
+    if plane > 0 {
+        let inv_plane = 1.0f32 / plane as f32;
+        let level = Level::new();
+        for (x, o) in input.data.chunks_exact(plane).zip(out.chunks_exact_mut(plane)) {
+            let mean = sum_run(x, 0.0) * inv_plane;
+            for (o, &x) in o.iter_mut().zip(x) {
+                let d = x - mean;
+                *o = d * d;
+            }
+            let denom = (sum_run(o, 0.0) / n + lambda) * scale;
+            simd_call!(level, max = Avx2, simam_plane_simd(x, o, denom, shift));
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(&out[..len]),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+/// `d = x * sigmoid(d / denom + shift)` over a plane.
+#[simd]
+fn simam_plane_simd<S: Simd>(simd: S, x: &[f32], d: &mut [f32], denom: f32, shift: f32) {
+    use fearless_simd::{f32x16, prelude::*};
+    let (denom, shift) = (f32x16::splat(simd, denom), f32x16::splat(simd, shift));
+    // (A macro, not a closure: a closure would not get the target features.)
+    macro_rules! gate {
+        ($x:expr, $d:expr) => {{
+            let e = f32x16::load_array_ref(simd, $d) / denom + shift;
+            (f32x16::load_array_ref(simd, $x) * vm::sigmoid(e)).store_array($d);
+        }};
+    }
+    let (xs, x_tail) = x.as_chunks::<16>();
+    let (ds, d_tail) = d.as_chunks_mut::<16>();
+    for (x, d) in xs.iter().zip(ds) {
+        gate!(x, d);
+    }
+    if !x_tail.is_empty() {
+        let (mut x, mut d) = ([0.0; 16], [0.0; 16]);
+        x[..x_tail.len()].copy_from_slice(x_tail);
+        d[..x_tail.len()].copy_from_slice(d_tail);
+        gate!(&x, &mut d);
+        d_tail.copy_from_slice(&d[..x_tail.len()]);
+    }
+}
+
 /// Writes the sums of `data` (as [outer, reduced, inner]) over its middle axis
 /// to `out` (as [outer, inner]).
 fn sum_adjacent<T: Copy + std::ops::AddAssign>(
@@ -1201,27 +1295,7 @@ fn sum_adjacent<T: Copy + std::ops::AddAssign>(
     let out = &mut out[..outer * inner];
     if inner == 1 {
         for (dst, run) in out.iter_mut().zip(data.chunks_exact(reduced)) {
-            // Eight independent accumulators: f32 addition is not associative,
-            // so a single one would keep the loop serial on the add latency.
-            let mut acc = [zero; 8];
-            let (chunks, rest) = run.as_chunks::<8>();
-            for c in chunks {
-                for (a, &v) in acc.iter_mut().zip(c) {
-                    *a += v;
-                }
-            }
-            let [mut s, mut s1, mut s2, mut s3, s4, s5, s6, s7] = acc;
-            s += s4;
-            s1 += s5;
-            s2 += s6;
-            s3 += s7;
-            s += s1;
-            s2 += s3;
-            s += s2;
-            for &v in rest {
-                s += v;
-            }
-            *dst = s;
+            *dst = sum_run(run, zero);
         }
     } else {
         for (dst, block) in out.chunks_exact_mut(inner).zip(data.chunks_exact(reduced * inner)) {
@@ -3030,6 +3104,45 @@ mod tests {
             .collect();
         for (a, b) in res.data.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6, "mismatch: got {} expected {}", a, b);
+        }
+    }
+
+    /// `simam` is the chain it replaces, bit for bit, over planes of one and two
+    /// axes around the vector widths.
+    #[test]
+    fn test_simam_is_the_unfused_chain() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_same_bits};
+        let mut rng = Rng::new(13);
+        let (lambda, scale, shift) = (1e-4, 4.0, 0.5);
+        for &w in AWKWARD_LENS {
+            for (shape, axes) in [(vec![2, 3, w], 1), (vec![1, 2, 3, w], 2)] {
+                let data = rng.vec(shape.iter().product(), -3.0, 3.0);
+                let x = TensorView::from_slice(&data, shape.clone());
+                let reduced: Vec<i64> = (shape.len() - axes..shape.len()).map(|a| a as i64).collect();
+                let plane: usize = shape[shape.len() - axes..].iter().product();
+                let n_val = plane as f32 - 1.0;
+                let n = TensorView::from_slice(std::slice::from_ref(&n_val), vec![]);
+                fn scalar(v: &f32) -> TensorView<'_> {
+                    TensorView::from_slice(std::slice::from_ref(v), vec![])
+                }
+                let mut bufs: [Vec<f32>; 11] = Default::default();
+                let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10] = &mut bufs;
+                let mean = reduce_mean(&x, &reduced, true, b0);
+                let centered = sub(&x, &mean, b1);
+                let d = pow(&centered, &scalar(&2.0), b2);
+                let sum = reduce_sum(&d, &reduced, true, b3);
+                let var = div(&sum, &n, b4);
+                let biased = add(&var, &scalar(&lambda), b5);
+                let denom = mul(&biased, &scalar(&scale), b6);
+                let energy = div(&d, &denom, b7);
+                let shifted = add(&energy, &scalar(&shift), b8);
+                let gate = sigmoid(&shifted, b9);
+                let want = mul(&x, &gate, b10);
+                let mut out = vec![7.0; 3];
+                let got = simam(&x, &n, axes, lambda, scale, shift, &mut out);
+                assert_eq!(got.shape, want.shape);
+                assert_same_bits(&got.data, &want.data, &format!("shape {shape:?} axes {axes}"));
+            }
         }
     }
 }

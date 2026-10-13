@@ -500,6 +500,15 @@ pub enum Op {
         scale: f32,
         epsilon: f32,
     },
+    /// SimAM attention over the planes of the last `axes` axes:
+    /// `x * sigmoid(d / (scale * (ReduceSum(d) / n + lambda)) + shift)` with
+    /// `d = (x - ReduceMean(x))^2`. Inputs: `[x, n]`, `n` a scalar.
+    SimAm {
+        axes: usize,
+        lambda: f32,
+        scale: f32,
+        shift: f32,
+    },
     /// `MatMul` + `Add`. Inputs: `[a, b, bias]`.
     Linear,
     /// Dynamically quantized linear layer: `DynamicQuantizeLinear` of the
@@ -777,6 +786,7 @@ impl Op {
             Op::ConvAct { .. } => "ConvAct",
             Op::Silu => "Silu",
             Op::ScaleNorm { .. } => "ScaleNorm",
+            Op::SimAm { .. } => "SimAm",
             Op::Linear => "Linear",
             Op::QLinearDynamic { .. } => "QLinearDynamic",
             Op::EmbeddingConcat { .. } => "EmbeddingConcat",
@@ -929,6 +939,17 @@ impl Op {
             Op::ScaleNorm { scale, epsilon } => {
                 set_attr_f(attrs, "scale", scale, 1.0);
                 set_attr_f(attrs, "epsilon", epsilon, 0.0);
+            }
+            Op::SimAm {
+                axes,
+                lambda,
+                scale,
+                shift,
+            } => {
+                set_attr_i(attrs, "axes", axes as i64, 0);
+                set_attr_f(attrs, "lambda", lambda, 0.0);
+                set_attr_f(attrs, "scale", scale, 1.0);
+                set_attr_f(attrs, "shift", shift, 0.0);
             }
             Op::QuantizeLinear(a) | Op::DequantizeLinear(a) | Op::FakeQuantizeLinear(a) => {
                 a.write(attrs)
