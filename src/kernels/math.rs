@@ -49,6 +49,24 @@ fn sigmoid_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
     vm::map!(simd, src, out, vm::sigmoid)
 }
 
+fn sin_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, sin_simd(src, out))
+}
+
+#[simd]
+fn sin_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::sin)
+}
+
+fn cos_into(level: Level, src: &[f32], out: &mut [f32]) {
+    simd_call!(level, max = Avx2, cos_simd(src, out))
+}
+
+#[simd]
+fn cos_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32]) {
+    vm::map!(simd, src, out, vm::cos)
+}
+
 fn silu_into(level: Level, src: &[f32], out: &mut [f32]) {
     simd_call!(level, max = Avx2, silu_simd(src, out))
 }
@@ -2065,24 +2083,10 @@ pub fn range_i64<'a>(
     TensorView::from_slice(out, vec![n])
 }
 pub fn sin<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let numel = input.data.len();
-    // SAFETY: every element is written below before any is read.
-    unsafe { utils::ensure_capacity(out, numel) };
-    let out_slice = out.as_mut_slice();
-    for i in 0..numel {
-        out_slice[i] = input.data[i].sin();
-    }
-    TensorView::from_slice(out, input.shape.to_vec())
+    unary(input, out, sin_into)
 }
 pub fn cos<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
-    let numel = input.data.len();
-    // SAFETY: every element is written below before any is read.
-    unsafe { utils::ensure_capacity(out, numel) };
-    let out_slice = out.as_mut_slice();
-    for i in 0..numel {
-        out_slice[i] = input.data[i].cos();
-    }
-    TensorView::from_slice(out, input.shape.to_vec())
+    unary(input, out, cos_into)
 }
 pub fn exp<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     unary(input, out, exp_into)
