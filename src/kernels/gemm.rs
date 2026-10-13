@@ -158,14 +158,10 @@ pub fn matmul_fused_add<'a>(
         }
     }
 
-    let mut out_shape = if batch_a >= batch_b {
-        a.shape[..a_dims - 2].to_vec()
-    } else {
-        b.shape[..b_dims - 2].to_vec()
-    };
-    if out_shape.is_empty() {
-        // Both inputs are 2D, no batch dims
-    }
+    // As in `matmul`, batch dims broadcast numpy-style: `[M,K] x [1,K,N]` is
+    // `[1,M,N]`.
+    let mut out_shape = utils::broadcast_shapes(&a.shape[..a_dims - 2], &b.shape[..b_dims - 2])
+        .expect("MatMul batch dims do not broadcast");
     out_shape.push(m);
     out_shape.push(n);
 

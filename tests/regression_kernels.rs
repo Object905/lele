@@ -1833,6 +1833,34 @@ fn test_matmul_2d_by_3d_keeps_batch_dim() {
 }
 
 #[test]
+fn test_matmul_fused_add_2d_by_3d_keeps_batch_dim() {
+    // T-one's mel filterbank plus its bias, fused into Linear: the batch dim
+    // used to be dropped as in `matmul`, giving [64, T].
+    let (m, k, n) = (3usize, 4usize, 5usize);
+    let a: Vec<f32> = (0..m * k).map(|i| i as f32 * 0.5 - 2.0).collect();
+    let mut want = Vec::new();
+    for (batch, bias) in [(1usize, vec![0.25f32]), (2, (0..n).map(|j| j as f32).collect())] {
+        let b: Vec<f32> = (0..batch * k * n).map(|i| (i % 7) as f32 - 3.0).collect();
+        want.clear();
+        for bi in 0..batch {
+            for i in 0..m {
+                for j in 0..n {
+                    let dot: f32 = (0..k).map(|p| a[i * k + p] * b[bi * k * n + p * n + j]).sum();
+                    want.push(dot + bias[j % bias.len()]);
+                }
+            }
+        }
+        let ta = TensorView::from_slice(&a, vec![m, k]);
+        let tb = TensorView::from_slice(&b, vec![batch, k, n]);
+        let tbias = TensorView::from_slice(&bias, vec![bias.len()]);
+        let mut buf = Vec::new();
+        let got = matmul_fused_add(&ta, &tb, &tbias, &mut buf);
+        assert_eq!(got.shape.as_ref(), &[batch, m, n]);
+        assert_close(&got.data, &want, 1e-4, &format!("matmul_fused_add 2d x [{batch},k,n]"));
+    }
+}
+
+#[test]
 fn test_split_without_sizes_splits_evenly() {
     // No `split` input or attribute: the compiler passes zeros, meaning
     // equal parts (the GLU in a conformer's conv module).
