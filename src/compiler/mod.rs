@@ -265,10 +265,20 @@ impl Compiler {
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    pub fn new(data: &'a [u8]) -> Self {{")?;
-        writeln!(
-            &mut code,
-            "        Self {{ weights: lele::runtime::Weights::new(data) }}"
-        )?;
+        // f16 weights are converted to f32 once, here, not on every read.
+        let f16 = weights.f16_regions();
+        if f16.is_empty() {
+            writeln!(
+                &mut code,
+                "        Self {{ weights: lele::runtime::Weights::new(data) }}"
+            )?;
+        } else {
+            writeln!(
+                &mut code,
+                "        Self {{ weights: lele::runtime::Weights::new(data).with_f16(&{:?}) }}",
+                f16
+            )?;
+        }
         writeln!(&mut code, "    }}")?;
         for method in &self.custom_methods {
             writeln!(&mut code, "{}", method)?;
