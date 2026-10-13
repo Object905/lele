@@ -212,47 +212,25 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             tab, outputs[0], inputs[0]
         )?,
         Op::Cast { to } => {
-            // Always use a temporary buffer for Cast to avoid borrow conflicts
-            // Cast operations typically convert between types, and reusing buffers
-            // can lead to borrowing issues when the input TensorView holds a reference
-            // to the same buffer we're trying to mutably borrow for output
-
-            if let DType::I64 | DType::I32 | DType::Bool = to {
+            // The allocator gives a conversion a buffer of the target type that
+            // the input is not in, and a view its input's buffer.
+            if ctx.input_type(0).cast_is_view(*to) {
                 writeln!(
                     w,
-                    "{}let mut temp_cast_buf_{} = Vec::<i64>::new();",
-                    tab, outputs[0]
+                    "{}let {} = {}.clone();",
+                    tab, outputs[0], inputs[0]
                 )?;
+            } else if let DType::I64 | DType::I32 | DType::Bool = to {
                 writeln!(
                     w,
-                    "{}let {} = lele::kernels::utils::cast_to_i64(&{}, &mut temp_cast_buf_{});",
-                    tab, outputs[0], inputs[0], outputs[0]
+                    "{}let {} = lele::kernels::utils::cast_to_i64(&{}, {});",
+                    tab, outputs[0], inputs[0], buf_expr
                 )?;
-            } else if *to == DType::F32 {
-                // Check if input is already f32, in which case cast is a no-op
-                if ctx.input_type(0) == ElemType::F32 {
-                    writeln!(
-                        w,
-                        "{}let {} = {}.clone(); // Cast f32->f32 is no-op",
-                        tab, outputs[0], inputs[0]
-                    )?;
-                } else {
-                    writeln!(
-                        w,
-                        "{}let mut temp_cast_buf_{} = Vec::<f32>::new();",
-                        tab, outputs[0]
-                    )?;
-                    writeln!(
-                        w,
-                        "{}let {} = lele::kernels::utils::cast_to_f32(&{}, &mut temp_cast_buf_{});",
-                        tab, outputs[0], inputs[0], outputs[0]
-                    )?;
-                }
             } else {
                 writeln!(
                     w,
-                    "{}let {} = {}.clone(); // Cast ignored",
-                    tab, outputs[0], inputs[0]
+                    "{}let {} = lele::kernels::utils::cast_to_f32(&{}, {});",
+                    tab, outputs[0], inputs[0], buf_expr
                 )?;
             }
         }
