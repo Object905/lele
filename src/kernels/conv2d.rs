@@ -140,6 +140,17 @@ fn conv2d_activation<'b, 'a>(
     let out_channels = w_shape[0];
     let kernel_h = w_shape[2];
     let kernel_w = w_shape[3];
+    // Each group's planes are computed from its share of the input; a group
+    // count that does not divide both would leave output planes unwritten.
+    let g = group as usize;
+    assert!(
+        group > 0
+            && in_channels.is_multiple_of(g)
+            && out_channels.is_multiple_of(g)
+            && w_shape[1] * g == in_channels,
+        "Conv2d: {in_channels} input and {out_channels} output channels in {group} groups \
+         against weights of shape {w_shape:?}"
+    );
 
     let dilation_h = if dilations.len() >= 2 {
         dilations[0] as usize

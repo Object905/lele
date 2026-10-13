@@ -178,8 +178,20 @@ fn conv1d_fused_at<'b, 'a>(
     } else {
         panic!("Conv1d: Unsupported input rank {}", rank);
     };
+    assert!(w_shape.len() == 3, "Conv1d: weights of shape {w_shape:?}");
     let out_channels = w_shape[0];
     let kernel_size = w_shape[2];
+    // Each group's rows are computed from its share of the input; a group count
+    // that does not divide both would leave output rows unwritten.
+    let g = group as usize;
+    assert!(
+        group > 0
+            && in_channels.is_multiple_of(g)
+            && out_channels.is_multiple_of(g)
+            && w_shape[1] * g == in_channels,
+        "Conv1d: {in_channels} input and {out_channels} output channels in {group} groups \
+         against weights of shape {w_shape:?}"
+    );
     let dilation = if dilations.is_empty() {
         1
     } else {
