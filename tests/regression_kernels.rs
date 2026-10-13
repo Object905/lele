@@ -2160,10 +2160,10 @@ fn ref_reduce(
 }
 
 #[test]
-fn test_reduce_mean_axis_combinations() {
-    // The trailing-axes cases take a contiguous-run fast path and the rest fall
-    // through to the general coordinate walk; both must agree with the
-    // reference, and the fast path must still report the right shape.
+fn test_reduce_axis_combinations() {
+    // Adjacent axes take a fast path and the rest fall through to the general
+    // coordinate walk; both must agree with the reference, and the fast path
+    // must still report the right shape.
     let shape = vec![2usize, 3, 4, 5];
     let data: Vec<f32> = (0..2 * 3 * 4 * 5)
         .map(|i| (i % 29) as f32 * 0.37 - 4.0)
@@ -2197,6 +2197,25 @@ fn test_reduce_mean_axis_combinations() {
                 1e-4,
                 &format!("reduce_mean axes {axes:?} keepdims={keepdims}"),
             );
+
+            let got = reduce_sum(&t, axes, keepdims, &mut buf);
+            let (want_shape, want) = ref_reduce(&shape, &data, axes, keepdims, false);
+            assert_eq!(got.shape.as_ref(), want_shape.as_slice());
+            assert_close(
+                &got.data,
+                &want,
+                1e-4,
+                &format!("reduce_sum axes {axes:?} keepdims={keepdims}"),
+            );
+
+            let ints: Vec<i64> = (0..data.len() as i64).map(|i| i % 29 - 7).collect();
+            let mut ibuf = Vec::new();
+            let got = reduce_sum(&TensorView::from_slice(&ints, shape.clone()), axes, keepdims, &mut ibuf);
+            let floats: Vec<f32> = ints.iter().map(|&x| x as f32).collect();
+            let (want_shape, want) = ref_reduce(&shape, &floats, axes, keepdims, false);
+            assert_eq!(got.shape.as_ref(), want_shape.as_slice());
+            let want: Vec<i64> = want.iter().map(|&x| x as i64).collect();
+            assert_eq!(&got.data[..], &want[..], "reduce_sum i64 axes {axes:?} keepdims={keepdims}");
         }
     }
 }

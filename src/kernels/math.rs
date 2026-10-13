@@ -1164,6 +1164,77 @@ pub fn not<'b, 'a, T: ElementOps>(
         shape: std::borrow::Cow::Owned(input.shape.to_vec()),
     }
 }
+/// The [outer, reduced, inner] sizes of `shape` with `axes` (sorted, without
+/// duplicates) reduced, if the axes are adjacent and none is empty. Then each
+/// output sums `reduced` elements `inner` apart, which the reductions add up
+/// without computing a multi-dimensional index per element.
+fn adjacent_axes(shape: &[usize], axes: &[usize]) -> Option<(usize, usize, usize)> {
+    let (&first, &last) = (axes.first()?, axes.last()?);
+    let reduced: usize = shape[first..=last].iter().product();
+    (last - first + 1 == axes.len() && reduced > 0).then(|| {
+        let outer = shape[..first].iter().product();
+        (outer, reduced, shape[last + 1..].iter().product())
+    })
+}
+
+/// `shape` with `axes` removed, or set to 1 with `keepdims`.
+fn reduced_shape(shape: &[usize], axes: &[usize], keepdims: bool) -> Vec<usize> {
+    let mut out = Vec::with_capacity(shape.len());
+    for (d, &n) in shape.iter().enumerate() {
+        if !axes.contains(&d) {
+            out.push(n);
+        } else if keepdims {
+            out.push(1);
+        }
+    }
+    out
+}
+
+/// Writes the sums of `data` (as [outer, reduced, inner]) over its middle axis
+/// to `out` (as [outer, inner]).
+fn sum_adjacent<T: Copy + std::ops::AddAssign>(
+    data: &[T],
+    (outer, reduced, inner): (usize, usize, usize),
+    zero: T,
+    out: &mut [T],
+) {
+    let out = &mut out[..outer * inner];
+    if inner == 1 {
+        for (dst, run) in out.iter_mut().zip(data.chunks_exact(reduced)) {
+            // Eight independent accumulators: f32 addition is not associative,
+            // so a single one would keep the loop serial on the add latency.
+            let mut acc = [zero; 8];
+            let (chunks, rest) = run.as_chunks::<8>();
+            for c in chunks {
+                for (a, &v) in acc.iter_mut().zip(c) {
+                    *a += v;
+                }
+            }
+            let [mut s, mut s1, mut s2, mut s3, s4, s5, s6, s7] = acc;
+            s += s4;
+            s1 += s5;
+            s2 += s6;
+            s3 += s7;
+            s += s1;
+            s2 += s3;
+            s += s2;
+            for &v in rest {
+                s += v;
+            }
+            *dst = s;
+        }
+    } else {
+        for (dst, block) in out.chunks_exact_mut(inner).zip(data.chunks_exact(reduced * inner)) {
+            dst.fill(zero);
+            for row in block.chunks_exact(inner) {
+                for (d, &v) in dst.iter_mut().zip(row) {
+                    *d += v;
+                }
+            }
+        }
+    }
+}
+
 pub fn reduce_mean<'b, 'a>(
     input: &TensorView<'b>,
     axes: &[i64],
@@ -1185,37 +1256,14 @@ pub fn reduce_mean<'b, 'a>(
     resolved_axes.sort();
     resolved_axes.dedup();
 
-    // Fast path: the reduced axes are the trailing ones, so each output is the
-    // sum of one contiguous run. This is what pooling asks for — the last axis,
-    // or [H, W] of an NCHW tensor — and the generic path below costs a
-    // multi-dimensional index computation per element.
-    if !resolved_axes.is_empty() && resolved_axes[0] + resolved_axes.len() == dims {
-        let inner: usize = input.shape[resolved_axes[0]..].iter().product();
-        let outer: usize = input.shape[..resolved_axes[0]].iter().product();
-        let mut out_shape: Vec<usize> = input.shape[..resolved_axes[0]].to_vec();
-        if keepdims {
-            out_shape.resize(dims, 1);
-        }
-        let scale = 1.0f32 / inner as f32;
-        // SAFETY: every element is written below before any is read.
-        unsafe { utils::ensure_capacity(out, outer) };
-        for (o, dst) in out.iter_mut().enumerate() {
-            let run = &input.data[o * inner..(o + 1) * inner];
-            // Eight independent accumulators: f32 addition is not associative,
-            // so a single one would keep the loop serial on the add latency.
-            let mut acc = [0.0f32; 8];
-            let (chunks, rest) = run.as_chunks::<8>();
-            for c in chunks {
-                for (a, &v) in acc.iter_mut().zip(c) {
-                    *a += v;
-                }
-            }
-            let mut s =
-                ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
-            for &v in rest {
-                s += v;
-            }
-            *dst = s * scale;
+    if let Some(sizes) = adjacent_axes(&input.shape, &resolved_axes) {
+        let scale = 1.0f32 / sizes.1 as f32;
+        let out_shape = reduced_shape(&input.shape, &resolved_axes, keepdims);
+        // SAFETY: `sum_adjacent` writes every element before any is read.
+        unsafe { utils::ensure_capacity(out, sizes.0 * sizes.2) };
+        sum_adjacent(&input.data, sizes, 0.0, out);
+        for x in out.iter_mut() {
+            *x *= scale;
         }
         return TensorView {
             data: Cow::Borrowed(out),
@@ -1307,6 +1355,17 @@ pub fn reduce_sum<'b, 'a, T: ElementOps + std::ops::AddAssign>(
         .collect();
     resolved_axes.sort();
     resolved_axes.dedup();
+    let zero = T::from_f32(0.0);
+    if let Some(sizes) = adjacent_axes(&input.shape, &resolved_axes) {
+        let out_shape = reduced_shape(&input.shape, &resolved_axes, keepdims);
+        // SAFETY: `sum_adjacent` writes every element before any is read.
+        unsafe { utils::ensure_capacity(out, sizes.0 * sizes.2) };
+        sum_adjacent(&input.data, sizes, zero, out);
+        return TensorView {
+            data: Cow::Borrowed(out),
+            shape: Cow::Owned(out_shape),
+        };
+    }
     let mut out_shape = Vec::new();
     let mut reduce_mask = vec![false; dims];
     for &ax in &resolved_axes {
@@ -1323,7 +1382,6 @@ pub fn reduce_sum<'b, 'a, T: ElementOps + std::ops::AddAssign>(
     if out.len() != out_numel {
         out.resize(out_numel, T::from_f32(0.0));
     }
-    let zero = T::from_f32(0.0);
     for v in out.iter_mut() {
         *v = zero;
     }
