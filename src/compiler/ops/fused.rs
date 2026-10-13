@@ -111,10 +111,17 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                     outputs[0], inputs[0], inputs[1], dilations, pads, strides,
                 )?;
             } else {
+                // Pads are [begin, end], or [begin, _, end, _] as computed above.
                 writeln!(
                     w,
-                    "{tab}let {} = self.conv1d_relu({}, {}, {bias}, {}, {}, {groups}, {}, {buf});",
-                    outputs[0], inputs[0], inputs[1], strides[0], dilations[0], pads[0] as usize,
+                    "{tab}let {} = lele::kernels::conv1d_fused(&{}, &{}, {bias}, &[{}], {groups}, &[{}, {}], &[{}], true, {buf});",
+                    outputs[0],
+                    inputs[0],
+                    inputs[1],
+                    dilations[0],
+                    pads[0],
+                    pads[pads.len() / 2],
+                    strides[0],
                 )?;
             }
         }
