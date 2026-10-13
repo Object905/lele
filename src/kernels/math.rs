@@ -1735,7 +1735,7 @@ pub fn reduce_l2<'b, 'a>(
 
 /// The sum of the squares of `run`, in eight independent accumulators (f32 addition is
 /// not associative, so a single one would keep the loop serial on the add latency).
-fn sum_squares(run: &[f32]) -> f32 {
+pub(crate) fn sum_squares(run: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
     let (chunks, rest) = run.as_chunks::<8>();
     for c in chunks {
