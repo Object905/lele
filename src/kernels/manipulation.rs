@@ -610,7 +610,8 @@ fn concat_impl<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
     }
 
     let out_numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, out_numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
     if out_numel == 0 {
         return TensorView::from_slice(out, out_shape);
     }
@@ -680,7 +681,8 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
                 let start_offset = start * stride;
                 let end_offset = end * stride;
 
-                utils::ensure_capacity(out, end_offset - start_offset);
+                // SAFETY: the run is copied in whole below.
+                unsafe { utils::ensure_capacity(out, end_offset - start_offset) };
                 out.copy_from_slice(&input.data[start_offset..end_offset]);
 
                 let mut out_shape = input.shape.to_vec();
@@ -796,7 +798,8 @@ pub fn slice<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         out_shape[i] = count as usize;
     }
     let out_numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, out_numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
 
     if out_numel == 0 {
         return TensorView::from_slice(out, out_shape);
@@ -870,7 +873,8 @@ pub fn pad<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         new_shape[i] += p[i] + p[i + rank];
     }
     let total = new_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, total);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, total) };
     // For constant mode: use provided constant_value or default to 0 (per ONNX spec)
     let fill_val: T = if let Some(cv) = constant_value {
         if !cv.data.is_empty() {
@@ -1073,7 +1077,8 @@ where
         out_shape.push(data.shape[i]);
     }
     let out_numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, out_numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
     let outer_dim: usize = data.shape[..axis].iter().product();
     let axis_dim = data.shape[axis];
     let inner_dim: usize = data.shape[axis + 1..].iter().product();
@@ -1118,7 +1123,8 @@ pub fn transpose<'b, 'a, T: Clone + Copy + std::fmt::Debug + 'static>(
     );
     let out_shape: Vec<usize> = (0..ndim).map(|i| input_shape[perm_at(i)]).collect();
     let out_numel = input.data.len();
-    utils::ensure_capacity(out, out_numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_numel) };
     let dst = &mut out[..out_numel];
     // Two axes longer than 1 that swap places, the rest of length 1, as in
     // most model transposes: a matrix transpose, without the planning that
@@ -1284,7 +1290,8 @@ pub fn split<'a, T: Clone + Copy + std::fmt::Debug>(
         let mut out_shape = input.shape.to_vec();
         out_shape[axis] = split_size;
         let out_numel = out_shape.iter().product::<usize>();
-        utils::ensure_capacity(&mut outputs[i], out_numel);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(&mut outputs[i], out_numel) };
         for outer_idx in 0..outer_dim {
             let src_offset = outer_idx * input.shape[axis] * inner_dim + axis_offset * inner_dim;
             let dst_offset = outer_idx * split_size * inner_dim;
@@ -1405,7 +1412,8 @@ where
     // Fast path: all same shape — direct elementwise, no coordinates
     if condition.shape == x.shape && x.shape == y.shape {
         let numel = cond_data.len();
-        utils::ensure_capacity(out, numel);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, numel) };
         let o = out.as_mut_slice();
         for i in 0..numel {
             unsafe {

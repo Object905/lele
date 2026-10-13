@@ -326,7 +326,8 @@ pub fn gemm<'a>(
     assert_eq!(k, k2, "Gemm K dim mismatch");
 
     let output_len = m * n;
-    utils::ensure_capacity(out_buf, output_len);
+    // SAFETY: the product replaces every element.
+    unsafe { utils::ensure_capacity(out_buf, output_len) };
     // With no C to add, the product overwrites the buffer, so it is not filled first.
     let accum = match c {
         Some(_) if beta == 0.0 => Accum::Replace,

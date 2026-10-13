@@ -138,9 +138,11 @@ pub(crate) fn quantize_rows(
     row_sums: &mut Vec<i32>,
 ) {
     assert!(src.len() >= m * k);
-    // Every quad and sum is written, so the buffers are not filled first.
-    crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(4));
-    crate::kernels::utils::ensure_capacity(row_sums, m);
+    // SAFETY: every quad and sum is written, so the buffers are not filled first.
+    unsafe {
+        crate::kernels::utils::ensure_capacity(dst, m * k.div_ceil(4));
+        crate::kernels::utils::ensure_capacity(row_sums, m);
+    }
     let flip = if dot == Dot::Sdot {
         0x8080_8080u32 as i32
     } else {

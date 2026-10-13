@@ -239,7 +239,9 @@ fn conv2d_activation<'b, 'a>(
     let in_channels_per_group = in_channels / groups;
     let out_channels_per_group = out_channels / groups;
 
-    utils::ensure_capacity(out, total_output);
+    // SAFETY: every element is written below before any is read (the group
+    // count divides the channels, asserted above).
+    unsafe { utils::ensure_capacity(out, total_output) };
 
     let input_data = &input.data;
     let weight_data = &weights.data;
@@ -692,7 +694,8 @@ fn max_pool2d_at<'b, 'a>(
         "pool/compute output size overflow"
     );
     let total = total as usize;
-    utils::ensure_capacity(out, total);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, total) };
 
     let window = Window {
         channels,
@@ -796,7 +799,8 @@ fn resize_nearest_inner<'b, 'a>(
     let total = total as usize;
     let out_h = out_h as usize;
     let out_w = out_w as usize;
-    utils::ensure_capacity(out, total);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, total) };
 
     let data = &input.data;
 
@@ -881,8 +885,10 @@ pub fn topk<'a>(
     *out_shape.last_mut().unwrap() = k;
 
     let total = outer * k;
-    utils::ensure_capacity(values_buf, total);
-    utils::ensure_capacity(indices_buf, total);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(values_buf, total) };
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(indices_buf, total) };
 
     let data = &input.data;
 
@@ -928,7 +934,8 @@ pub fn gather_elements<'a, 'b, T: Clone + Copy + std::fmt::Debug, U: crate::kern
     };
 
     let total: usize = idx_shape.iter().product();
-    utils::ensure_capacity(out, total);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, total) };
 
     let data = &input.data;
     let idx_data = &indices.data;
@@ -1077,7 +1084,8 @@ fn conv_transpose_1d<'b, 'a>(
     let l_out = l_out as usize;
 
     let out_size = batch_size * out_channels * l_out;
-    utils::ensure_capacity(out, out_size);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_size) };
 
     // A 1D transposed convolution is a 2D one of height 1.
     let shape = Transposed {
@@ -1416,7 +1424,8 @@ fn conv_transpose_inner<'b, 'a>(
     let out_h = out_h as usize;
     let out_w = out_w as usize;
     let out_size = batch_size * out_channels * out_h * out_w;
-    utils::ensure_capacity(out, out_size);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, out_size) };
 
     let shape = Transposed {
         batch: batch_size,

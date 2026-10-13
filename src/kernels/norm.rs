@@ -15,7 +15,8 @@ pub fn softmax<'b, 'a>(
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     assert!(axis < ndim);
     let numel = input.data.len();
-    utils::ensure_capacity(out_buf, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, numel) };
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), numel) };
     let inner_size: usize = input.shape[axis + 1..].iter().product();
     let axis_size = input.shape[axis];
@@ -199,7 +200,8 @@ pub fn log_softmax<'b, 'a>(
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     assert!(axis < ndim);
     let numel = input.data.len();
-    utils::ensure_capacity(out_buf, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, numel) };
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), numel) };
     let inner_size: usize = input.shape[axis + 1..].iter().product();
     let axis_size = input.shape[axis];
@@ -287,7 +289,8 @@ pub fn layer_norm<'b, 'a>(
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     let outer_size: usize = input.shape[..axis].iter().product();
     let norm_size: usize = input.shape[axis..].iter().product();
-    utils::ensure_capacity(out_buf, input.data.len());
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, input.data.len()) };
     let out_slice =
         unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
     debug_assert_eq!(outer_size * norm_size, input.data.len());
@@ -316,7 +319,8 @@ pub fn batch_norm<'b, 'a>(
 ) -> TensorView<'a> {
     let shape = &input.shape;
     let numel = input.data.len();
-    utils::ensure_capacity(out_buf, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, numel) };
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), numel) };
     // [outer, channels, inner...]: every rank is the 4D NCHW case with the
     // trailing dimensions flattened.
@@ -447,7 +451,8 @@ pub fn rms_norm<'b, 'a>(
     let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
     let outer_size: usize = input.shape[..axis].iter().product();
     let norm_size: usize = input.shape[axis..].iter().product();
-    utils::ensure_capacity(out_buf, input.data.len());
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out_buf, input.data.len()) };
     let out_slice =
         unsafe { std::slice::from_raw_parts_mut(out_buf.as_mut_ptr(), input.data.len()) };
     debug_assert_eq!(outer_size * norm_size, input.data.len());
@@ -484,7 +489,8 @@ pub fn scale_norm<'a>(
         "scale_norm: {} scales for rows of {n}",
         gamma.data.len()
     );
-    utils::ensure_capacity(out, len);
+    // SAFETY: every row is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     if let Some(rows) = len.checked_div(n) {
         let out = &mut out[..len];
         let params = (scale, epsilon);

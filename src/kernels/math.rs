@@ -20,7 +20,8 @@ fn unary<'a>(
 ) -> TensorView<'a> {
     const LANES: usize = 16;
     let n = input.data.len();
-    utils::ensure_capacity(out, n);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, n) };
     if n >= LANES {
         kernel(Level::new(), &input.data, out);
     } else {
@@ -224,7 +225,8 @@ where
         )
     });
     let numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(output_buf, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(output_buf, numel) };
     let dims = out_shape.len();
     let o_slice = output_buf.as_mut_slice();
 
@@ -501,7 +503,8 @@ where
         )
     });
     let numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(output_buf, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(output_buf, numel) };
     let dims = out_shape.len();
     if a.data.len() == 1 {
         let val_a = a.data[0];
@@ -632,7 +635,8 @@ fn add_inner<'b, 'a, T: Clone + Copy + std::ops::Add<Output = T> + std::fmt::Deb
     }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -682,7 +686,8 @@ fn mul_inner<'b, 'a, T: Clone + Copy + std::ops::Mul<Output = T> + std::fmt::Deb
     }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -713,7 +718,8 @@ pub fn sub<'b, 'a, T: Clone + Copy + std::ops::Sub<Output = T> + std::fmt::Debug
     }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -733,7 +739,8 @@ pub fn sub<'b, 'a, T: Clone + Copy + std::ops::Sub<Output = T> + std::fmt::Debug
 }
 pub fn reciprocal<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     for i in 0..numel {
         out[i] = 1.0 / input.data[i];
     }
@@ -771,7 +778,8 @@ pub fn erf<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 
 pub fn softplus<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     for i in 0..numel {
         let x = input.data[i];
         out[i] = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
@@ -788,7 +796,8 @@ pub fn hard_sigmoid<'b, 'a>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let i_slice = &input.data;
     let o_slice = out.as_mut_slice();
     #[cfg(target_arch = "aarch64")]
@@ -838,7 +847,8 @@ pub fn div<'b, 'a, T: Clone + Copy + std::ops::Div<Output = T> + std::fmt::Debug
     }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -874,7 +884,8 @@ pub fn mod_f32<'b, 'a, T: ElementOps>(
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let len = a.data.len();
-    utils::ensure_capacity(out, len);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     let b_scalar = b.data.len() == 1;
     let o_slice = out.as_mut_slice();
     let b_slice = &b.data;
@@ -1025,7 +1036,8 @@ pub fn sqrt<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView
 
 pub fn round<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let len = input.data.len();
-    utils::ensure_capacity(out, len);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     let in_slice = &input.data;
     let out_slice = out.as_mut_slice();
     for i in 0..len {
@@ -1041,7 +1053,8 @@ pub fn round<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorVie
 
 pub fn floor<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let len = input.data.len();
-    utils::ensure_capacity(out, len);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     let in_slice = &input.data;
     let out_slice = out.as_mut_slice();
     for i in 0..len {
@@ -1057,7 +1070,8 @@ pub fn floor<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorVie
 
 pub fn ceil<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let len = input.data.len();
-    utils::ensure_capacity(out, len);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     let in_slice = &input.data;
     let out_slice = out.as_mut_slice();
     for i in 0..len {
@@ -1079,7 +1093,8 @@ pub fn pow<'b, 'a, T: ElementOps>(
     if b.data.len() == 1 {
         let exp_val = b.data.first().unwrap().as_f32();
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let o_slice = out.as_mut_slice();
         if exp_val == 3.0 {
@@ -1111,7 +1126,8 @@ pub fn pow<'b, 'a, T: ElementOps>(
     }
     if a.data.len() == b.data.len() && a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let a_slice = &a.data;
         let b_slice = &b.data;
         let o_slice = out.as_mut_slice();
@@ -1133,7 +1149,8 @@ pub fn not<'b, 'a, T: ElementOps>(
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
     let len = input.data.len();
-    utils::ensure_capacity(out, len);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
     let i_slice = &input.data;
     let o_slice = out.as_mut_slice();
     let zero = T::from_f32(0.0);
@@ -1180,7 +1197,8 @@ pub fn reduce_mean<'b, 'a>(
             out_shape.resize(dims, 1);
         }
         let scale = 1.0f32 / inner as f32;
-        utils::ensure_capacity(out, outer);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, outer) };
         for (o, dst) in out.iter_mut().enumerate() {
             let run = &input.data[o * inner..(o + 1) * inner];
             // Eight independent accumulators: f32 addition is not associative,
@@ -1572,7 +1590,8 @@ pub fn reduce_l2<'b, 'a>(
 
     if resolved_axes.len() == 1 && resolved_axes[0] == dims - 1 && input.shape[dims - 1] == 2 {
         let n = input.data.len() / 2;
-        utils::ensure_capacity(out, n);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, n) };
         let mut out_shape = Vec::new();
         for i in 0..dims {
             if i != dims - 1 {
@@ -1750,7 +1769,8 @@ pub fn max<'b, 'a>(
 ) -> TensorView<'a> {
     if a.shape == b.shape {
         let len = a.data.len();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let out_slice = out.as_mut_slice();
         for i in 0..len {
             out_slice[i] = a.data[i].max(b.data[i]);
@@ -1768,7 +1788,8 @@ pub fn max<'b, 'a>(
         });
         // Both inputs can be broadcast, so the output can be larger than either.
         let len = out_shape.iter().product();
-        utils::ensure_capacity(out, len);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, len) };
         let out_slice = out.as_mut_slice();
         let ndim = out_shape.len();
         let mut coords = vec![0usize; ndim];
@@ -1831,7 +1852,8 @@ pub fn clip<'b, 'a, T: ElementOps, U: ElementOps, V: ElementOps>(
         .map(|v| T::from_f32(v.as_f32()))
         .unwrap_or(T::constant_max());
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     for i in 0..numel {
         let val = input.data[i].clamp_val(min_val, max_val);
         out[i] = V::from_f32(val.as_f32());
@@ -1849,7 +1871,8 @@ pub fn prelu<'b, 'a>(
     if slope.data.len() == 1 {
         let s = slope.data[0];
         let numel = input.data.len();
-        utils::ensure_capacity(out, numel);
+        // SAFETY: every element is written below before any is read.
+        unsafe { utils::ensure_capacity(out, numel) };
         for i in 0..numel {
             let x = input.data[i];
             out[i] = if x < 0.0 { x * s } else { x };
@@ -1876,7 +1899,8 @@ pub fn range<'a>(
     } else {
         0
     };
-    utils::ensure_capacity(out, n);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, n) };
     let out_slice = out.as_mut_slice();
     for (i, o) in out_slice[..n].iter_mut().enumerate() {
         *o = start_val + (i as f32) * delta_val;
@@ -1900,7 +1924,8 @@ pub fn range_i64<'a>(
     } else {
         0
     };
-    utils::ensure_capacity(out, n);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, n) };
     let out_slice = out.as_mut_slice();
     for (i, o) in out_slice[..n].iter_mut().enumerate() {
         *o = start_val + (i as i64) * delta_val;
@@ -1909,7 +1934,8 @@ pub fn range_i64<'a>(
 }
 pub fn sin<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].sin();
@@ -1918,7 +1944,8 @@ pub fn sin<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 }
 pub fn cos<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].cos();
@@ -1930,7 +1957,8 @@ pub fn exp<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<
 }
 pub fn log<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = input.data[i].ln();
@@ -1942,7 +1970,8 @@ pub fn neg<'b, 'a, T: ElementOps>(
     out: &'a mut Vec<T>,
 ) -> TensorView<'a, T> {
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let out_slice = out.as_mut_slice();
     for i in 0..numel {
         out_slice[i] = T::from_f32(-input.data[i].as_f32());
@@ -2051,7 +2080,8 @@ where
         axis as usize
     };
     let numel = input.data.len();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let o_slice = out.as_mut_slice();
     let i_slice = &input.data;
     let ax_dim = input.shape[ax];
@@ -2109,7 +2139,8 @@ pub fn einsum_bs_d_bsd<'b, 'a>(
     let d_len = b.data.len();
     let bs_len = a.data.len();
     let numel = bs_len * d_len;
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let o_slice = out.as_mut_slice();
     let mut idx = 0;
     for i in 0..bs_len {
@@ -2163,7 +2194,8 @@ pub fn expand<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         }
     }
     let numel: usize = out_shape.iter().product();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let input_strides = utils::compute_strides(input_shape);
     // Broadcast dimensions (missing or of size 1) don't advance the input.
     let offset_in = ndim_out - ndim_in;
@@ -2211,7 +2243,8 @@ pub fn tile<'b, 'a, T: Clone + Copy + std::fmt::Debug>(
         .map(|(&dim, &rep)| dim * rep)
         .collect();
     let numel = out_shape.iter().product();
-    utils::ensure_capacity(out, numel);
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
     let out_slice = out.as_mut_slice();
     let input_strides = utils::compute_strides(&input.shape);
     let mut coords = vec![0; ndim];
