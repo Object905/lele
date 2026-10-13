@@ -117,6 +117,24 @@ impl<'a> Weights<'a> {
         }
     }
 
+    /// An f16 weight as stored, for kernels that widen it as they read it
+    /// (the B operand of [`Self::linear`] and `kernels::matmul`).
+    pub fn weight_f16_raw(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, half::f16> {
+        let bytes = &self.data[offset..offset + len];
+        // SAFETY: `f16` is two bytes, and every bit pattern is a valid one.
+        let (head, halves, tail) = unsafe { bytes.align_to::<half::f16>() };
+        let data = if head.is_empty() && tail.is_empty() {
+            std::borrow::Cow::Borrowed(halves)
+        } else {
+            let halves = bytes.as_chunks::<2>().0.iter().map(|&b| half::f16::from_le_bytes(b));
+            std::borrow::Cow::Owned(halves.collect())
+        };
+        TensorView {
+            data,
+            shape: std::borrow::Cow::Borrowed(shape),
+        }
+    }
+
     /// Raw bytes of a weight, for prepared weights that skip the f32 conversion.
     pub fn weight_u8_raw(&self, offset: usize, len: usize) -> &'a [u8] {
         &self.data[offset..offset + len]
@@ -352,10 +370,10 @@ impl Weights<'_> {
         kernels::qmatmul_i8(input, input_scale, input_zero_point, &qw, output_buf)
     }
 
-    pub fn linear<'c, 'd>(
+    pub fn linear<'c, 'd, B: kernels::MatB>(
         &self,
         input: &TensorView<'c>,
-        weight: &TensorView<'c>,
+        weight: &TensorView<'c, B>,
         bias: &TensorView<'c>,
         output_buf: &'d mut Vec<f32>,
     ) -> TensorView<'d> {

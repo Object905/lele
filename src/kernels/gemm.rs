@@ -1,13 +1,62 @@
 use crate::kernels::bias_act::bias_act_inplace;
 use crate::kernels::conv2d::Activation;
-use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
+use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul, matmul_f16};
 use crate::kernels::utils;
 use crate::tensor::TensorView;
 use std::borrow::Cow;
 
-pub fn matmul<'a>(
+/// Element type of the B operand of [`matmul`] and [`matmul_fused_add`]: f32, or f16
+/// weights, which are widened as the kernels read them (the product is that of the
+/// widened matrix, bit for bit).
+pub trait MatB: Clone + std::fmt::Debug + 'static {
+    /// `out (+)= a * b`, with `b` the row-major `k x n` matrix at `b`.
+    ///
+    /// # Safety
+    /// `b` must be valid for reads of `k * n` elements.
+    #[doc(hidden)]
+    unsafe fn matmul_into(
+        out: MatMut<f32>,
+        accum: Accum,
+        a: MatRef<f32>,
+        b: *const Self,
+        k: usize,
+        n: usize,
+    );
+}
+
+impl MatB for f32 {
+    unsafe fn matmul_into(
+        out: MatMut<f32>,
+        accum: Accum,
+        a: MatRef<f32>,
+        b: *const f32,
+        k: usize,
+        n: usize,
+    ) {
+        // SAFETY: the caller promised `k * n` readable elements.
+        let b = unsafe { MatRef::<f32>::from_raw_parts(b, k, n, n as isize, 1) };
+        strided_matmul(out, accum, a, b, 1.0, Par::Seq);
+    }
+}
+
+impl MatB for half::f16 {
+    unsafe fn matmul_into(
+        out: MatMut<f32>,
+        accum: Accum,
+        a: MatRef<f32>,
+        b: *const half::f16,
+        k: usize,
+        n: usize,
+    ) {
+        // SAFETY: the caller promised `k * n` readable elements.
+        let b = unsafe { std::slice::from_raw_parts(b, k * n) };
+        matmul_f16(out, accum, a, b, n, 1.0);
+    }
+}
+
+pub fn matmul<'a, B: MatB>(
     a: &TensorView<'_>,
-    b: &TensorView<'_>,
+    b: &TensorView<'_, B>,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
     let a_dims = a.shape.len();
@@ -53,8 +102,6 @@ pub fn matmul<'a>(
         unsafe {
             let a_mat =
                 MatRef::<f32>::from_raw_parts(a.data.as_ptr().add(a_offset), m, k, k as isize, 1);
-            let b_mat =
-                MatRef::<f32>::from_raw_parts(b.data.as_ptr().add(b_offset), k, n, n as isize, 1);
             let out_mat = MatMut::<f32>::from_raw_parts_mut(
                 out_slice.as_mut_ptr().add(out_offset),
                 m,
@@ -62,7 +109,8 @@ pub fn matmul<'a>(
                 n as isize,
                 1,
             );
-            strided_matmul(out_mat, Accum::Replace, a_mat, b_mat, 1.0, Par::Seq);
+            let b_ptr = b.data.as_ptr().add(b_offset);
+            B::matmul_into(out_mat, Accum::Replace, a_mat, b_ptr, k, n);
         }
     }
     TensorView {
@@ -70,9 +118,9 @@ pub fn matmul<'a>(
         shape: Cow::Owned(out_shape),
     }
 }
-pub fn matmul_fused_add<'a>(
+pub fn matmul_fused_add<'a, B: MatB>(
     a: &TensorView<'_>,
-    b: &TensorView<'_>,
+    b: &TensorView<'_, B>,
     bias: &TensorView<'_>,
     out_buf: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
@@ -121,13 +169,6 @@ pub fn matmul_fused_add<'a>(
                     k as isize,
                     1,
                 );
-                let b_mat = MatRef::<f32>::from_raw_parts(
-                    b.data.as_ptr().add(b_offset),
-                    k,
-                    n,
-                    n as isize,
-                    1,
-                );
                 let out_mat = MatMut::<f32>::from_raw_parts_mut(
                     out_slice.as_mut_ptr().add(out_offset),
                     m,
@@ -135,7 +176,8 @@ pub fn matmul_fused_add<'a>(
                     n as isize,
                     1,
                 );
-                strided_matmul(out_mat, Accum::Add, a_mat, b_mat, 1.0, Par::Seq);
+                let b_ptr = b.data.as_ptr().add(b_offset);
+                B::matmul_into(out_mat, Accum::Add, a_mat, b_ptr, k, n);
             }
         }
     } else {
