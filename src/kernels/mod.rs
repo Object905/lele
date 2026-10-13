@@ -48,7 +48,7 @@ pub use norm::*;
 pub use pooling::*;
 pub use pooling::{average_pool2d, global_average_pool};
 pub use qgemm::{
-    QWeights, mat_mul_integer_qweights, qlinear_dynamic, qlinear_static, qmatmul_acts,
+    QWeights, Requant, mat_mul_integer_qweights, qlinear_dynamic, qlinear_static, qmatmul_acts,
 };
 pub use qmatmul_i8::{prepare_quantized_weights, qmatmul_i8};
 pub use quantization::*;

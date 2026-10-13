@@ -1,6 +1,6 @@
 //! Fusions of QDQ (QuantizeLinear / DequantizeLinear) graphs.
 
-use crate::compiler::ir::{DType, Graph, Op, ValueId};
+use crate::compiler::ir::{Binary, DType, Graph, NodeId, Op, ValueId};
 use crate::model::onnx_proto::TensorProto;
 
 /// Collapses `QuantizeLinear` → `DequantizeLinear` round trips into a single
@@ -216,6 +216,187 @@ fn fuse_qdq_matmul_weight(g: &mut Graph) {
         g.set_inputs(mm_id, inputs);
         g.node_mut(mm_id).op = Op::QLinearMatMulI8;
         g.remove_node(dq_w_id);
+    }
+}
+
+/// Inputs of `QLinearMatMulI8` beyond the five it is made with: the scale and
+/// zero point of the pair that follows the product, and the bias added after
+/// it.
+pub(crate) const I8_REQUANT: usize = 5;
+pub(crate) const I8_BIAS: usize = 7;
+/// The scale and zero point of the pair after a `QLinearMatMulAct`.
+pub(crate) const ACT_REQUANT: usize = 6;
+
+/// Folds the `QuantizeLinear` -> `DequantizeLinear` pairs (by now
+/// `FakeQuantizeLinear`) around the integer matmuls into them. Each is a pass
+/// over an activation, and all of them leave the result as it was, bit for
+/// bit:
+///
+/// * a pair whose every reader is an integer matmul quantizing it with the
+///   pair's own scale and zero point goes: quantizing the input gives the
+///   codes the pair would have, and quantizing those again gives them back;
+/// * the uint8 pair after a matmul's product, and a constant bias added after
+///   that, become the product's epilogue, which rounds each step as the nodes
+///   did.
+pub(crate) fn fold_qdq_into_matmuls(g: &mut Graph) {
+    drop_requantized_inputs(g);
+    fold_output_pairs(g);
+    fold_biases(g);
+}
+
+/// The scale and zero point of a per-tensor uint8 `FakeQuantizeLinear`.
+fn u8_round_trip(g: &Graph, fq: NodeId) -> Option<(ValueId, ValueId)> {
+    let n = g.node(fq);
+    let Op::FakeQuantizeLinear(attrs) = &n.op else {
+        return None;
+    };
+    let (scale, zp) = (n.input(1)?, n.input(2)?);
+    let numel = |t: &TensorProto| t.dims.iter().product::<i64>().max(1);
+    let scalar_scale = g
+        .data(scale)
+        .is_some_and(|t| DType::from_onnx(t.data_type) == DType::F32 && numel(t) == 1);
+    let u8_zp = g
+        .data(zp)
+        .is_some_and(|t| DType::from_onnx(t.data_type) == DType::U8 && numel(t) == 1);
+    let u8_out = attrs.output_dtype.is_none_or(|t| t == DType::U8);
+    (scalar_scale && u8_zp && u8_out && attrs.block_size == 0).then_some((scale, zp))
+}
+
+/// The sole reader of `v`, unless `v` is also a graph output.
+fn sole_reader(g: &Graph, v: ValueId) -> Option<NodeId> {
+    match g.value(v).consumers() {
+        &[c] if g.uses(v) == 1 => Some(c),
+        _ => None,
+    }
+}
+
+/// `node` quantizes every operand it reads from `v` with `scale` and `zp`.
+fn quantizes(g: &Graph, node: NodeId, v: ValueId, scale: ValueId, zp: ValueId) -> bool {
+    let n = g.node(node);
+    // The quantized operands, each followed by its scale and zero point.
+    let operands: &[usize] = match n.op {
+        Op::QLinearMatMulI8 => &[0],
+        Op::QLinearMatMulAct => &[0, 3],
+        _ => return false,
+    };
+    n.inputs().iter().enumerate().all(|(i, &input)| {
+        input != Some(v)
+            || operands.contains(&i) && n.input(i + 1) == Some(scale) && n.input(i + 2) == Some(zp)
+    })
+}
+
+fn drop_requantized_inputs(g: &mut Graph) {
+    let mut drops = Vec::new();
+    for (id, n) in g.nodes() {
+        if !matches!(n.op, Op::FakeQuantizeLinear(_)) {
+            continue;
+        }
+        let (Some(x), Some(y), Some(scale), Some(zp)) =
+            (n.input(0), n.output(0), n.input(1), n.input(2))
+        else {
+            continue;
+        };
+        let readers = g.value(y).consumers();
+        if readers.is_empty()
+            || g.uses(y) != readers.len()
+            || !readers.iter().all(|&r| quantizes(g, r, y, scale, zp))
+        {
+            continue;
+        }
+        drops.push((id, x, y));
+    }
+    for (id, x, y) in drops {
+        let mut readers = g.value(y).consumers().to_vec();
+        readers.dedup();
+        for r in readers {
+            let inputs = g
+                .node(r)
+                .inputs()
+                .iter()
+                .map(|&v| if v == Some(y) { Some(x) } else { v });
+            g.set_inputs(r, inputs.collect());
+        }
+        g.remove_node(id);
+    }
+}
+
+/// Moves the output of `consumer` onto `node` and removes `consumer`.
+fn absorb(g: &mut Graph, node: NodeId, consumer: NodeId) {
+    let out = g.node(consumer).output(0);
+    g.remove_node(consumer);
+    g.set_output(node, 0, out);
+}
+
+/// Sets input `i` of `node`, padding with omitted operands.
+fn set_input(g: &mut Graph, node: NodeId, i: usize, v: ValueId) {
+    let mut inputs = g.node(node).inputs().to_vec();
+    if inputs.len() <= i {
+        inputs.resize(i + 1, None);
+    }
+    inputs[i] = Some(v);
+    g.set_inputs(node, inputs);
+}
+
+fn fold_output_pairs(g: &mut Graph) {
+    let mut folds = Vec::new();
+    for (id, n) in g.nodes() {
+        let slot = match n.op {
+            Op::QLinearMatMulI8 => I8_REQUANT,
+            Op::QLinearMatMulAct => ACT_REQUANT,
+            _ => continue,
+        };
+        let Some(fq) = n.output(0).and_then(|y| sole_reader(g, y)) else {
+            continue;
+        };
+        if g.node(fq).input(0) != n.output(0) || n.input(slot).is_some() {
+            continue;
+        }
+        if let Some((scale, zp)) = u8_round_trip(g, fq) {
+            folds.push((id, fq, slot, scale, zp));
+        }
+    }
+    for (id, fq, slot, scale, zp) in folds {
+        absorb(g, id, fq);
+        set_input(g, id, slot, scale);
+        set_input(g, id, slot + 1, zp);
+    }
+}
+
+fn fold_biases(g: &mut Graph) {
+    let mut folds = Vec::new();
+    for (id, n) in g.nodes() {
+        if !matches!(n.op, Op::QLinearMatMulI8) || n.input(I8_BIAS).is_some() {
+            continue;
+        }
+        let (Some(y), Some(w)) = (n.output(0), n.input(3)) else {
+            continue;
+        };
+        let Some(add) = sole_reader(g, y) else {
+            continue;
+        };
+        let a = g.node(add);
+        if !matches!(a.op, Op::Binary(Binary::Add)) {
+            continue;
+        }
+        let Some(bias) = (match (a.input(0), a.input(1)) {
+            (Some(l), r) if l == y => r,
+            (l, Some(r)) if r == y => l,
+            _ => None,
+        }) else {
+            continue;
+        };
+        // One value per column of the weight, `[k, n]`.
+        let n_cols = g.data(w).map(|t| t.dims[1]);
+        let fits = g.data(bias).is_some_and(|t| {
+            DType::from_onnx(t.data_type) == DType::F32 && n_cols.is_some_and(|n| t.dims == [n])
+        });
+        if bias != y && fits {
+            folds.push((id, add, bias));
+        }
+    }
+    for (id, add, bias) in folds {
+        absorb(g, id, add);
+        set_input(g, id, I8_BIAS, bias);
     }
 }
 
@@ -600,6 +781,117 @@ mod tests {
             initializer(&mut g, "w").data_type = DType::U8.to_onnx();
             let g = run(g, fuse_qdq_matmul);
             assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+        }
+    }
+
+    mod fold_into_matmuls {
+        use super::*;
+
+        fn init(name: &str, dtype: DType, dims: &[i64]) -> TensorProto {
+            // (The values do not matter, and no type is wider than 4 bytes.)
+            let len = dims.iter().product::<i64>().max(1) as usize * 4;
+            TensorProto {
+                name: name.to_string(),
+                data_type: dtype.to_onnx(),
+                dims: dims.to_vec(),
+                raw_data: vec![1; len],
+                ..Default::default()
+            }
+        }
+
+        /// `x`'s pair, an int8 `[4, 2]` weight, the product's pair and a bias.
+        fn graph(extra: Vec<NodeProto>, outputs: &[&str]) -> GraphProto {
+            let mut nodes = vec![
+                node("QuantizeLinear", &["x", "s", "z"], "xq", &[]),
+                node("DequantizeLinear", &["xq", "s", "z"], "a", &[]),
+                node("DequantizeLinear", &["w", "w_scale"], "wd", &[("axis", 1)]),
+                node("MatMul", &["a", "wd"], "y", &[]),
+                node("QuantizeLinear", &["y", "ys", "yz"], "yq", &[]),
+                node("DequantizeLinear", &["yq", "ys", "yz"], "yd", &[]),
+                node("Add", &["bias", "yd"], "out", &[]),
+            ];
+            nodes.extend(extra);
+            GraphProto {
+                node: nodes,
+                initializer: vec![
+                    init("w", DType::I8, &[4, 2]),
+                    init("w_scale", DType::F32, &[2]),
+                    init("s", DType::F32, &[]),
+                    init("z", DType::U8, &[]),
+                    init("ys", DType::F32, &[]),
+                    init("yz", DType::U8, &[]),
+                    init("bias", DType::F32, &[2]),
+                    init("bias_wide", DType::F32, &[4, 2]),
+                ],
+                output: outputs.iter().map(|o| output(o)).collect(),
+                ..Default::default()
+            }
+        }
+
+        fn fold(g: &mut Graph) {
+            fuse_qdq_matmul(g);
+            fuse_qdq(g);
+            fold_qdq_into_matmuls(g);
+        }
+
+        #[test]
+        fn folds_the_pairs_and_the_bias_into_an_int8_matmul() {
+            let g = run(graph(vec![], &["out"]), fold);
+            assert_eq!(op_types(&g), ["QLinearMatMulI8"]);
+            assert_eq!(
+                g.node[0].input,
+                ["x", "s", "z", "w", "w_scale", "ys", "yz", "bias"]
+            );
+            assert_eq!(g.node[0].output, ["out"]);
+        }
+
+        #[test]
+        fn keeps_an_input_pair_something_else_reads() {
+            let g = run(
+                graph(vec![node("Relu", &["a"], "r", &[])], &["out", "r"]),
+                fold,
+            );
+            assert_eq!(
+                op_types(&g),
+                ["FakeQuantizeLinear", "QLinearMatMulI8", "Relu"]
+            );
+            assert_eq!(g.node[1].input[0], "a");
+        }
+
+        #[test]
+        fn keeps_the_pair_after_a_product_something_else_reads() {
+            let g = run(graph(vec![], &["out", "y"]), fold);
+            assert_eq!(
+                op_types(&g),
+                ["QLinearMatMulI8", "FakeQuantizeLinear", "Add"]
+            );
+            assert_eq!(g.node[0].input.len(), 5);
+        }
+
+        #[test]
+        fn keeps_a_bias_that_is_not_one_per_column() {
+            let mut g = graph(vec![], &["out"]);
+            g.node[6].input[0] = "bias_wide".to_string();
+            let g = run(g, fold);
+            assert_eq!(op_types(&g), ["QLinearMatMulI8", "Add"]);
+            assert_eq!(g.node[0].input[5..], ["ys", "yz"]);
+        }
+
+        #[test]
+        fn folds_the_pairs_around_a_product_of_activations() {
+            let mut g = graph(
+                vec![
+                    node("QuantizeLinear", &["v", "s", "z"], "vq", &[]),
+                    node("DequantizeLinear", &["vq", "s", "z"], "b", &[]),
+                ],
+                &["yd"],
+            );
+            g.node.retain(|n| n.op_type != "Add" && n.output[0] != "wd");
+            g.node[2].input[1] = "b".to_string();
+            let g = run(g, fold);
+            assert_eq!(op_types(&g), ["QLinearMatMulAct"]);
+            assert_eq!(g.node[0].input, ["x", "s", "z", "v", "s", "z", "ys", "yz"]);
+            assert_eq!(g.node[0].output, ["yd"]);
         }
     }
 }
