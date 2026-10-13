@@ -299,8 +299,7 @@ fn compile_model(
 
     let compiler = Compiler::new()
         .with_name(class_name)
-        .with_default_optimizations()
-        .with_constant_folding(true);
+        .with_default_optimizations();
 
     let result = compiler.compile(graph)?;
 
