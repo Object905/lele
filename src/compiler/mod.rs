@@ -216,6 +216,11 @@ impl Compiler {
         }
         if opt.operator_fusion {
             passes::fuse(&mut ir);
+            if opt.dead_code_elimination {
+                // The constants fused chains read (an epsilon, a scale) are
+                // left without readers, and would each keep a buffer.
+                passes::eliminate_dead_code(&mut ir);
+            }
         }
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
