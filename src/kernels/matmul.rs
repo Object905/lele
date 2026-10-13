@@ -230,6 +230,41 @@ pub fn matmul_f16(
     )
 }
 
+/// [`matmul`] with A an f16 matrix, row-major with `lda` elements between its `dst.nrows`
+/// rows of `b.nrows` columns. A is widened whole into a buffer kept for the thread (as
+/// large as the largest A seen), then the product is [`matmul`]'s, so it is that of A
+/// widened, bit for bit.
+pub fn matmul_f16_a(
+    dst: MatMut<f32>,
+    accum: Accum,
+    a: &[half::f16],
+    lda: usize,
+    b: MatRef<f32>,
+    alpha: f32,
+) {
+    use half::slice::HalfFloatSliceExt;
+    thread_local! {
+        static WIDE_A: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let (m, k) = (dst.nrows, b.nrows);
+    if m == 0 || k == 0 {
+        // SAFETY: an empty A addresses no elements.
+        let a =
+            unsafe { MatRef::from_raw_parts(std::ptr::NonNull::dangling().as_ptr(), m, k, 0, 0) };
+        return matmul(dst, accum, a, b, alpha, Par::Seq);
+    }
+    assert!(a.len() >= (m - 1) * lda + k, "matmul: A is too short");
+    WIDE_A.with_borrow_mut(|wide| {
+        wide.resize(m * k, 0.0);
+        for (i, row) in wide.chunks_exact_mut(k).enumerate() {
+            a[i * lda..][..k].convert_to_f32_slice(row);
+        }
+        // SAFETY: `wide` holds the `m x k` row-major elements addressed.
+        let a = unsafe { MatRef::from_raw_parts(wide.as_ptr(), m, k, k as isize, 1) };
+        matmul(dst, accum, a, b, alpha, Par::Seq);
+    })
+}
+
 /// B of [`matmul_b`].
 enum BMat<'a> {
     F32(MatRef<f32>),

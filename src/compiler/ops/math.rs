@@ -28,7 +28,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             tab,
             outputs[0],
             inputs[0],
-            ctx.matmul_b(1),
+            ctx.matmul_weight(1),
             buf_expr
         )?,
         Op::MatMulInteger => {

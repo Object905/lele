@@ -1,14 +1,16 @@
 use crate::kernels::bias_act::bias_act_inplace;
 use crate::kernels::conv2d::Activation;
-use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul, matmul_f16};
+use crate::kernels::matmul::{
+    Accum, MatMut, MatRef, Par, matmul as strided_matmul, matmul_f16, matmul_f16_a,
+};
 use crate::kernels::utils;
 use crate::tensor::TensorView;
 use std::borrow::Cow;
 
-/// Element type of the B operand of [`matmul`] and [`matmul_fused_add`]: f32, or f16
-/// weights, which are widened as the kernels read them (the product is that of the
-/// widened matrix, bit for bit).
-pub trait MatB: Clone + std::fmt::Debug + 'static {
+/// Element type of a weight operand of the matrix products ([`matmul`],
+/// [`matmul_fused_add`], pointwise `conv1d`): f32, or f16, which the kernels widen as they
+/// read it, so that the product is that of the widened matrix, bit for bit.
+pub trait WeightElem: Clone + std::fmt::Debug + 'static {
     /// `out (+)= a * b`, with `b` the row-major `k x n` matrix at `b`.
     ///
     /// # Safety
@@ -22,9 +24,23 @@ pub trait MatB: Clone + std::fmt::Debug + 'static {
         k: usize,
         n: usize,
     );
+
+    /// `out (+)= a * b`, with `a` the row-major `m x k` matrix at `a`.
+    ///
+    /// # Safety
+    /// `a` must be valid for reads of `m * k` elements.
+    #[doc(hidden)]
+    unsafe fn matmul_left_into(
+        out: MatMut<f32>,
+        accum: Accum,
+        a: *const Self,
+        m: usize,
+        k: usize,
+        b: MatRef<f32>,
+    );
 }
 
-impl MatB for f32 {
+impl WeightElem for f32 {
     unsafe fn matmul_into(
         out: MatMut<f32>,
         accum: Accum,
@@ -37,9 +53,22 @@ impl MatB for f32 {
         let b = unsafe { MatRef::<f32>::from_raw_parts(b, k, n, n as isize, 1) };
         strided_matmul(out, accum, a, b, 1.0, Par::Seq);
     }
+
+    unsafe fn matmul_left_into(
+        out: MatMut<f32>,
+        accum: Accum,
+        a: *const f32,
+        m: usize,
+        k: usize,
+        b: MatRef<f32>,
+    ) {
+        // SAFETY: the caller promised `m * k` readable elements.
+        let a = unsafe { MatRef::<f32>::from_raw_parts(a, m, k, k as isize, 1) };
+        strided_matmul(out, accum, a, b, 1.0, Par::Seq);
+    }
 }
 
-impl MatB for half::f16 {
+impl WeightElem for half::f16 {
     unsafe fn matmul_into(
         out: MatMut<f32>,
         accum: Accum,
@@ -52,9 +81,22 @@ impl MatB for half::f16 {
         let b = unsafe { std::slice::from_raw_parts(b, k * n) };
         matmul_f16(out, accum, a, b, n, 1.0);
     }
+
+    unsafe fn matmul_left_into(
+        out: MatMut<f32>,
+        accum: Accum,
+        a: *const half::f16,
+        m: usize,
+        k: usize,
+        b: MatRef<f32>,
+    ) {
+        // SAFETY: the caller promised `m * k` readable elements.
+        let a = unsafe { std::slice::from_raw_parts(a, m * k) };
+        matmul_f16_a(out, accum, a, k, b, 1.0);
+    }
 }
 
-pub fn matmul<'a, B: MatB>(
+pub fn matmul<'a, B: WeightElem>(
     a: &TensorView<'_>,
     b: &TensorView<'_, B>,
     out_buf: &'a mut Vec<f32>,
@@ -118,7 +160,7 @@ pub fn matmul<'a, B: MatB>(
         shape: Cow::Owned(out_shape),
     }
 }
-pub fn matmul_fused_add<'a, B: MatB>(
+pub fn matmul_fused_add<'a, B: WeightElem>(
     a: &TensorView<'_>,
     b: &TensorView<'_, B>,
     bias: &TensorView<'_>,

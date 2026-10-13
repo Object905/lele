@@ -370,7 +370,7 @@ impl Weights<'_> {
         kernels::qmatmul_i8(input, input_scale, input_zero_point, &qw, output_buf)
     }
 
-    pub fn linear<'c, 'd, B: kernels::MatB>(
+    pub fn linear<'c, 'd, B: kernels::WeightElem>(
         &self,
         input: &TensorView<'c>,
         weight: &TensorView<'c, B>,

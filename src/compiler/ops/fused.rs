@@ -45,7 +45,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             "{tab}let {} = self.linear(&{}, &{}, &{}, {buf});",
             outputs[0],
             inputs[0],
-            ctx.matmul_b(1),
+            ctx.matmul_weight(1),
             inputs[2]
         )?,
         Op::ConvAct { conv, act } => {
