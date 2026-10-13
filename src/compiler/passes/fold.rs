@@ -76,7 +76,8 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
             continue;
         };
         let dtype = output_dtype(&node.op, &inputs);
-        let Some((data, shape)) = fold_op(&node.op, &inputs) else {
+        // Empty tensors are not written to the weights file.
+        let Some((data, shape)) = fold_op(&node.op, &inputs).filter(|(d, _)| !d.is_empty()) else {
             continue;
         };
 
