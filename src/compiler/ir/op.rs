@@ -494,6 +494,10 @@ pub enum Op {
     },
     /// `x * sigmoid(x)`.
     Silu,
+    /// Snake activation, `x + beta * sin(alpha * x)^2` with one `alpha` and
+    /// `beta` per channel (the second to last axis of `x`). Inputs:
+    /// `[x, alpha, beta]`.
+    Snake,
     /// `x / (ReduceL2(x, last axis) * scale + epsilon) * gamma` (ScaleNorm).
     /// Inputs: `[x, gamma]`.
     ScaleNorm {
@@ -785,6 +789,7 @@ impl Op {
             Op::QLinearMatMulI8 => "QLinearMatMulI8",
             Op::ConvAct { .. } => "ConvAct",
             Op::Silu => "Silu",
+            Op::Snake => "Snake",
             Op::ScaleNorm { .. } => "ScaleNorm",
             Op::SimAm { .. } => "SimAm",
             Op::Linear => "Linear",
@@ -992,6 +997,7 @@ impl Op {
             | Op::Where
             | Op::QLinearMatMulI8
             | Op::Silu
+            | Op::Snake
             | Op::Linear => {}
         }
     }

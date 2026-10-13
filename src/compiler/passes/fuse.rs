@@ -16,6 +16,7 @@ pub(crate) fn fuse(g: &mut Graph) {
     fuse_layer_norm(g);
     fuse_scale_norm(g);
     fuse_simam(g);
+    fuse_snake(g);
     fuse_gelu(g);
     fuse_silu(g);
     fuse_conv_bias(g);
@@ -70,9 +71,20 @@ fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorProto> {
     }
 }
 
-/// The values of a compile-time constant.
+/// The values of a compile-time constant, float16 ones (which
+/// `tensor_to_array` does not read) included.
 fn constant(g: &Graph, v: Option<ValueId>) -> Option<Vec<f32>> {
-    tensor_to_array(constant_tensor(g, v)?).ok().map(|(data, _)| data)
+    let t = constant_tensor(g, v)?;
+    if DType::from_onnx(t.data_type) == DType::F16 {
+        // The bits, raw or one per element of `int32_data`.
+        let bits: Vec<u16> = if t.raw_data.is_empty() {
+            t.int32_data.iter().map(|&x| x as u16).collect()
+        } else {
+            t.raw_data.as_chunks::<2>().0.iter().map(|&b| u16::from_le_bytes(b)).collect()
+        };
+        return Some(bits.into_iter().map(|b| half::f16::from_bits(b).to_f32()).collect());
+    }
+    tensor_to_array(t).ok().map(|(data, _)| data)
 }
 
 /// Whether `v` is a constant scalar close to `expected`.
@@ -332,6 +344,55 @@ fn fuse_simam(g: &mut Graph) {
         if let Some((nodes, op, inputs)) = fused {
             let proto = named_after(g, mul);
             g.fuse(&nodes, op, proto, inputs.to_vec());
+        }
+    }
+}
+
+/// `x + beta * Pow(Sin(alpha * x), 2)` with constant `alpha` and `beta` of one
+/// element per channel (the second to last axis of `x`: shaped `[.., C, 1]`
+/// with leading 1s) or a single one, and the operands of each `Mul` and the
+/// `Add` in either order → `Snake`.
+fn fuse_snake(g: &mut Graph) {
+    // A constant per channel, or one value.
+    let per_channel = |g: &Graph, v: Option<ValueId>| {
+        let t = constant_tensor(g, v)?;
+        let dims = &t.dims;
+        let ok = dims.iter().product::<i64>() == 1
+            || (dims.len() >= 2
+                && dims[dims.len() - 1] == 1
+                && dims[..dims.len() - 2].iter().all(|&d| d == 1));
+        (ok && constant(g, v)?.iter().all(|c| c.is_finite())).then_some(v)
+    };
+    for add in binary_nodes(g, Binary::Add) {
+        if !g.contains(add) {
+            continue;
+        }
+        let fused = (0..2).find_map(|k| {
+            let node = g.node(add);
+            let x = node.input(1 - k)?;
+            let mul_beta = sole_producer(g, node.input(k), binary(Binary::Mul))?;
+            let (squared, beta) = (0..2).find_map(|j| {
+                let beta = per_channel(g, g.node(mul_beta).input(1 - j))?;
+                Some((g.node(mul_beta).input(j), beta))
+            })?;
+            let pow = sole_producer(g, squared, binary(Binary::Pow))?;
+            let sin = sole_producer(g, g.node(pow).input(0), unary(Unary::Sin))?;
+            let mul_alpha = sole_producer(g, g.node(sin).input(0), binary(Binary::Mul))?;
+            let alpha = (0..2).find_map(|j| {
+                let alpha = per_channel(g, g.node(mul_alpha).input(1 - j))?;
+                (g.node(mul_alpha).input(j) == Some(x)).then_some(alpha)
+            })?;
+            // (f16 activations are computed in f32, as the unfused kernels did.)
+            if !is_scalar(g, g.node(pow).input(1), 2.0)
+                || !matches!(g.value(x).dtype, DType::F32 | DType::F16)
+            {
+                return None;
+            }
+            Some(([mul_alpha, sin, pow, mul_beta, add], [Some(x), alpha, beta]))
+        });
+        if let Some((nodes, inputs)) = fused {
+            let proto = named_after(g, add);
+            g.fuse(&nodes, Op::Snake, proto, inputs.to_vec());
         }
     }
 }
@@ -819,6 +880,50 @@ mod tests {
         }
         // A sum over other axes than the mean's is left.
         assert_eq!(fused(nodes(false, &[-1]), constants).len(), 12);
+    }
+
+    #[test]
+    fn fuses_snake() {
+        let nodes = |swap: bool| {
+            let mut cast = node("Cast", &["input"], "x");
+            cast.attribute.push(crate::model::onnx_proto::AttributeProto {
+                name: "to".to_string(),
+                i: 1,
+                ..Default::default()
+            });
+            let order = |a: &'static str, b: &'static str| if swap { [b, a] } else { [a, b] };
+            vec![
+                cast,
+                node("Mul", &order("x", "alpha"), "scaled"),
+                node("Sin", &["scaled"], "s"),
+                node("Pow", &["s", "two"], "squared"),
+                node("Mul", &order("beta", "squared"), "t"),
+                node("Add", &order("x", "t"), "y"),
+            ]
+        };
+        // Per channel in f16, as Hojo-TTS stores them.
+        let f16s = |name: &str, dims: Vec<i64>, v: f32| TensorProto {
+            name: name.to_string(),
+            data_type: DType::F16.to_onnx(),
+            raw_data: (0..dims.iter().product::<i64>())
+                .flat_map(|_| half::f16::from_f32(v).to_le_bytes())
+                .collect(),
+            dims,
+            ..Default::default()
+        };
+        let constants = |alpha_dims: Vec<i64>| {
+            vec![
+                f16s("alpha", alpha_dims, 0.5),
+                f16s("beta", vec![1, 4, 1], 2.0),
+                f16s("two", vec![], 2.0),
+            ]
+        };
+        for swap in [false, true] {
+            assert_eq!(fused(nodes(swap), constants(vec![1, 4, 1])), ["Cast", "Snake"]);
+        }
+        assert_eq!(fused(nodes(false), constants(vec![1])), ["Cast", "Snake"]);
+        // One alpha per column, not per channel, is left.
+        assert_eq!(fused(nodes(false), constants(vec![1, 1, 4])).len(), 6);
     }
 
     #[test]

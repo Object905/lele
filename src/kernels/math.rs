@@ -1302,6 +1302,70 @@ fn simam_plane_simd<S: Simd>(simd: S, x: &[f32], d: &mut [f32], denom: f32, shif
     }
 }
 
+/// Snake activation, `x + beta * sin(alpha * x)^2`, with `alpha` and `beta` of
+/// one element per channel (the second to last axis of `input`) or a single
+/// one. Each step rounds as the `Mul`, `Sin`, `Pow`, `Mul` and `Add` it
+/// replaces do, so the result is theirs bit for bit, in one pass where they
+/// take five.
+pub fn snake<'a>(
+    input: &TensorView<'_>,
+    alpha: &TensorView<'_>,
+    beta: &TensorView<'_>,
+    out: &'a mut Vec<f32>,
+) -> TensorView<'a> {
+    let rank = input.shape.len();
+    let width = input.shape.last().copied().unwrap_or(1);
+    let channels = if rank >= 2 { input.shape[rank - 2] } else { 1 };
+    for (name, p) in [("alpha", alpha), ("beta", beta)] {
+        assert!(
+            p.data.len() == 1 || p.data.len() == channels,
+            "snake: {} {name} for {channels} channels",
+            p.data.len()
+        );
+    }
+    let len = input.data.len();
+    // SAFETY: every row is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
+    if width > 0 {
+        let level = Level::new();
+        let rows = input.data.chunks_exact(width).zip(out.chunks_exact_mut(width));
+        for (r, (x, o)) in rows.enumerate() {
+            let at = |p: &TensorView<'_>| p.data[if p.data.len() == 1 { 0 } else { r % channels }];
+            simd_call!(level, max = Avx2, snake_row_simd(x, o, at(alpha), at(beta)));
+        }
+    }
+    TensorView {
+        data: Cow::Borrowed(&out[..len]),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
+}
+
+/// `out = x + beta * sin(alpha * x)^2` over a row.
+#[simd]
+fn snake_row_simd<S: Simd>(simd: S, x: &[f32], out: &mut [f32], alpha: f32, beta: f32) {
+    use fearless_simd::{f32x16, prelude::*};
+    let (a, b) = (f32x16::splat(simd, alpha), f32x16::splat(simd, beta));
+    // (A macro, not a closure: a closure would not get the target features.)
+    macro_rules! snake {
+        ($x:expr, $o:expr) => {{
+            let x = f32x16::load_array_ref(simd, $x);
+            let s = vm::sin(x * a);
+            (x + b * (s * s)).store_array($o);
+        }};
+    }
+    let (xs, x_tail) = x.as_chunks::<16>();
+    let (os, o_tail) = out.as_chunks_mut::<16>();
+    for (x, o) in xs.iter().zip(os) {
+        snake!(x, o);
+    }
+    if !x_tail.is_empty() {
+        let (mut x, mut o) = ([0.0; 16], [0.0; 16]);
+        x[..x_tail.len()].copy_from_slice(x_tail);
+        snake!(&x, &mut o);
+        o_tail.copy_from_slice(&o[..x_tail.len()]);
+    }
+}
+
 /// Writes the sums of `data` (as [outer, reduced, inner]) over its middle axis
 /// to `out` (as [outer, inner]).
 fn sum_adjacent<T: Copy + std::ops::AddAssign>(
@@ -3108,6 +3172,43 @@ mod tests {
             .collect();
         for (a, b) in res.data.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6, "mismatch: got {} expected {}", a, b);
+        }
+    }
+
+    /// `snake` is the chain it replaces, bit for bit, over rows around the vector
+    /// width, with per-channel and single parameters, and inputs down to
+    /// subnormals.
+    #[test]
+    fn test_snake_is_the_unfused_chain() {
+        use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_same_bits};
+        let mut rng = Rng::new(14);
+        let channels = 3;
+        for &w in AWKWARD_LENS {
+            let shape = vec![2, channels, w];
+            let mut data = rng.vec(2 * channels * w, -4.0, 4.0);
+            for (i, x) in data.iter_mut().enumerate().step_by(5) {
+                *x = [0.0, -1e-40, 3e-20, 1e-5, f32::MIN_POSITIVE][i % 5] * (*x).signum();
+            }
+            let x = TensorView::from_slice(&data, shape.clone());
+            let per_channel = [rng.vec(channels, 0.1, 3.0), rng.vec(channels, 0.2, 2.0)];
+            for [alpha, beta] in [per_channel.clone(), [vec![0.7], vec![1.3]]] {
+                let a = TensorView::from_slice(&alpha, vec![1, alpha.len(), 1]);
+                let b = TensorView::from_slice(&beta, vec![1, beta.len(), 1]);
+                let two = 2.0f32;
+                let two = TensorView::from_slice(std::slice::from_ref(&two), vec![]);
+                let mut bufs: [Vec<f32>; 5] = Default::default();
+                let [b0, b1, b2, b3, b4] = &mut bufs;
+                let scaled = mul(&x, &a, b0);
+                let s = sin(&scaled, b1);
+                let squared = pow(&s, &two, b2);
+                let t = mul(&b, &squared, b3);
+                let want = add(&x, &t, b4);
+                let mut out = vec![5.0; 7];
+                let got = snake(&x, &a, &b, &mut out);
+                assert_eq!(got.shape, want.shape);
+                let what = format!("width {w}, {} alphas", alpha.len());
+                assert_same_bits(&got.data, &want.data, &what);
+            }
         }
     }
 
