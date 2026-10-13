@@ -97,10 +97,10 @@ pub fn conv2d_fused<'b, 'a>(
 
 /// Most bytes of unfolded input per band of output rows: about half of L2, so the
 /// columns are written and read back from cache.
-const IM2COL_BYTES: usize = 512 * 1024;
+pub(crate) const IM2COL_BYTES: usize = 512 * 1024;
 
 /// `band_bytes` bounds the unfolded input per band ([`IM2COL_BYTES`]; smaller in tests).
-fn conv2d_activation<'b, 'a>(
+pub(crate) fn conv2d_activation<'b, 'a>(
     level: Level,
     input: &TensorView<'b>,
     weights: &TensorView<'b>,
@@ -337,13 +337,14 @@ fn conv2d_activation<'b, 'a>(
 
     let col_rows = in_channels_per_group * kernel_h * kernel_w;
     let col_cols = out_h * out_w;
-    // Beyond a few rows of C, the product packs its blocks of the columns itself,
-    // straight from the input (`pack_columns`), so they are never unfolded whole:
-    // one copy of the input, which stays in cache, where unfolding and then packing
-    // made two, through a buffer larger than L2. (Not where the product goes to
-    // Accelerate.)
+    // Beyond a few rows and columns of C, the product packs its blocks of the
+    // columns itself, straight from the input (`pack_columns`), so they are never
+    // unfolded whole: one copy of the input, which stays in cache, where unfolding
+    // and then packing made two, through a buffer larger than L2. (Not where the
+    // product goes to Accelerate, or would take dot products for few columns.)
     let packed = !cfg!(all(target_arch = "aarch64", target_os = "macos"))
-        && out_channels_per_group > matmul_nn::SMALL_M;
+        && out_channels_per_group > matmul_nn::SMALL_M
+        && col_cols > crate::kernels::matmul::DOT_MAX_N;
     // The output is computed in bands of whole rows, whose unfolded columns or,
     // packed, part of the output fit in L2.
     let row_bytes = if packed {
@@ -580,10 +581,8 @@ fn im2col(
                 let col_row_offset = col_row * spatial_cols;
                 // Output column `ow` reads input column `ow * stride_w + shift - pad_left`.
                 let shift = kw * dilation_w;
-                let ow_start = pad_left.saturating_sub(shift).div_ceil(stride_w).min(out_w);
-                let ow_end = (in_w + pad_left)
-                    .saturating_sub(shift)
-                    .div_ceil(stride_w)
+                let ow_start = div_ceil_by(pad_left.saturating_sub(shift), stride_w).min(out_w);
+                let ow_end = div_ceil_by((in_w + pad_left).saturating_sub(shift), stride_w)
                     .clamp(ow_start, out_w);
                 for oh in out_rows.clone() {
                     let ih = (oh * stride_h + kh * dilation_h) as isize - pad_top as isize;
@@ -615,6 +614,18 @@ fn im2col(
     }
 }
 
+/// `x.div_ceil(s)`, without a division for the strides of 1 and 2: unfolding
+/// computes one per row of columns, which for a short output is a large share of
+/// the work.
+#[inline(always)]
+fn div_ceil_by(x: usize, s: usize) -> usize {
+    match s {
+        1 => x,
+        2 => x.div_ceil(2),
+        s => x.div_ceil(s),
+    }
+}
+
 /// Packs the block `(pc, kc, jc, nc)` of the columns `im2col` would unfold for
 /// the output rows from `oh_start` of window `w` over `input` (from its first
 /// channel) into `panels`, as `matmul_nn::Packer` does.
@@ -630,11 +641,6 @@ fn pack_columns<S: Simd>(
     let (in_h, in_w, out_w, pad_left) = (w.in_h, w.in_w, w.out_w, w.pad_left);
     // Integer division is slow next to copying a few elements: the row's channel
     // and kernel position, and each segment's output position, are stepped.
-    let div_ceil_stride = |x: usize| match w.stride_w {
-        1 => x,
-        2 => x.div_ceil(2),
-        s => x.div_ceil(s),
-    };
     let taps = w.kernel_h * w.kernel_w;
     let (mut c, tap) = (pc / taps, pc % taps);
     let (mut kh, mut kw) = (tap / w.kernel_w, tap % w.kernel_w);
@@ -656,8 +662,9 @@ fn pack_columns<S: Simd>(
         // Output column `ow` reads input column `ow * stride_w + shift - pad_left`:
         // those in range are copied, the rest zeroed.
         let shift = kw * w.dilation_w;
-        let ow_start = div_ceil_stride(pad_left.saturating_sub(shift)).min(out_w);
-        let ow_end = div_ceil_stride((in_w + pad_left).saturating_sub(shift)).clamp(ow_start, out_w);
+        let ow_start = div_ceil_by(pad_left.saturating_sub(shift), w.stride_w).min(out_w);
+        let ow_end =
+            div_ceil_by((in_w + pad_left).saturating_sub(shift), w.stride_w).clamp(ow_start, out_w);
         // The block's columns, a segment of an output row at a time: `len` from
         // column `ow` of output row `oh`, at column `at` of the block.
         let (mut oh, mut ow, mut at) = (first_oh, first_ow, 0);
