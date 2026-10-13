@@ -945,10 +945,10 @@ mod tests {
         assert!(contains(&unpacked.weights, &bytes(&conv)));
     }
 
-    /// i64 tensors and casts are written into the workspace, each into a buffer of its
-    /// own type, not into vectors allocated on every call.
+    /// i64 tensors, casts and every output of a Split are written into the workspace,
+    /// each into a buffer of its own type, not into vectors allocated on every call.
     #[test]
-    fn test_workspace_holds_i64_tensors_and_casts() {
+    fn test_workspace_holds_i64_tensors_casts_and_splits() {
         use crate::model::onnx_proto::{AttributeProto, GraphProto, TensorProto, ValueInfoProto};
         let info = |name: &str| ValueInfoProto {
             name: name.to_string(),
@@ -973,6 +973,7 @@ mod tests {
                 node("Shape", &["x"], &["s"], vec![]),
                 node("Gather", &["s", "idx"], &["g"], vec![]),
                 node("Cast", &["g"], &["c"], vec![int("to", DType::F32.to_onnx() as i64)]),
+                node("Split", &["x"], &["a", "b"], vec![int("axis", 0)]),
             ],
             initializer: vec![TensorProto {
                 name: "idx".to_string(),
@@ -982,7 +983,7 @@ mod tests {
                 ..Default::default()
             }],
             input: vec![info("x")],
-            output: vec![info("c")],
+            output: ["c", "a", "b"].map(info).to_vec(),
             ..Default::default()
         };
         let code = Compiler::new().compile(&graph).unwrap().code;
@@ -1003,6 +1004,11 @@ mod tests {
         };
         assert_eq!(field("kernels::gather("), "Vec<i64>,");
         assert_eq!(field("cast_to_f32("), "Vec<f32>,");
+        assert_eq!(field("split_one(&x, 0, &[0, 0], 0,"), "Vec<f32>,");
+        assert_ne!(
+            buffer("split_one(&x, 0, &[0, 0], 0,"),
+            buffer("split_one(&x, 0, &[0, 0], 1,")
+        );
     }
 
     /// An `If` branch that returns one of its initializers reads it through

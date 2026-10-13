@@ -280,20 +280,20 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 let split = split.clone().unwrap_or_else(|| vec![0; outputs.len()]);
                 format!("&{:?}", split)
             };
-            // Use split_owned which returns owned TensorViews directly,
-            // avoiding the overhead of creating local buffers and cloning
-            writeln!(w, "{}let splits_slice = {};", tab, splits)?;
-            writeln!(
-                w,
-                "{}let mut split_results = lele::kernels::split_owned(&{}, {}, splits_slice);",
-                tab, inputs[0], axis
-            )?;
-            // Extract results in reverse order using swap_remove for O(1) extraction
-            for (i, out_name) in outputs.iter().enumerate().rev() {
+            // Each output into its workspace buffer, or one local to the chunk.
+            for (i, (raw, out)) in ctx.node.output.iter().zip(outputs).enumerate() {
+                let buf = match ctx.allocator.and_then(|a| a.tensor_to_buffer.get(raw)) {
+                    Some(idx) => format!("&mut ws.buf_{idx}"),
+                    None => {
+                        let ty = ctx.var_types.get(out);
+                        writeln!(w, "{tab}let mut buf_{out} = Vec::<{ty}>::new();")?;
+                        format!("&mut buf_{out}")
+                    }
+                };
                 writeln!(
                     w,
-                    "{}let {} = split_results.swap_remove({});",
-                    tab, out_name, i
+                    "{tab}let {out} = lele::kernels::split_one(&{}, {axis}, {splits}, {i}, {buf});",
+                    inputs[0]
                 )?;
             }
         }
