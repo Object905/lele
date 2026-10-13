@@ -936,7 +936,7 @@ pub fn equal_i64_f32_lhs<'a, 'b>(
     equal_i64_impl(&a_as_i64, &a.shape, &b.data, &b.shape, out)
 }
 
-fn equal_i64_impl<'a, T: PartialEq + Copy>(
+fn equal_i64_impl<'a, T: PartialEq + Copy + std::fmt::Debug>(
     a_data: &[T],
     a_shape: &[usize],
     b_data: &[T],
@@ -946,25 +946,18 @@ fn equal_i64_impl<'a, T: PartialEq + Copy>(
     let out_shape = utils::broadcast_shapes(a_shape, b_shape)
         .unwrap_or_else(|| panic!("Shapes not broadcastable: a={:?} b={:?}", a_shape, b_shape));
     let numel = out_shape.iter().product::<usize>();
-    utils::ensure_capacity(out, numel);
-    if a_data.len() == 1 && b_data.len() == 1 {
-        out[0] = if a_data[0] == b_data[0] { 1 } else { 0 };
-    } else if a_data.len() == 1 {
-        let val_a = a_data[0];
-        for i in 0..numel {
-            out[i] = if val_a == b_data[i] { 1 } else { 0 };
-        }
-    } else if b_data.len() == 1 {
-        let val_b = b_data[0];
-        for i in 0..numel {
-            out[i] = if a_data[i] == val_b { 1 } else { 0 };
-        }
-    } else if a_data.len() == b_data.len() {
-        for i in 0..numel {
-            out[i] = if a_data[i] == b_data[i] { 1 } else { 0 };
-        }
-    } else {
-        panic!("equal_i64: complex broadcast not implemented");
+    let eq = |x: T, y: T| (x == y) as i64;
+    // Each fast path reads operands that hold one value or the whole output.
+    let (a_len, b_len) = (a_data.len(), b_data.len());
+    if !(a_len == numel || a_len == 1) || !(b_len == numel || b_len == 1) {
+        let a = TensorView::from_slice(a_data, a_shape.to_vec());
+        let b = TensorView::from_slice(b_data, b_shape.to_vec());
+        return broadcast_binary_op_to(&a, &b, out, eq);
+    }
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, numel) };
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = eq(a_data[if a_len == 1 { 0 } else { i }], b_data[if b_len == 1 { 0 } else { i }]);
     }
     TensorView {
         data: Cow::Borrowed(out),
@@ -2420,6 +2413,30 @@ mod tests {
                 assert_eq!(got.shape.as_ref(), &want_shape[..], "axes {axes:?}");
             }
         }
+    }
+
+    /// `equal_i64` broadcasting both operands (`[1, 6]` against `[6, 1]`, which used
+    /// to index past them), and one against a scalar or a whole.
+    #[test]
+    fn test_equal_i64_broadcasts_both_operands() {
+        let (row, col): (Vec<i64>, Vec<i64>) = ((0..6).collect(), (0..6).map(|i| 5 - i).collect());
+        let r = TensorView::from_slice(&row, vec![1, 6]);
+        let c = TensorView::from_slice(&col, vec![6, 1]);
+        let mut out = Vec::new();
+        let got = equal_i64(&r, &c, &mut out);
+        assert_eq!(got.shape.as_ref(), &[6, 6]);
+        for (k, &v) in got.data.iter().enumerate() {
+            let (i, j) = (k / 6, k % 6);
+            assert_eq!(v, (row[j] == col[i]) as i64, "at {i},{j}");
+        }
+        let three = [3i64];
+        let s = TensorView::from_slice(&three, vec![]);
+        let mut out = Vec::new();
+        let got = equal_i64(&r, &s, &mut out);
+        assert_eq!(got.data.as_ref(), &[0, 0, 0, 1, 0, 0]);
+        let mut out = Vec::new();
+        let got = equal_i64(&r, &r, &mut out);
+        assert_eq!(got.data.as_ref(), &[1; 6]);
     }
 
     /// Every set of axes of a `[2, 3, 4, 11]` tensor (consecutive ones take the fast
