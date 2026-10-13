@@ -85,6 +85,12 @@ pub struct Optimizations {
     /// MatMul + Add, dynamically quantized linear layers, ...) into single
     /// operators with fused kernels.
     pub operator_fusion: bool,
+    /// Stores f16 weights read only as the right operand of matrix products
+    /// in the order the matmul kernel reads them
+    /// ([`pack_f16`](crate::kernels::matmul::pack_f16)), so that each product
+    /// streams its weight from start to end. Not done when patterns are
+    /// registered, whose generators read weights as stored in the model.
+    pub weight_packing: bool,
 }
 
 impl Optimizations {
@@ -96,6 +102,7 @@ impl Optimizations {
             dead_code_elimination: true,
             qdq_fusion: true,
             operator_fusion: true,
+            weight_packing: true,
         }
     }
 }
@@ -212,7 +219,12 @@ impl Compiler {
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
         let (allocator, analysis) = alloc::solve_allocation(&ir);
-        let weights = weights::Weights::collect(&ir);
+        // Patterns and overrides of the products would read packed weights as stored in
+        // the model.
+        let pack = opt.weight_packing
+            && self.patterns.is_empty()
+            && !["MatMul", "Linear"].iter().any(|op| self.overrides.contains_key(*op));
+        let weights = weights::Weights::collect(&ir, pack);
         let (graph_inputs, graph_outputs) = (ir.input_infos(), ir.output_infos());
         let (ids, protos) = lower_nodes(&ir);
         let protos: Vec<&NodeProto> = protos.iter().collect();
