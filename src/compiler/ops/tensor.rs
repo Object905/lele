@@ -418,6 +418,22 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 buf_expr
             )?;
         }
+        Op::QLinearMatMulAct => {
+            // Produced by `fuse_qdq_matmul`: the scales are scalar f32 and the
+            // zero points scalar uint8.
+            writeln!(
+                w,
+                "{tab}let {} = lele::kernels::qmatmul_acts(&{}, {}.data[0], {}.data[0] as i32, &{}, {}.data[0], {}.data[0] as i32, {});",
+                outputs[0],
+                inputs[0],
+                inputs[1],
+                inputs[2],
+                inputs[3],
+                inputs[4],
+                inputs[5],
+                buf_expr
+            )?;
+        }
         Op::DynamicQuantizeLinear => {
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[0])?;
             writeln!(w, "{}let mut buf_{} = Vec::<f32>::new();", tab, outputs[1])?;

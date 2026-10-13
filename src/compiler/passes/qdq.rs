@@ -1,6 +1,6 @@
 //! Fusions of QDQ (QuantizeLinear / DequantizeLinear) graphs.
 
-use crate::compiler::ir::{DType, Graph, Op};
+use crate::compiler::ir::{DType, Graph, Op, ValueId};
 use crate::model::onnx_proto::TensorProto;
 
 /// Collapses `QuantizeLinear` → `DequantizeLinear` round trips into a single
@@ -81,7 +81,57 @@ pub(crate) fn fuse_qdq(g: &mut Graph) {
 /// The activation's own `DequantizeLinear` is left alone: it commonly feeds
 /// several matmuls (one per attention projection), and [`fuse_qdq`] still
 /// collapses it later.
+///
+/// A `MatMul` of two such activations (attention's queries by keys, and
+/// probabilities by values) becomes a `QLinearMatMulAct`, which quantizes both
+/// back to their codes and multiplies them in integers.
 pub(crate) fn fuse_qdq_matmul(g: &mut Graph) {
+    fuse_qdq_matmul_weight(g);
+    fuse_qdq_matmul_act(g);
+}
+
+/// The scale and zero point of `v` if it is a `DequantizeLinear` of a
+/// computed tensor, with a scalar scale and a scalar uint8 zero point: an
+/// activation the integer kernels can quantize back exactly.
+fn dequantized_activation(g: &Graph, v: ValueId) -> Option<(ValueId, ValueId)> {
+    let dq = g.producer(v)?;
+    if !matches!(dq.op, Op::DequantizeLinear(_)) || g.data(dq.input(0)?).is_some() {
+        return None;
+    }
+    let (scale, zp) = (dq.input(1)?, dq.input(2)?);
+    let numel = |t: &TensorProto| t.dims.iter().product::<i64>().max(1);
+    let scalar_scale = g.data(scale).is_some_and(|t| numel(t) == 1);
+    // UINT8 is the operand type `vpdpbusd` takes for A.
+    let u8_zp = g
+        .data(zp)
+        .is_some_and(|t| DType::from_onnx(t.data_type) == DType::U8 && numel(t) == 1);
+    (scalar_scale && u8_zp).then_some((scale, zp))
+}
+
+fn fuse_qdq_matmul_act(g: &mut Graph) {
+    let mut rewrites = Vec::new();
+    for (mm_id, mm) in g.nodes() {
+        if !matches!(mm.op, Op::MatMul) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (mm.input(0), mm.input(1)) else {
+            continue;
+        };
+        let (Some((a_scale, a_zp)), Some((b_scale, b_zp))) =
+            (dequantized_activation(g, a), dequantized_activation(g, b))
+        else {
+            continue;
+        };
+        let inputs = [a, a_scale, a_zp, b, b_scale, b_zp].map(Some).to_vec();
+        rewrites.push((mm_id, inputs));
+    }
+    for (mm_id, inputs) in rewrites {
+        g.set_inputs(mm_id, inputs);
+        g.node_mut(mm_id).op = Op::QLinearMatMulAct;
+    }
+}
+
+fn fuse_qdq_matmul_weight(g: &mut Graph) {
     // Every byte of an initializer is zero, so the tensor is too. Zero
     // points live in `raw_data` or `int32_data` depending on the exporter.
     let all_zero = |t: &TensorProto| {
@@ -500,13 +550,55 @@ mod tests {
             assert_eq!(op_types(&g).last(), Some(&"MatMul"));
         }
 
-        #[test]
-        fn keeps_matmul_between_two_activations() {
-            // Attention scores: both operands are dequantized activations, so
-            // there is no static weight to pack.
+        /// Attention scores: both operands dequantized activations.
+        fn activation_nodes() -> Vec<NodeProto> {
             let mut n = nodes();
-            n[1] = node("DequantizeLinear", &["vq", "a_scale", "a_zp"], "wd", &[]);
-            let g = run(graph(n), fuse_qdq_matmul);
+            n[1] = node("DequantizeLinear", &["vq", "w_scale", "a_zp"], "wd", &[]);
+            n
+        }
+
+        #[test]
+        fn rewrites_matmul_between_two_dequantized_activations() {
+            let mut g = graph(activation_nodes());
+            initializer(&mut g, "w_scale").dims = vec![];
+            let g = run(g, fuse_qdq_matmul);
+            // Both DequantizeLinears stay, for `fuse_qdq` to collapse.
+            assert_eq!(
+                op_types(&g),
+                ["DequantizeLinear", "DequantizeLinear", "QLinearMatMulAct"]
+            );
+            assert_eq!(
+                g.node[2].input,
+                ["a", "a_scale", "a_zp", "wd", "w_scale", "a_zp"]
+            );
+            assert_eq!(g.node[2].output, ["y"]);
+        }
+
+        #[test]
+        fn keeps_matmul_between_activations_with_a_per_channel_scale() {
+            // `w_scale` has two elements.
+            let g = run(graph(activation_nodes()), fuse_qdq_matmul);
+            assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+        }
+
+        #[test]
+        fn keeps_matmul_between_activations_with_an_int8_zero_point() {
+            let mut g = graph(activation_nodes());
+            initializer(&mut g, "w_scale").dims = vec![];
+            initializer(&mut g, "a_zp").data_type = DType::I8.to_onnx();
+            let g = run(g, fuse_qdq_matmul);
+            assert_eq!(op_types(&g).last(), Some(&"MatMul"));
+        }
+
+        #[test]
+        fn keeps_matmul_against_a_dequantized_uint8_weight() {
+            // A constant B is no activation: folding dequantizes it once,
+            // rather than the kernel quantizing it on every call.
+            let mut n = nodes();
+            n[1] = node("DequantizeLinear", &["w", "a_scale", "a_zp"], "wd", &[]);
+            let mut g = graph(n);
+            initializer(&mut g, "w").data_type = DType::U8.to_onnx();
+            let g = run(g, fuse_qdq_matmul);
             assert_eq!(op_types(&g).last(), Some(&"MatMul"));
         }
     }
