@@ -3,7 +3,7 @@
 
 use super::super::{
     generate::{ElemType, OpContext},
-    ir::{DType, Op},
+    ir::{DType, Op, ReshapeDim},
 };
 use std::io::Write;
 
@@ -23,7 +23,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             if let Some(ints) = ctx.ints(idx) {
                 Ok(format!("&{:?}", ints))
             } else {
-                if ctx.var_types.is_i64(&ctx.inputs[idx]) {
+                if ctx.input_type(idx) == ElemType::I64 {
                     // For i64 tensors, use .data directly
                     Ok(format!("&{}.data[..]", ctx.inputs[idx]))
                 } else {
@@ -47,7 +47,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             if let Some(ints) = ctx.ints(idx) {
                 Ok(format!("Some(&{:?})", ints))
             } else {
-                if ctx.var_types.is_i64(&ctx.inputs[idx]) {
+                if ctx.input_type(idx) == ElemType::I64 {
                     Ok(format!("Some(&{}.data[..])", ctx.inputs[idx]))
                 } else {
                     let temp_name = format!("temp_i64_{}", idx);
@@ -92,6 +92,25 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 w,
                 "{}let {} = lele::kernels::reshape(&{}, {});",
                 tab, outputs[0], inputs[0], shape
+            )?;
+        }
+        Op::ReshapeTo { dims } => {
+            let x = &inputs[0];
+            let dims: Vec<String> = dims
+                .iter()
+                .map(|d| match d {
+                    ReshapeDim::Fixed(n) => n.to_string(),
+                    ReshapeDim::Input(k) => format!("{x}.shape[{k}] as i64"),
+                    ReshapeDim::Infer => "-1".to_string(),
+                })
+                .collect();
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::reshape(&{}, &[{}]);",
+                tab,
+                outputs[0],
+                x,
+                dims.join(", ")
             )?;
         }
         Op::Flatten { axis } => {
@@ -197,7 +216,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 )?;
             } else if *to == DType::F32 {
                 // Check if input is already f32, in which case cast is a no-op
-                if ctx.var_types.get(&ctx.inputs[0]) == ElemType::F32 {
+                if ctx.input_type(0) == ElemType::F32 {
                     writeln!(
                         w,
                         "{}let {} = {}.clone(); // Cast f32->f32 is no-op",
@@ -316,7 +335,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                     format!("&{:?}", ints)
                 } else {
                     // pads is a computed tensor, we need to extract data
-                    if ctx.var_types.is_i64(&ctx.inputs[1]) {
+                    if ctx.input_type(1) == ElemType::I64 {
                         format!("&{}.data[..]", inputs[1])
                     } else {
                         // Need to convert f32 to i64

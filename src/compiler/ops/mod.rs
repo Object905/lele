@@ -52,6 +52,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::QLinearMatMulI8
         | Op::QuantizeLinear(_)
         | Op::Reshape
+        | Op::ReshapeTo { .. }
         | Op::Shape { .. }
         | Op::Size
         | Op::Slice

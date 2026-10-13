@@ -40,6 +40,14 @@ impl<'a> OpContext<'a> {
         self.weights.get(self.node.input.get(i)?)
     }
 
+    /// The element type input `i` is held in, whether it is a variable or a
+    /// weight.
+    pub fn input_type(&self, i: usize) -> ElemType {
+        self.node.input.get(i).map_or(ElemType::F32, |name| {
+            self.var_types.get(&sanitize_name(name))
+        })
+    }
+
     /// The values of input `i`, if it is an int64 or int32 weight.
     pub fn ints(&self, i: usize) -> Option<&'a [i64]> {
         self.weights.ints(self.node.input.get(i)?)

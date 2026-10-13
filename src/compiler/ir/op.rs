@@ -186,6 +186,16 @@ impl Activation {
     }
 }
 
+/// One dimension of an [`Op::ReshapeTo`] target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReshapeDim {
+    Fixed(i64),
+    /// Dimension `k` of the input.
+    Input(usize),
+    /// Whatever the element count leaves; at most one per target.
+    Infer,
+}
+
 /// An enum of operators sharing one [`Op`] variant, each named by its
 /// `op_type`.
 macro_rules! op_kinds {
@@ -492,6 +502,11 @@ pub enum Op {
     EmbeddingConcat {
         value: Option<TensorProto>,
     },
+    /// `Reshape` to a target known at compile time up to dimensions of the
+    /// input. Inputs: `[x]`.
+    ReshapeTo {
+        dims: Vec<ReshapeDim>,
+    },
 
     /// Any operator without a typed variant yet. Its graph attributes are
     /// built into `graphs` so passes see into them; every other attribute
@@ -740,6 +755,7 @@ impl Op {
             Op::Linear => "Linear",
             Op::QLinearDynamic { .. } => "QLinearDynamic",
             Op::EmbeddingConcat { .. } => "EmbeddingConcat",
+            Op::ReshapeTo { .. } => "ReshapeTo",
             Op::Onnx { op_type, .. } => op_type,
         }
     }
@@ -793,6 +809,20 @@ impl Op {
                 set_attr_t(attrs, "value", value)
             }
             Op::Conv(conv) => conv.write(attrs),
+            Op::ReshapeTo { dims } => {
+                // `shape` holds the fixed sizes, -1 to infer and 0 where
+                // `input_axes` names the input dimension to take.
+                let (shape, input_axes) = dims
+                    .iter()
+                    .map(|d| match *d {
+                        ReshapeDim::Fixed(n) => (n, -1),
+                        ReshapeDim::Input(k) => (0, k as i64),
+                        ReshapeDim::Infer => (-1, -1),
+                    })
+                    .unzip();
+                set_attr_ints(attrs, "shape", Some(shape));
+                set_attr_ints(attrs, "input_axes", Some(input_axes));
+            }
             Op::ConvAct { conv, act } => {
                 conv.write(attrs);
                 set_attr(attrs, "activation", 3 /* STRING */, |a| {

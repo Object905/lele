@@ -1,6 +1,6 @@
 //! Constant folding.
 
-use crate::compiler::ir::{DType, Dim, Graph, Op, QuantAttrs};
+use crate::compiler::ir::{DType, Graph, Op, QuantAttrs};
 use crate::model::onnx_proto::TensorProto;
 use crate::model::tensor_to_array;
 use std::collections::{HashMap, HashSet};
@@ -38,34 +38,7 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
             consts.insert(g.value(v).name.clone(), Const { data, shape, dtype });
         }
     }
-    // 2. Shapes of inputs whose every dimension is static, so that
-    // `Shape -> Concat -> Reshape` chains on them fold. Only `Shape` may read
-    // these entries (see below): their data is the shape, not the input.
-    for &v in &g.inputs {
-        let Some(dims) = &g.value(v).shape else {
-            continue;
-        };
-        if dims.is_empty() || dims.iter().any(|d| matches!(d, Dim::Sym(_))) {
-            continue;
-        }
-        let shape: Vec<usize> = dims
-            .iter()
-            .map(|d| match d {
-                Dim::Fixed(n) if *n > 0 => *n as usize,
-                _ => 1,
-            })
-            .collect();
-        let data = shape.iter().map(|&d| d as f32).collect();
-        consts.insert(
-            g.value(v).name.clone(),
-            Const {
-                data,
-                shape,
-                dtype: DType::I64,
-            },
-        );
-    }
-    // 3. Constant nodes. They stay in the graph; code generation reads them.
+    // 2. Constant nodes. They stay in the graph; code generation reads them.
     for (_, node) in g.nodes() {
         if let Op::Constant { value } = &node.op
             && let Some(out) = node.output(0)
@@ -77,20 +50,20 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
         }
     }
 
-    // 4. One pass in execution order folds whole constant chains.
+    // 3. One pass in execution order folds whole constant chains.
+    // An initializer of an input's name is only its default value.
     let graph_inputs: HashSet<_> = g.inputs.iter().copied().collect();
     for id in g.node_ids() {
         let node = g.node(id);
         if matches!(node.op, Op::Constant { .. }) || node.inputs().is_empty() {
             continue;
         }
-        let is_shape = matches!(node.op, Op::Shape { .. });
         let inputs: Option<Vec<&Const>> = node
             .inputs()
             .iter()
             .map(|v| {
                 let v = (*v)?;
-                if graph_inputs.contains(&v) && !is_shape {
+                if graph_inputs.contains(&v) {
                     return None;
                 }
                 consts.get(&g.value(v).name)
@@ -131,7 +104,7 @@ fn fold_graph(g: &mut Graph, inherited: &Consts) {
         g.add_initializer(out, tensor);
     }
 
-    // 5. Subgraphs, which see everything known here.
+    // 4. Subgraphs, which see everything known here.
     for id in g.node_ids() {
         for sub in g.node_mut(id).op.subgraphs_mut() {
             fold_graph(sub, &consts);

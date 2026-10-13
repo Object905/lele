@@ -150,6 +150,12 @@ impl Compiler {
         passes::fuse_qdq_matmul(&mut ir);
         if self.constant_folding {
             passes::fold_constants(&mut ir);
+            // Shape inference resolves the shape computations folding
+            // could not, which may leave more to fold.
+            passes::infer_dtypes(&mut ir);
+            passes::fold_shapes(&mut ir);
+            passes::fold_constants(&mut ir);
+            passes::eliminate_dead_code(&mut ir);
         }
         // Runs after folding so that only the activation pairs are left.
         passes::fuse_qdq(&mut ir);
@@ -287,11 +293,9 @@ impl Compiler {
         // Generate return type
         let ret_types: Vec<String> = graph_outputs
             .iter()
-            .map(|o| {
-                match var_types.get(&sanitize_name(&o.name)) {
-                    ElemType::F32 => "TensorView<'a>".to_string(),
-                    ty => format!("TensorView<'a, {}>", ty),
-                }
+            .map(|o| match var_types.get(&sanitize_name(&o.name)) {
+                ElemType::F32 => "TensorView<'a>".to_string(),
+                ty => format!("TensorView<'a, {}>", ty),
             })
             .collect();
         let ret_sig = if ret_types.len() == 1 {

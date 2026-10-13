@@ -77,7 +77,8 @@ impl Weights {
 
     fn add_graph(&mut self, g: &Graph) {
         for &v in g.initializers() {
-            if let Some(t) = g.data(v) {
+            // Those that folding left without readers are not written.
+            if let Some(t) = g.data(v).filter(|_| g.uses(v) > 0) {
                 self.add(&g.value(v).name, t);
             }
         }

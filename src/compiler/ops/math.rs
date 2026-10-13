@@ -3,7 +3,6 @@
 
 use super::super::generate::{ElemType, OpContext};
 use super::super::ir::{Binary, DType, Op, Reduction, Unary};
-use super::super::sanitize_name;
 use std::io::Write;
 
 pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<()> {
@@ -135,7 +134,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             }
         }
         Op::Range => {
-            let is_i64 = inputs[..3].iter().any(|i| ctx.var_types.is_i64(i));
+            let is_i64 = (0..3).any(|i| ctx.input_type(i) == ElemType::I64);
             if is_i64 {
                 writeln!(w, "{}let mut buf_{} = Vec::<i64>::new();", tab, outputs[0])?;
                 writeln!(
@@ -239,7 +238,7 @@ fn generate_binary(ctx: &OpContext, op: Binary, w: &mut dyn Write) -> std::io::R
     let (a, b) = (&ctx.inputs[0], &ctx.inputs[1]);
     let (out, buf_expr) = (&ctx.outputs[0], &ctx.buf_expr);
     let types = ctx.var_types;
-    let any_i64 = types.is_i64(a) || types.is_i64(b);
+    let any_i64 = ctx.input_type(0) == ElemType::I64 || ctx.input_type(1) == ElemType::I64;
     let kernel = match op {
         Binary::Add => "add",
         Binary::And => "logical_and",
@@ -277,23 +276,19 @@ fn generate_binary(ctx: &OpContext, op: Binary, w: &mut dyn Write) -> std::io::R
             );
         }
         Binary::Equal => {
-            if !(types.is_i64(out) || types.is_i64(a)) {
+            let (type_a, type_b) = (ctx.input_type(0), ctx.input_type(1));
+            if !(types.is_i64(out) || type_a == ElemType::I64) {
                 "equal"
             } else {
                 let a_is_weight_f32 = a.contains("weight_f32");
                 let b_is_weight_f32 = b.contains("weight_f32");
-                let type_a = types.get(&sanitize_name(&ctx.node.input[0]));
                 if b_is_weight_f32 {
                     if type_a == ElemType::I64 {
                         "equal_i64_f32_r_i64"
                     } else {
                         "equal_i64_f32_r"
                     }
-                } else if a_is_weight_f32
-                    || type_a == ElemType::F32
-                        && (b.contains("weight_i64")
-                            || types.is_i64(&sanitize_name(&ctx.node.input[1])))
-                {
+                } else if a_is_weight_f32 || type_a == ElemType::F32 && type_b == ElemType::I64 {
                     "equal_i64_f32_lhs"
                 } else {
                     "equal_i64"

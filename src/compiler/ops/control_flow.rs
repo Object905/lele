@@ -1,7 +1,7 @@
 //! Code generation for control flow.
 
 use super::super::{
-    generate::{Nodes, OpContext, generate_nodes, lower_nodes, weight_expr},
+    generate::{ElemType, Nodes, OpContext, generate_nodes, lower_nodes, weight_expr},
     ir::{Graph, Op},
     sanitize_name,
 };
@@ -40,7 +40,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
     };
     let cond = &inputs[0];
     let out_vars = outputs.join(", ");
-    if ctx.var_types.is_i64(cond) {
+    if ctx.input_type(0) == ElemType::I64 {
         writeln!(
             w,
             "{}let ({}) = if {}.data.first().is_some_and(|&v| v != 0) {{",
