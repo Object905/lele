@@ -32,6 +32,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::Gemm { .. }
         | Op::GlobalAveragePool
         | Op::Gru { .. }
+        | Op::InstanceNormalization { .. }
         | Op::LayerNormalization { .. }
         | Op::Lstm
         | Op::MaxPool(_)
@@ -57,6 +58,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::QuantizeLinear(_)
         | Op::Reshape
         | Op::ReshapeTo { .. }
+        | Op::ScatterND
         | Op::Shape { .. }
         | Op::Size
         | Op::Slice
@@ -65,6 +67,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::Tile
         | Op::TopK { .. }
         | Op::Transpose { .. }
+        | Op::Trilu { .. }
         | Op::Unsqueeze { .. }
         | Op::Where => tensor::generate(ctx, w)?,
         Op::ArgMax { .. }

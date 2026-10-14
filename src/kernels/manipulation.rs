@@ -1651,10 +1651,176 @@ where
     TensorView::from_slice(out, out_shape)
 }
 
+/// Trilu: the upper (`upper`) or lower triangle of each matrix over the last two
+/// axes, the rest zeroed. `k` moves the diagonal: with `upper`, the elements
+/// `j - i >= k` are kept; otherwise, those with `j - i <= k`.
+pub fn trilu<'a, T: Copy + Default + std::fmt::Debug>(
+    input: &TensorView<'_, T>,
+    k: i64,
+    upper: bool,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    let rank = input.shape.len();
+    assert!(rank >= 2, "Trilu needs at least two axes");
+    let (rows, cols) = (input.shape[rank - 2], input.shape[rank - 1]);
+    let len = input.data.len();
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
+    for (src, dst) in input
+        .data
+        .chunks(rows * cols)
+        .zip(out[..len].chunks_mut(rows * cols))
+    {
+        for i in 0..rows {
+            for j in 0..cols {
+                let d = j as i64 - i as i64;
+                let keep = if upper { d >= k } else { d <= k };
+                dst[i * cols + j] = if keep {
+                    src[i * cols + j]
+                } else {
+                    T::default()
+                };
+            }
+        }
+    }
+    TensorView::from_slice(&out[..len], input.shape.to_vec())
+}
+
+/// ScatterND: a copy of `data` with the slices that `indices` points to replaced by
+/// `updates`. The last axis of `indices` holds the leading coordinates of a slice
+/// of `data`; where two indices are the same, the later update wins.
+pub fn scatter_nd<'a, T: Copy + std::fmt::Debug, I: utils::AsI64 + Copy + std::fmt::Debug>(
+    data: &TensorView<'_, T>,
+    indices: &TensorView<'_, I>,
+    updates: &TensorView<'_, T>,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    let len = data.data.len();
+    let rank = data.shape.len();
+    let q = *indices
+        .shape
+        .last()
+        .expect("ScatterND indices have an axis");
+    assert!(q <= rank, "ScatterND index longer than the data's rank");
+    let slice: usize = data.shape[q..].iter().product();
+    let count: usize = indices.shape[..indices.shape.len() - 1].iter().product();
+    assert_eq!(
+        updates.data.len(),
+        count * slice,
+        "ScatterND updates do not match indices"
+    );
+    // SAFETY: the copy below writes every element.
+    unsafe { utils::ensure_capacity(out, len) };
+    out[..len].copy_from_slice(&data.data);
+    // Elements between two steps of each coordinate: a step of the last is a slice.
+    let mut strides = vec![1usize; q];
+    for d in (0..q.saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1] * data.shape[d + 1];
+    }
+    for d in 0..q {
+        strides[d] *= slice;
+    }
+    for n in 0..count {
+        let mut at = 0;
+        for d in 0..q {
+            let mut c = indices.data[n * q + d].as_i64();
+            if c < 0 {
+                c += data.shape[d] as i64;
+            }
+            assert!(
+                (0..data.shape[d] as i64).contains(&c),
+                "ScatterND: index out of range"
+            );
+            at += c as usize * strides[d];
+        }
+        out[at..at + slice].copy_from_slice(&updates.data[n * slice..(n + 1) * slice]);
+    }
+    TensorView::from_slice(&out[..len], data.shape.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tensor::TensorView;
+
+    #[test]
+    fn test_trilu_keeps_a_triangle_of_each_matrix() {
+        let data: Vec<f32> = (1..=24).map(|i| i as f32).collect();
+        // Two 3x4 matrices.
+        let t = TensorView::from_slice(&data, vec![2, 3, 4]);
+        let mut out = Vec::new();
+        let upper = trilu(&t, 0, true, &mut out).data.to_vec();
+        assert_eq!(
+            &upper[..12],
+            &[1., 2., 3., 4., 0., 6., 7., 8., 0., 0., 11., 12.]
+        );
+        assert_eq!(&upper[12..16], &[13., 14., 15., 16.]);
+        // Moving the diagonal up drops it; down brings in the row below.
+        let upper1 = trilu(&t, 1, true, &mut out).data.to_vec();
+        assert_eq!(
+            &upper1[..12],
+            &[0., 2., 3., 4., 0., 0., 7., 8., 0., 0., 0., 12.]
+        );
+        let upper_1 = trilu(&t, -1, true, &mut out).data.to_vec();
+        assert_eq!(
+            &upper_1[..12],
+            &[1., 2., 3., 4., 5., 6., 7., 8., 0., 10., 11., 12.]
+        );
+        let lower = trilu(&t, 0, false, &mut out).data.to_vec();
+        assert_eq!(
+            &lower[..12],
+            &[1., 0., 0., 0., 5., 6., 0., 0., 9., 10., 11., 0.]
+        );
+        let lower1 = trilu(&t, 1, false, &mut out).data.to_vec();
+        assert_eq!(
+            &lower1[..12],
+            &[1., 2., 0., 0., 5., 6., 7., 0., 9., 10., 11., 12.]
+        );
+        // Far past the matrix, all or nothing.
+        assert!(trilu(&t, 9, true, &mut out).data.iter().all(|&x| x == 0.0));
+        assert_eq!(trilu(&t, 9, false, &mut out).data.to_vec(), data);
+        // Other element types.
+        let ints = TensorView::from_slice(&[1i64, 2, 3, 4], vec![2, 2]);
+        let mut out = Vec::new();
+        assert_eq!(trilu(&ints, 0, false, &mut out).data.to_vec(), [1, 0, 3, 4]);
+    }
+
+    /// The examples of the ONNX ScatterND spec, and a negative index.
+    #[test]
+    fn test_scatter_nd_matches_the_spec() {
+        let mut out = Vec::new();
+        // Elements of a vector.
+        let data = TensorView::from_slice(&[1., 2., 3., 4., 5., 6., 7., 8.], vec![8]);
+        let indices = TensorView::from_slice(&[4i64, 3, 1, 7], vec![4, 1]);
+        let updates = TensorView::from_slice(&[9., 10., 11., 12.], vec![4]);
+        assert_eq!(
+            scatter_nd(&data, &indices, &updates, &mut out)
+                .data
+                .to_vec(),
+            [1., 11., 3., 10., 9., 6., 7., 12.]
+        );
+        // Whole matrices of a stack.
+        let data = TensorView::from_slice(&[0.0f32; 16], vec![4, 2, 2]);
+        let indices = TensorView::from_slice(&[2i64, 0], vec![2, 1]);
+        let updates = TensorView::from_slice(&[1., 2., 3., 4., 5., 6., 7., 8.], vec![2, 2, 2]);
+        let r = scatter_nd(&data, &indices, &updates, &mut out);
+        assert_eq!(
+            r.data.to_vec(),
+            [
+                5., 6., 7., 8., 0., 0., 0., 0., 1., 2., 3., 4., 0., 0., 0., 0.
+            ]
+        );
+        // Single elements of a matrix, by their coordinates, and from the end.
+        let data = TensorView::from_slice(&[0.0f32; 6], vec![2, 3]);
+        let indices = TensorView::from_slice(&[0i64, 2, -1, -3], vec![2, 2]);
+        let updates = TensorView::from_slice(&[7., 8.], vec![2]);
+        assert_eq!(
+            scatter_nd(&data, &indices, &updates, &mut out)
+                .data
+                .to_vec(),
+            [0., 0., 7., 8., 0., 0.]
+        );
+    }
 
     /// Slice, Gather, Transpose and Split return a view of a borrowed input exactly when
     /// what they take is one run of it, with the elements and shape a copy has; an owned

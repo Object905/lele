@@ -384,6 +384,9 @@ pub enum Op {
         beta: f32,
     },
     Identity,
+    InstanceNormalization {
+        epsilon: f32,
+    },
     LayerNormalization {
         axis: i64,
         epsilon: f32,
@@ -422,6 +425,8 @@ pub enum Op {
     },
     /// `allowzero` stays in the proto.
     Reshape,
+    /// Without a `reduction`: with one the node stays an [`Op::Onnx`].
+    ScatterND,
     /// The other attributes (`cubic_coeff_a`, `antialias`, ...) stay in the
     /// proto.
     Resize {
@@ -465,6 +470,10 @@ pub enum Op {
     Transpose {
         /// Absent means reversing the axes.
         perm: Option<Vec<i64>>,
+    },
+    Trilu {
+        /// The upper triangle is kept; otherwise the lower.
+        upper: bool,
     },
     Unary(Unary),
     Unsqueeze {
@@ -671,6 +680,16 @@ impl Op {
                 alpha: attr_f(node, "alpha").unwrap_or(0.2),
                 beta: attr_f(node, "beta").unwrap_or(0.5),
             },
+            "InstanceNormalization" => Op::InstanceNormalization {
+                epsilon: attr_f(node, "epsilon").unwrap_or(1e-5),
+            },
+            "ScatterND" => match attr_s(node, "reduction").as_deref() {
+                None | Some("none") => Op::ScatterND,
+                Some(_) => fallback(node),
+            },
+            "Trilu" => Op::Trilu {
+                upper: attr_i(node, "upper").unwrap_or(1) != 0,
+            },
             "LayerNormalization" => Op::LayerNormalization {
                 axis: attr_i(node, "axis").unwrap_or(-1),
                 epsilon: attr_f(node, "epsilon").unwrap_or(1e-5),
@@ -774,6 +793,9 @@ impl Op {
             Op::Gemm { .. } => "Gemm",
             Op::Gru { .. } => "GRU",
             Op::HardSigmoid { .. } => "HardSigmoid",
+            Op::InstanceNormalization { .. } => "InstanceNormalization",
+            Op::ScatterND => "ScatterND",
+            Op::Trilu { .. } => "Trilu",
             Op::LayerNormalization { .. } => "LayerNormalization",
             Op::LeakyRelu { .. } => "LeakyRelu",
             Op::LogSoftmax { .. } => "LogSoftmax",
@@ -926,6 +948,8 @@ impl Op {
                 set_attr_f(attrs, "alpha", alpha, 0.2);
                 set_attr_f(attrs, "beta", beta, 0.5);
             }
+            Op::InstanceNormalization { epsilon } => set_attr_f(attrs, "epsilon", epsilon, 1e-5),
+            Op::Trilu { upper } => set_attr_i(attrs, "upper", upper as i64, 1),
             Op::LayerNormalization { axis, epsilon } => {
                 set_attr_i(attrs, "axis", axis, -1);
                 set_attr_f(attrs, "epsilon", epsilon, 1e-5);
@@ -1000,6 +1024,7 @@ impl Op {
             | Op::Max
             | Op::Range
             | Op::Reshape
+            | Op::ScatterND
             | Op::Size
             | Op::Slice
             | Op::Stft
@@ -1221,6 +1246,8 @@ mod tests {
             ("CumSum", vec![int("exclusive", 1), int("reverse", 0)]),
             ("Einsum", vec![string("equation", "bs,d->bsd")]),
             ("Gemm", vec![float("alpha", 1.0), int("transB", 1)]),
+            ("InstanceNormalization", vec![float("epsilon", 1e-3)]),
+            ("Trilu", vec![int("upper", 0)]),
             (
                 "GRU",
                 vec![int("hidden_size", 8), int("linear_before_reset", 1)],

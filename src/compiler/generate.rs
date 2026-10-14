@@ -1036,6 +1036,76 @@ mod tests {
         );
     }
 
+    /// Trilu, ScatterND and InstanceNormalization have code, a Trilu without its
+    /// `k` takes the main diagonal, and a Reshape target keeps its 0s, which copy
+    /// the input's dimension, beside a -1.
+    #[test]
+    fn test_trilu_scatter_nd_instance_norm_and_reshape_zero() {
+        use crate::model::onnx_proto::{AttributeProto, GraphProto, TensorProto, ValueInfoProto};
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let node =
+            |op: &str, input: &[&str], output: &[&str], attribute: Vec<AttributeProto>| NodeProto {
+                op_type: op.to_string(),
+                input: input.iter().map(|s| s.to_string()).collect(),
+                output: output.iter().map(|s| s.to_string()).collect(),
+                attribute,
+                ..Default::default()
+            };
+        let constant = |name: &str, dims: Vec<i64>, values: &[f32]| TensorProto {
+            name: name.to_string(),
+            data_type: DType::F32.to_onnx(),
+            dims,
+            raw_data: values.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            ..Default::default()
+        };
+        let ints = |name: &str, values: &[i64]| TensorProto {
+            name: name.to_string(),
+            data_type: DType::I64.to_onnx(),
+            dims: vec![values.len() as i64],
+            raw_data: values.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            ..Default::default()
+        };
+        let attribute = |name: &str, f: f32| AttributeProto {
+            name: name.to_string(),
+            f,
+            ..Default::default()
+        };
+        let graph = GraphProto {
+            node: vec![
+                node("Trilu", &["x"], &["t"], vec![]),
+                node("ScatterND", &["x", "idx", "upd"], &["s"], vec![]),
+                node(
+                    "InstanceNormalization",
+                    &["x", "g", "b"],
+                    &["n"],
+                    vec![attribute("epsilon", 1e-3)],
+                ),
+                node("Reshape", &["x", "target"], &["r"], vec![]),
+            ],
+            initializer: vec![
+                ints("idx", &[1]),
+                constant("upd", vec![1], &[0.0]),
+                constant("g", vec![1], &[1.0]),
+                constant("b", vec![1], &[0.0]),
+                ints("target", &[0, 1, -1]),
+            ],
+            input: vec![info("x")],
+            output: ["t", "s", "n", "r"].map(info).to_vec(),
+            ..Default::default()
+        };
+        let code = Compiler::new().compile(&graph).unwrap().code;
+        assert!(code.contains("kernels::trilu(&x, 0, true,"), "{code}");
+        assert!(code.contains("kernels::scatter_nd(&x,"), "{code}");
+        assert!(
+            code.contains("kernels::instance_norm(&x,") && code.contains("0.001"),
+            "{code}"
+        );
+        assert!(code.contains("kernels::reshape(&x, &[0, 1, -1])"), "{code}");
+    }
+
     /// A 1D Conv fused with its Relu borrows its input, which later nodes may
     /// still read (it used to be moved), and keeps both of its pads.
     #[test]
