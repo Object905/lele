@@ -437,12 +437,15 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
         | Op::Gelu { .. }
         | Op::HardSigmoid { .. }
         | Op::Identity
+        | Op::Elu { .. }
         | Op::InstanceNormalization { .. }
+        | Op::IsNaN
         | Op::LayerNormalization { .. }
         | Op::LeakyRelu { .. }
         | Op::LogSoftmax { .. }
         | Op::QuantizeLinear(_)
         | Op::ScaleNorm { .. }
+        | Op::ScatterElements { .. }
         | Op::ScatterND
         | Op::SimAm { .. }
         | Op::Silu

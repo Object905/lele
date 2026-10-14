@@ -602,6 +602,13 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 tab, outputs[0], inputs[0], inputs[1], axis, buf_expr
             )?;
         }
+        Op::ScatterElements { axis } => {
+            writeln!(
+                w,
+                "{}let {} = lele::kernels::scatter_elements(&{}, &{}, &{}, {}, {});",
+                tab, outputs[0], inputs[0], inputs[1], inputs[2], axis, buf_expr
+            )?;
+        }
         Op::ScatterND => {
             writeln!(
                 w,

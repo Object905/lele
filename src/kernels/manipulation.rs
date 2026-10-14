@@ -1738,10 +1738,113 @@ pub fn scatter_nd<'a, T: Copy + std::fmt::Debug, I: utils::AsI64 + Copy + std::f
     TensorView::from_slice(&out[..len], data.shape.to_vec())
 }
 
+/// ScatterElements: a copy of `data` where, for each position of `indices`, the
+/// element that has that position's coordinates but the index's value along `axis`
+/// is replaced by the same position of `updates`. Later positions win over earlier
+/// ones that point to the same element.
+pub fn scatter_elements<'a, T: Copy + std::fmt::Debug, I: utils::AsI64 + Copy + std::fmt::Debug>(
+    data: &TensorView<'_, T>,
+    indices: &TensorView<'_, I>,
+    updates: &TensorView<'_, T>,
+    axis: i64,
+    out: &'a mut Vec<T>,
+) -> TensorView<'a, T> {
+    let rank = data.shape.len();
+    assert_eq!(indices.shape.len(), rank, "ScatterElements: ranks differ");
+    assert_eq!(
+        indices.shape, updates.shape,
+        "ScatterElements: shapes differ"
+    );
+    let axis = if axis < 0 { axis + rank as i64 } else { axis } as usize;
+    let len = data.data.len();
+    // SAFETY: the copy below writes every element.
+    unsafe { utils::ensure_capacity(out, len) };
+    out[..len].copy_from_slice(&data.data);
+    let strides = |shape: &[usize]| {
+        let mut s = vec![1usize; rank];
+        for d in (0..rank.saturating_sub(1)).rev() {
+            s[d] = s[d + 1] * shape[d + 1];
+        }
+        s
+    };
+    let (data_strides, index_strides) = (strides(&data.shape), strides(&indices.shape));
+    for n in 0..indices.data.len() {
+        let mut at = 0;
+        for d in 0..rank {
+            let coord = (n / index_strides[d]) % indices.shape[d];
+            let coord = if d == axis {
+                let mut c = indices.data[n].as_i64();
+                if c < 0 {
+                    c += data.shape[d] as i64;
+                }
+                assert!(
+                    (0..data.shape[d] as i64).contains(&c),
+                    "ScatterElements: index out of range"
+                );
+                c as usize
+            } else {
+                coord
+            };
+            at += coord * data_strides[d];
+        }
+        out[at] = updates.data[n];
+    }
+    TensorView::from_slice(&out[..len], data.shape.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tensor::TensorView;
+
+    /// The examples of the ONNX ScatterElements spec, and a negative index.
+    #[test]
+    fn test_scatter_elements_matches_the_spec() {
+        let mut out = Vec::new();
+        // Along the first axis: each column's rows are picked by the indices.
+        let data = TensorView::from_slice(&[0.0f32; 9], vec![3, 3]);
+        let indices = TensorView::from_slice(&[1i64, 0, 2, 0, 2, 1], vec![2, 3]);
+        let updates = TensorView::from_slice(&[1., 1.1, 1.2, 2., 2.1, 2.2], vec![2, 3]);
+        assert_eq!(
+            scatter_elements(&data, &indices, &updates, 0, &mut out)
+                .data
+                .to_vec(),
+            [2., 1.1, 0., 1., 0., 2.2, 0., 2.1, 1.2]
+        );
+        // Along the second, one index from the end.
+        let data = TensorView::from_slice(&[1., 2., 3., 4., 5.], vec![1, 5]);
+        let indices = TensorView::from_slice(&[1i64, -1], vec![1, 2]);
+        let updates = TensorView::from_slice(&[1.1, 2.1], vec![1, 2]);
+        assert_eq!(
+            scatter_elements(&data, &indices, &updates, 1, &mut out)
+                .data
+                .to_vec(),
+            [1., 1.1, 3., 4., 2.1]
+        );
+    }
+
+    #[test]
+    fn test_is_nan_and_elu() {
+        let x = TensorView::from_slice(&[0.0, f32::NAN, -1.0, f32::INFINITY], vec![2, 2]);
+        let mut flags = Vec::new();
+        assert_eq!(
+            crate::kernels::is_nan(&x, &mut flags).data.to_vec(),
+            [0, 1, 0, 0]
+        );
+        // Every length takes the vector path or the padded one.
+        for n in [3usize, 16, 17, 100] {
+            let v: Vec<f32> = (0..n).map(|i| i as f32 * 0.37 - 5.0).collect();
+            let mut out = Vec::new();
+            let got = crate::kernels::elu(&TensorView::from_slice(&v, vec![n]), 0.7, &mut out);
+            for (g, &x) in got.data.iter().zip(&v) {
+                let want = if x >= 0.0 { x } else { 0.7 * x.exp_m1() };
+                assert!(
+                    (g - want).abs() <= 1e-6 * want.abs().max(1.0),
+                    "{x}: {g} vs {want}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_trilu_keeps_a_triangle_of_each_matrix() {

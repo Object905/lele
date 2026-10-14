@@ -153,6 +153,17 @@ fn leaky_relu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32], alpha: f32) {
     vm::map!(simd, src, out, vm::leaky_relu, alpha)
 }
 
+fn elu_into(level: Level, src: &[f32], out: &mut [f32], alpha: f32) {
+    simd_call!(level, max = Avx2, elu_simd(src, out, alpha))
+}
+
+#[simd]
+fn elu_simd<S: Simd>(simd: S, src: &[f32], out: &mut [f32], alpha: f32) {
+    use fearless_simd::prelude::*;
+    let alpha = fearless_simd::f32x16::splat(simd, alpha);
+    vm::map!(simd, src, out, vm::elu, alpha)
+}
+
 fn sqrt_into(level: Level, src: &[f32], out: &mut [f32]) {
     simd_call!(level, max = Avx2, sqrt_simd(src, out))
 }
@@ -914,6 +925,25 @@ pub fn mod_f32<'b, 'a, T: ElementOps>(
         shape: std::borrow::Cow::Owned(a.shape.to_vec()),
     }
 }
+/// Mod of integers, which takes the sign of the divisor (the result of `fmod = 0`);
+/// a zero divisor gives 0.
+pub fn mod_i64<'b, 'a>(
+    a: &TensorView<'b, i64>,
+    b: &TensorView<'b, i64>,
+    out: &'a mut Vec<i64>,
+) -> TensorView<'a, i64> {
+    broadcast_binary_op_to(a, b, out, |x, y| {
+        if y == 0 {
+            return 0;
+        }
+        let r = x.wrapping_rem(y);
+        if r != 0 && (r < 0) != (y < 0) {
+            r + y
+        } else {
+            r
+        }
+    })
+}
 pub fn equal<'b, 'a>(
     a: &TensorView<'b>,
     b: &TensorView<'b>,
@@ -1039,6 +1069,26 @@ pub fn leaky_relu<'a, 'b>(
     unary(input, out, |level, src, out| {
         leaky_relu_into(level, src, out, alpha)
     })
+}
+
+pub fn elu<'a, 'b>(input: &TensorView<'b>, alpha: f32, out: &'a mut Vec<f32>) -> TensorView<'a> {
+    unary(input, out, |level, src, out| {
+        elu_into(level, src, out, alpha)
+    })
+}
+
+/// IsNaN: 1 where the element is NaN, else 0.
+pub fn is_nan<'a>(input: &TensorView<'_>, out: &'a mut Vec<i64>) -> TensorView<'a, i64> {
+    let len = input.data.len();
+    // SAFETY: every element is written below before any is read.
+    unsafe { utils::ensure_capacity(out, len) };
+    for (o, x) in out.iter_mut().zip(input.data.iter()) {
+        *o = x.is_nan() as i64;
+    }
+    TensorView {
+        data: Cow::Borrowed(out),
+        shape: Cow::Owned(input.shape.to_vec()),
+    }
 }
 
 pub fn sqrt<'b, 'a>(input: &TensorView<'b>, out: &'a mut Vec<f32>) -> TensorView<'a> {
@@ -2604,6 +2654,19 @@ mod tests {
     use super::*;
     use crate::kernels::test_util::assert_close;
     use crate::tensor::TensorView;
+
+    #[test]
+    fn test_mod_i64_takes_the_sign_of_the_divisor() {
+        let a = TensorView::from_slice(&[7i64, -7, 7, -7, 0, 5], vec![2, 3]);
+        let b = TensorView::from_slice(&[3i64, 3, -3], vec![3]);
+        let mut out = Vec::new();
+        let r = mod_i64(&a, &b, &mut out);
+        assert_eq!(r.shape.to_vec(), [2, 3]);
+        // 7 mod 3 = 1, -7 mod 3 = 2, 7 mod -3 = -2; -7 mod 3 = 2, 0 mod 3 = 0, 5 mod -3 = -1.
+        assert_eq!(r.data.to_vec(), [1, 2, -2, 2, 0, -1]);
+        let zero = TensorView::from_slice(&[0i64], vec![1]);
+        assert_eq!(mod_i64(&a, &zero, &mut out).data.to_vec(), [0; 6]);
+    }
 
     /// Comparisons broadcast shapes of different ranks from the right: a causal mask is
     /// a column against a row.

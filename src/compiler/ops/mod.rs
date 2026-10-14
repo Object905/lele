@@ -17,6 +17,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::Clip
         | Op::CumSum { .. }
         | Op::Einsum { .. }
+        | Op::IsNaN
         | Op::MatMul
         | Op::MatMulInteger
         | Op::Max
@@ -58,6 +59,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::QuantizeLinear(_)
         | Op::Reshape
         | Op::ReshapeTo { .. }
+        | Op::ScatterElements { .. }
         | Op::ScatterND
         | Op::Shape { .. }
         | Op::Size
@@ -71,6 +73,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::Unsqueeze { .. }
         | Op::Where => tensor::generate(ctx, w)?,
         Op::ArgMax { .. }
+        | Op::Elu { .. }
         | Op::HardSigmoid { .. }
         | Op::LeakyRelu { .. }
         | Op::LogSoftmax { .. }
