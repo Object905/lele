@@ -573,22 +573,15 @@ where
         }
         for d in (0..dims).rev() {
             coords[d] += 1;
+            // The strides of broadcast axes, and of axes an input lacks, are 0.
             if coords[d] < out_shape[d] {
-                if a.shape.len() > d && a.shape[d] != 1 {
-                    off_a += a_strides[d];
-                }
-                if b.shape.len() > d && b.shape[d] != 1 {
-                    off_b += b_strides[d];
-                }
+                off_a += a_strides[d];
+                off_b += b_strides[d];
                 break;
             } else {
                 coords[d] = 0;
-                if a.shape.len() > d && a.shape[d] != 1 {
-                    off_a -= a_strides[d] * (out_shape[d] - 1);
-                }
-                if b.shape.len() > d && b.shape[d] != 1 {
-                    off_b -= b_strides[d] * (out_shape[d] - 1);
-                }
+                off_a -= a_strides[d] * (out_shape[d] - 1);
+                off_b -= b_strides[d] * (out_shape[d] - 1);
             }
         }
     }
@@ -2611,6 +2604,26 @@ mod tests {
     use super::*;
     use crate::kernels::test_util::assert_close;
     use crate::tensor::TensorView;
+
+    /// Comparisons broadcast shapes of different ranks from the right: a causal mask is
+    /// a column against a row.
+    #[test]
+    fn test_comparison_broadcasts_inputs_of_different_ranks() {
+        let col = TensorView::from_slice(&[0i64, 1, 2, 3], vec![4, 1]);
+        let row = TensorView::from_slice(&[0i64, 1, 2, 3], vec![4]);
+        let mut out = Vec::new();
+        let upper = less_i64(&col, &row, &mut out);
+        assert_eq!(upper.shape.to_vec(), [4, 4]);
+        let want: Vec<i64> = (0..16).map(|k| (k / 4 < k % 4) as i64).collect();
+        assert_eq!(upper.data.to_vec(), want);
+        // A row against a stack of columns: the row lies along the last axis, each
+        // column along the one before it.
+        let stack = TensorView::from_slice(&[0i64, 5, 1, 6, 2, 7], vec![2, 3, 1]);
+        let row = TensorView::from_slice(&[1i64, 4], vec![2]);
+        let got = less_i64(&stack, &row, &mut out);
+        assert_eq!(got.shape.to_vec(), [2, 3, 2]);
+        assert_eq!(got.data.to_vec(), [1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0]);
+    }
 
     /// Every set of axes of a `[2, 3, 4, 5]` tensor (consecutive ones take the fast
     /// path), with and without kept dimensions, against a reference.
