@@ -422,11 +422,12 @@ impl Compiler {
             "        let res = self.forward_with_workspace(&mut ws, {});",
             arg_names_str
         )?;
+        // Outputs owning their data, such as states updated in place, move out.
         let ret_vals_owned: Vec<String> = if graph_outputs.len() == 1 {
-            vec!["res.to_owned()".to_string()]
+            vec!["res.into_owned()".to_string()]
         } else {
             (0..graph_outputs.len())
-                .map(|i| format!("res.{}.to_owned()", i))
+                .map(|i| format!("res.{}.into_owned()", i))
                 .collect()
         };
         let ret_str_owned = if ret_vals_owned.len() == 1 {
