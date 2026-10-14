@@ -1,4 +1,7 @@
+pub mod capture;
+pub mod endpoint;
 pub mod mel;
+pub mod resample;
 pub mod tokenizer;
 pub mod wav;
 pub mod whisper;

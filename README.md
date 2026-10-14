@@ -209,6 +209,7 @@ cd examples/ppocr && cargo run --release -- image.png      # PP-OCRv6 OCR
 cargo run --release -p tone-example --bin tone -- in.wav    # T-one ASR (8 kHz WAV)
 cargo run --release -p tone-example --bin tone-live         # T-one, live from the microphone
 cargo run --release -p whisper-example --bin whisper -- in.wav [--lang en]  # Whisper ASR (16 kHz WAV)
+cargo run --release -p whisper-example --bin whisper-live [-- --lang en]    # Whisper, live from the microphone
 ```
 
 ## Supported Models
