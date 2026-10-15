@@ -15,11 +15,11 @@
 //! kernels agree with ONNX, and is [`Dim::Unknown`] otherwise.
 
 use crate::compiler::ir::{
-    Binary, ConvAttrs, DType, Dim, Graph, Node, Op, PoolAttrs, Reduction, TargetDim, ValueId,
+    Binary, ConvAttrs, DType, Dim, Graph, Node, Op, PoolAttrs, Reduction, TargetDim, Unary, ValueId,
 };
 use crate::model::onnx_proto::{NodeProto, TensorProto};
 use crate::model::tensor_to_array;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 type Shape = Vec<Dim>;
 
@@ -34,7 +34,150 @@ enum Elem {
     Dim(ValueId, usize),
     /// A symbolic dimension of a value of an enclosing graph.
     Sym(String),
+    /// A polynomial in dimensions, `batch * 8` or `past + 1`, that is none
+    /// of the above.
+    Expr(Poly),
     Unknown,
+}
+
+/// What identifies a dimension in a [`Poly`]: its symbol, which values of
+/// different shapes may share, or else the value and axis it is of.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum AtomKey {
+    Sym(String),
+    Dim(ValueId, usize),
+}
+
+/// A dimension a [`Poly`] is a polynomial in: an [`Elem::Dim`] or
+/// [`Elem::Sym`], compared by what dimension it is.
+#[derive(Clone, Debug)]
+struct Atom {
+    key: AtomKey,
+    elem: Elem,
+}
+
+impl PartialEq for Atom {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Atom {}
+
+impl PartialOrd for Atom {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Atom {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+/// Polynomials with more terms, or terms of higher degree, are not tracked.
+const MAX_TERMS: usize = 8;
+const MAX_DEGREE: usize = 4;
+
+/// An integer as a polynomial in dimensions: the coefficient of each
+/// product of atoms (sorted; the empty product is the constant term), none
+/// of them zero. Dimensions are not negative, which tells the sign of some.
+#[derive(Clone, Debug, PartialEq)]
+struct Poly(BTreeMap<Vec<Atom>, i64>);
+
+impl Poly {
+    fn constant(n: i64) -> Self {
+        Poly(BTreeMap::from_iter((n != 0).then_some((Vec::new(), n))))
+    }
+
+    fn atom(atom: Atom) -> Self {
+        Poly(BTreeMap::from([(vec![atom], 1)]))
+    }
+
+    fn as_constant(&self) -> Option<i64> {
+        match self.0.iter().next() {
+            None => Some(0),
+            Some((product, &n)) if self.0.len() == 1 && product.is_empty() => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Adds `c` times `product`, `None` on overflow.
+    fn add_term(&mut self, product: Vec<Atom>, c: i64) -> Option<()> {
+        let sum = self.0.get(&product).copied().unwrap_or(0).checked_add(c)?;
+        if sum == 0 {
+            self.0.remove(&product);
+        } else {
+            self.0.insert(product, sum);
+        }
+        Some(())
+    }
+
+    /// `self + sign * other`.
+    fn plus(&self, other: &Poly, sign: i64) -> Option<Poly> {
+        let mut out = self.clone();
+        for (product, &c) in &other.0 {
+            out.add_term(product.clone(), c.checked_mul(sign)?)?;
+        }
+        out.tracked()
+    }
+
+    fn times(&self, other: &Poly) -> Option<Poly> {
+        let mut out = Poly(BTreeMap::new());
+        for (a, &x) in &self.0 {
+            for (b, &y) in &other.0 {
+                let mut product: Vec<Atom> = a.iter().chain(b).cloned().collect();
+                product.sort();
+                out.add_term(product, x.checked_mul(y)?)?;
+            }
+        }
+        out.tracked()
+    }
+
+    /// `self / other` where `other` is one term dividing every term of
+    /// `self`: `8 * batch * seq / (2 * seq)` is `4 * batch`.
+    fn divided(&self, other: &Poly) -> Option<Poly> {
+        let [(divisor, &d)] = other.0.iter().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let mut out = Poly(BTreeMap::new());
+        for (product, &c) in &self.0 {
+            let mut rest = product.clone();
+            for atom in divisor {
+                let i = rest.iter().position(|a| a == atom)?;
+                rest.remove(i);
+            }
+            if c % d != 0 {
+                return None;
+            }
+            out.add_term(rest, c / d)?;
+        }
+        Some(out)
+    }
+
+    fn tracked(self) -> Option<Poly> {
+        let degree = self.0.keys().map(Vec::len).max().unwrap_or(0);
+        (self.0.len() <= MAX_TERMS && degree <= MAX_DEGREE).then_some(self)
+    }
+
+    /// The sign of the value, where the coefficients tell it whatever the
+    /// dimensions: `seq + 1` is positive.
+    fn sign(&self) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        let constant = self.0.get(&Vec::new()).copied().unwrap_or(0);
+        let terms = self
+            .0
+            .iter()
+            .filter(|(p, _)| !p.is_empty())
+            .map(|(_, &c)| c);
+        match constant.cmp(&0) {
+            _ if self.0.len() == usize::from(constant != 0) => Some(constant.cmp(&0)),
+            Ordering::Greater if terms.clone().all(|c| c > 0) => Some(Ordering::Greater),
+            Ordering::Less if terms.clone().all(|c| c < 0) => Some(Ordering::Less),
+            _ => None,
+        }
+    }
 }
 
 impl Elem {
@@ -42,6 +185,36 @@ impl Elem {
         match self {
             Elem::Fixed(n) => Some(*n),
             _ => None,
+        }
+    }
+
+    /// This element as a polynomial, if it is known.
+    fn poly(&self, g: &Graph) -> Option<Poly> {
+        let key = match self {
+            Elem::Fixed(n) => return Some(Poly::constant(*n)),
+            Elem::Expr(p) => return Some(p.clone()),
+            Elem::Unknown => return None,
+            Elem::Sym(s) => AtomKey::Sym(s.clone()),
+            Elem::Dim(v, axis) => match self.to_dim(g) {
+                Dim::Fixed(n) => return Some(Poly::constant(n)),
+                Dim::Sym(s) => AtomKey::Sym(s),
+                Dim::Unknown => AtomKey::Dim(*v, *axis),
+            },
+        };
+        Some(Poly::atom(Atom {
+            key,
+            elem: self.clone(),
+        }))
+    }
+
+    /// `p` as the simplest element: a number or a dimension where it is one.
+    fn from_poly(p: Poly) -> Self {
+        if let Some(n) = p.as_constant() {
+            return Elem::Fixed(n);
+        }
+        match p.0.iter().next() {
+            Some((product, 1)) if p.0.len() == 1 && product.len() == 1 => product[0].elem.clone(),
+            _ => Elem::Expr(p),
         }
     }
 
@@ -64,7 +237,7 @@ impl Elem {
                 .and_then(|s| s.get(*axis).cloned())
                 .unwrap_or(Dim::Unknown),
             Elem::Sym(s) => Dim::Sym(s.clone()),
-            Elem::Unknown => Dim::Unknown,
+            Elem::Expr(_) | Elem::Unknown => Dim::Unknown,
         }
     }
 }
@@ -173,13 +346,15 @@ fn set_shape(g: &mut Graph, v: ValueId, inferred: Shape) {
     });
 }
 
-/// The more specific of two descriptions of one dimension.
-fn unify(a: &Dim, b: &Dim) -> Dim {
-    match (a, b) {
-        (Dim::Fixed(_), _) => a.clone(),
-        (_, Dim::Fixed(_)) => b.clone(),
-        (Dim::Sym(_), _) => a.clone(),
-        _ => b.clone(),
+/// The more specific of two descriptions of one dimension, `stated` by the
+/// model and `inferred`. Of two symbols, the inferred one, which comes from
+/// the inputs' dimensions: exporters name each tensor's own (`unk__72`), so
+/// that the same dimension has another name in each.
+fn unify(stated: &Dim, inferred: &Dim) -> Dim {
+    match (stated, inferred) {
+        (Dim::Fixed(_), _) => stated.clone(),
+        (_, Dim::Fixed(_) | Dim::Sym(_)) => inferred.clone(),
+        _ => stated.clone(),
     }
 }
 
@@ -544,7 +719,14 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
                 None => Some(x.into_iter().rev().collect()),
             }
         })),
-        Op::Reshape => first(reshape_target(shape(0).as_deref(), dims(1))),
+        Op::Reshape => first(reshape_target(shape(0).as_deref(), dims(1)).map(|mut out| {
+            if let Some((i, d)) = inferred_dim(g, node, elems)
+                && out.get(i) == Some(&Dim::Unknown)
+            {
+                out[i] = d;
+            }
+            out
+        })),
         Op::ReshapeTo { dims } => first(Some(target(dims))),
         Op::Flatten { axis } => first(shape(0).and_then(|x| {
             let a = if *axis < 0 {
@@ -737,7 +919,21 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
                     let up = span % delta != 0 && (span < 0) == (delta < 0);
                     Dim::Fixed((span / delta + i64::from(up)).max(0))
                 }
-                (Some(Elem::Fixed(0)), Some(limit), Some(Elem::Fixed(1))) => limit.to_dim(g),
+                // `limit - start` where it is not negative, as for
+                // `Range(past, past + seq, 1)`.
+                (Some(start), Some(limit), Some(Elem::Fixed(1))) => {
+                    let len = limit
+                        .poly(g)
+                        .zip(start.poly(g))
+                        .and_then(|(l, s)| l.plus(&s, -1));
+                    match len {
+                        Some(len) if len.sign() == Some(std::cmp::Ordering::Less) => Dim::Fixed(0),
+                        Some(len) if len.0.values().all(|&c| c > 0) => {
+                            Elem::from_poly(len).to_dim(g)
+                        }
+                        _ => Dim::Unknown,
+                    }
+                }
                 _ => Dim::Unknown,
             };
             first(Some(vec![len]))
@@ -898,6 +1094,32 @@ fn reshape_target(x: Option<&[Dim]>, target: Option<Shape>) -> Option<Shape> {
     Some(out)
 }
 
+/// The position of the -1 in the target of reshape `node` and the dimension
+/// it stands for, from the polynomials of the target's other elements and
+/// of the input's dimensions: `[batch, 8, 1500, 64]` to `[batch * 8, -1,
+/// 64]` makes it 1500.
+fn inferred_dim(g: &Graph, node: &Node, elems: &Elems) -> Option<(usize, Dim)> {
+    let x = node.input(0)?;
+    let rank = g.value(x).shape.as_ref()?.len();
+    let target = elems.get(&node.input(1)?)?;
+    let i = target.iter().position(|e| *e == Elem::Fixed(-1))?;
+    let dim = |axis: usize| Elem::Dim(x, axis).poly(g);
+    let mut total = Poly::constant(1);
+    for axis in 0..rank {
+        total = total.times(&dim(axis)?)?;
+    }
+    let mut part = Poly::constant(1);
+    for (j, e) in target.iter().enumerate().filter(|&(j, _)| j != i) {
+        // 0 copies the input's dimension.
+        let p = match e {
+            Elem::Fixed(0) => dim(j)?,
+            e => e.poly(g)?,
+        };
+        part = part.times(&p)?;
+    }
+    Some((i, Elem::from_poly(total.divided(&part)?).to_dim(g)))
+}
+
 /// The product of `dims` as a number times symbolic dimensions, sorted, if
 /// none is unknown.
 fn monomial(dims: &[Dim]) -> Option<(i64, Vec<&str>)> {
@@ -1002,39 +1224,86 @@ fn output_elems(g: &Graph, node: &Node, elems: &Elems) -> Option<Vec<Elem>> {
             }
             Some(out)
         }
-        Op::Binary(op @ (Binary::Add | Binary::Sub | Binary::Mul | Binary::Div)) => {
+        Op::Binary(op) => {
             let (a, b) = (input(0)?, input(1)?);
             let len = a.len().max(b.len());
             if (a.len() != len && a.len() != 1) || (b.len() != len && b.len() != 1) {
                 return None;
             }
             let at = |v: &Vec<Elem>, i: usize| v[if v.len() == 1 { 0 } else { i }].clone();
-            Some((0..len).map(|i| arith(*op, &at(a, i), &at(b, i))).collect())
+            (0..len)
+                .map(|i| arith(g, *op, &at(a, i), &at(b, i)))
+                .collect()
+        }
+        Op::Unary(Unary::Not) => Some(
+            input(0)?
+                .iter()
+                .map(|e| {
+                    e.fixed()
+                        .map_or(Elem::Unknown, |b| Elem::Fixed(i64::from(b == 0)))
+                })
+                .collect(),
+        ),
+        // Exporters replace the -1s of an `Expand` target by 1 with
+        // `Where(Equal(shape, -1), 1, shape)`.
+        Op::Where => {
+            let (c, a, b) = (input(0)?, input(1)?, input(2)?);
+            let len = c.len().max(a.len()).max(b.len());
+            if [c, a, b].iter().any(|v| v.len() != len && v.len() != 1) {
+                return None;
+            }
+            let at = |v: &Vec<Elem>, i: usize| v[if v.len() == 1 { 0 } else { i }].clone();
+            let pick = |i: usize| match at(c, i).fixed() {
+                Some(0) => at(b, i),
+                Some(_) => at(a, i),
+                None => Elem::Unknown,
+            };
+            Some((0..len).map(pick).collect())
         }
         _ => None,
     }
 }
 
-/// `a op b` for integers, as far as it is known.
-fn arith(op: Binary, a: &Elem, b: &Elem) -> Elem {
-    use Elem::Fixed;
-    match (op, a, b) {
-        (Binary::Add | Binary::Sub, d, Fixed(0))
-        | (Binary::Add, Fixed(0), d)
-        | (Binary::Mul | Binary::Div, d, Fixed(1))
-        | (Binary::Mul, Fixed(1), d) => d.clone(),
-        (_, Fixed(x), Fixed(y)) => {
-            let r = match op {
-                Binary::Add => x.checked_add(*y),
-                Binary::Sub => x.checked_sub(*y),
-                Binary::Mul => x.checked_mul(*y),
-                // Integer division truncates.
-                _ => x.checked_div(*y),
-            };
-            r.map_or(Elem::Unknown, Fixed)
-        }
-        _ => Elem::Unknown,
+/// `a op b` for integers, as far as it is known; `None` for an operator
+/// not modelled. Comparisons give 1 or 0.
+fn arith(g: &Graph, op: Binary, a: &Elem, b: &Elem) -> Option<Elem> {
+    use std::cmp::Ordering;
+    let compare = matches!(
+        op,
+        Binary::Equal
+            | Binary::Greater
+            | Binary::GreaterOrEqual
+            | Binary::Less
+            | Binary::LessOrEqual
+    );
+    if !compare && !matches!(op, Binary::Add | Binary::Sub | Binary::Mul | Binary::Div) {
+        return None;
     }
+    let (Some(x), Some(y)) = (a.poly(g), b.poly(g)) else {
+        return Some(Elem::Unknown);
+    };
+    let result = match op {
+        Binary::Add => x.plus(&y, 1),
+        Binary::Sub => x.plus(&y, -1),
+        Binary::Mul => x.times(&y),
+        // Integer division truncates.
+        Binary::Div => match (x.as_constant(), y.as_constant()) {
+            (Some(x), Some(y)) => x.checked_div(y).map(Poly::constant),
+            _ => x.divided(&y),
+        },
+        _ => {
+            let sign = x.plus(&y, -1).and_then(|d| d.sign());
+            let holds = |sign: Ordering| match op {
+                Binary::Equal => sign == Ordering::Equal,
+                Binary::Greater => sign == Ordering::Greater,
+                Binary::GreaterOrEqual => sign != Ordering::Less,
+                Binary::Less => sign == Ordering::Less,
+                _ => sign != Ordering::Greater,
+            };
+            sign.map(|s| Poly::constant(i64::from(holds(s))))
+        }
+    };
+    Some(result.map_or(Elem::Unknown, Elem::from_poly))
 }
 
 /// Replaces the integer tensors of `g` whose shape and elements are known
@@ -1073,6 +1342,13 @@ fn fold_ints(g: &mut Graph, elems: &Elems) {
                 dims,
                 data_type: DType::I32.to_onnx(),
                 int32_data: values.iter().map(|&x| x as i32).collect(),
+                ..Default::default()
+            },
+            // Comparisons of shapes.
+            DType::Bool => TensorProto {
+                dims,
+                data_type: DType::Bool.to_onnx(),
+                raw_data: values.iter().map(|&x| u8::from(x != 0)).collect(),
                 ..Default::default()
             },
             _ => continue,
@@ -1127,10 +1403,27 @@ fn rewrite_targets(g: &mut Graph, elems: &Elems) {
             .enumerate()
             .map(|(i, e)| target_dim(g, e, i, reshape, &mut inputs))
             .collect();
-        let Some(dims) = dims else {
+        let Some(mut dims) = dims else {
             continue;
         };
-        if dims.iter().filter(|d| **d == TargetDim::Infer).count() > 1 {
+        let infers = |dims: &[TargetDim]| dims.iter().filter(|d| **d == TargetDim::Infer).count();
+        // Where elements are expressions (`batch * 8`) besides the -1, the
+        // inferred output shape may know some of them.
+        let out_shape = node.output(0).and_then(|o| g.value(o).shape.clone());
+        if infers(&dims) > 1
+            && let Some(out_shape) = out_shape.filter(|s| s.len() == dims.len())
+        {
+            for (d, o) in dims.iter_mut().zip(&out_shape) {
+                if *d == TargetDim::Infer {
+                    *d = match o {
+                        Dim::Fixed(n) => TargetDim::Fixed(*n),
+                        Dim::Sym(_) => input_with_dim(g, &inputs, o).unwrap_or(TargetDim::Infer),
+                        Dim::Unknown => TargetDim::Infer,
+                    };
+                }
+            }
+        }
+        if infers(&dims) > 1 {
             continue;
         }
         let op = match &node.op {
@@ -1145,6 +1438,15 @@ fn rewrite_targets(g: &mut Graph, elems: &Elems) {
         let proto = node.proto.clone();
         g.fuse(&[id], op, proto, inputs.into_iter().map(Some).collect());
     }
+}
+
+/// A dimension of one of `inputs` that is `d`, by value for a symbolic one.
+fn input_with_dim(g: &Graph, inputs: &[ValueId], d: &Dim) -> Option<TargetDim> {
+    inputs.iter().enumerate().find_map(|(input, &v)| {
+        let shape = g.value(v).shape.as_ref()?;
+        let axis = shape.iter().position(|s| s == d)?;
+        Some(TargetDim::Of { input, axis })
+    })
 }
 
 /// Element `i` of a target as a [`TargetDim`], taking dimensions from
@@ -1163,14 +1465,7 @@ fn target_dim(
         let shape = g.value(v).shape.as_ref()?;
         shape.get(axis).cloned()
     };
-    // An input with dimension `d`, by value for a symbolic one.
-    let find = |inputs: &[ValueId], d: &Dim| {
-        inputs.iter().enumerate().find_map(|(input, &v)| {
-            let shape = g.value(v).shape.as_ref()?;
-            let axis = shape.iter().position(|s| s == d)?;
-            Some(TargetDim::Of { input, axis })
-        })
-    };
+    let find = |inputs: &[ValueId], d: &Dim| input_with_dim(g, inputs, d);
     let unknown = reshape.then_some(TargetDim::Infer);
     match e {
         Elem::Fixed(0) if reshape => {
@@ -1200,7 +1495,7 @@ fn target_dim(
             })
         }
         Elem::Sym(s) => find(inputs, &Dim::Sym(s.clone())).or(unknown),
-        Elem::Unknown => unknown,
+        Elem::Expr(_) | Elem::Unknown => unknown,
     }
 }
 
@@ -1666,5 +1961,120 @@ mod tests {
         assert_eq!(shape("r"), [batch.clone(), Unknown]);
         assert_eq!(shape("o"), [batch.clone(), seq, Unknown, Fixed(3)]);
         assert_eq!(shape("f"), [batch, Unknown]);
+    }
+
+    fn scalar(name: &str, v: i64) -> TensorProto {
+        TensorProto {
+            dims: vec![],
+            ..ints(name, &[v])
+        }
+    }
+
+    fn unsqueeze(input: &str, output: &str) -> NodeProto {
+        NodeProto {
+            attribute: vec![AttributeProto {
+                name: "axes".to_string(),
+                ints: vec![0],
+                ..Default::default()
+            }],
+            ..node("Unsqueeze", &[input], &[output])
+        }
+    }
+
+    /// Whisper's attention heads: `[batch, 8, 1500, 64]` to `[batch * 8,
+    /// -1, 64]`. The product of a dimension is an expression, which leaves
+    /// the -1 to be 1500. The model names the batch dimension of the tensor
+    /// reshaped `unk__5`, which inference knows is `batch`.
+    #[test]
+    fn products_of_dimensions_resolve_reshape_targets() {
+        let mut target = node("Concat", &["u", "rest"], &["target"]);
+        target.attribute.push(AttributeProto {
+            name: "axis".to_string(),
+            i: 0,
+            ..Default::default()
+        });
+        let mut g = run(GraphProto {
+            node: vec![
+                node("Relu", &["x"], &["r"]),
+                node("Shape", &["x"], &["s"]),
+                node("Gather", &["s", "i0"], &["b"]),
+                node("Mul", &["b", "eight"], &["b8"]),
+                unsqueeze("b8", "u"),
+                target,
+                node("Reshape", &["r", "target"], &["y"]),
+            ],
+            input: vec![input("x", &["batch", "8", "1500", "64"])],
+            value_info: vec![input("r", &["unk__5", "8", "1500", "64"])],
+            output: vec![output("y")],
+            initializer: vec![scalar("i0", 0), scalar("eight", 8), ints("rest", &[-1, 64])],
+            ..Default::default()
+        });
+        super::super::eliminate_dead_code(&mut g);
+        let ops: Vec<_> = g.nodes().map(|(_, n)| n.op.clone()).collect();
+        let [_, Op::ReshapeTo { dims }] = &ops[..] else {
+            panic!("{ops:?}");
+        };
+        use TargetDim::*;
+        assert_eq!(dims, &[Infer, Fixed(1500), Fixed(64)]);
+        let shape = |name: &str| g.value(g.find_value(name).unwrap()).shape.clone().unwrap();
+        assert_eq!(shape("r")[0], Dim::Sym("batch".into()));
+        assert_eq!(shape("y"), [Dim::Unknown, Dim::Fixed(1500), Dim::Fixed(64)]);
+    }
+
+    /// `Where(Equal(shape, -1), 1, shape)`, by which exporters replace the
+    /// -1s of an `Expand` target, is the shape: no dimension is -1.
+    #[test]
+    fn comparisons_of_dimensions_fold() {
+        let mut g = run(GraphProto {
+            node: vec![
+                node("Shape", &["x"], &["s"]),
+                node("Equal", &["s", "minus_ones"], &["e"]),
+                node("Where", &["e", "ones", "s"], &["t"]),
+                node("Expand", &["c", "t"], &["y"]),
+            ],
+            input: vec![input("x", &["batch", "seq"])],
+            output: vec![output("y")],
+            initializer: vec![
+                ints("minus_ones", &[-1, -1]),
+                ints("ones", &[1, 1]),
+                TensorProto {
+                    name: "c".to_string(),
+                    data_type: DType::F32.to_onnx(),
+                    dims: vec![1, 1],
+                    float_data: vec![0.5],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        super::super::eliminate_dead_code(&mut g);
+        let ops: Vec<_> = g.nodes().map(|(_, n)| n.op.clone()).collect();
+        let [Op::ExpandTo { dims }] = &ops[..] else {
+            panic!("{ops:?}");
+        };
+        let x = |axis| TargetDim::Of { input: 1, axis };
+        assert_eq!(dims, &[x(0), x(1)]);
+    }
+
+    /// The positions of a decoding step, `Range(past, past + seq)`, are
+    /// `seq` long.
+    #[test]
+    fn sums_of_dimensions_give_range_lengths() {
+        let g = run(GraphProto {
+            node: vec![
+                node("Shape", &["cache"], &["sc"]),
+                node("Gather", &["sc", "i1"], &["past"]),
+                node("Shape", &["x"], &["sx"]),
+                node("Gather", &["sx", "i1"], &["seq"]),
+                node("Add", &["past", "seq"], &["end"]),
+                node("Range", &["past", "end", "one"], &["r"]),
+            ],
+            input: vec![input("cache", &["1", "past"]), input("x", &["1", "seq"])],
+            output: vec![output("r")],
+            initializer: vec![scalar("i1", 1), scalar("one", 1)],
+            ..Default::default()
+        });
+        let r = g.value(g.find_value("r").unwrap()).shape.clone();
+        assert_eq!(r, Some(vec![Dim::Sym("seq".into())]));
     }
 }
