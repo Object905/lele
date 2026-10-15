@@ -7,6 +7,7 @@ use crate::kernels::gemm::WeightElem;
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul};
 use crate::kernels::utils;
 use crate::tensor::TensorView;
+use aligned_vec::AVec;
 use fearless_simd::Level;
 
 /// Adds `bias[oc]` to every `[oc, ..]` row of `out` (laid out `[batch, out_channels, len]`)
@@ -356,7 +357,7 @@ fn conv1d_fused_at<'b, 'a>(
     }
 
     thread_local! {
-        static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+        static SCRATCH: std::cell::RefCell<AVec<f32>> = std::cell::RefCell::new(AVec::new(0));
     }
 
     SCRATCH.with(|scratch_cell| {
@@ -494,8 +495,8 @@ fn depthwise_multiplied(
 ) {
     thread_local! {
         /// The taps and bias of one multiple, and its output.
-        static MULTIPLES: std::cell::RefCell<[Vec<f32>; 3]> =
-            const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new()]) };
+        static MULTIPLES: std::cell::RefCell<[AVec<f32>; 3]> =
+            std::cell::RefCell::new([AVec::new(0), AVec::new(0), AVec::new(0)]);
     }
     MULTIPLES.with_borrow_mut(|[taps, biases, part]| {
         part.clear();

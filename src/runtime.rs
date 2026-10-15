@@ -7,6 +7,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use aligned_vec::AVec;
+
 use crate::kernels::{self, ConvWeights, QWeights};
 use crate::tensor::TensorView;
 
@@ -19,8 +21,9 @@ type ConvWeightCache = HashMap<(usize, usize, usize, bool), (Vec<f32>, Arc<ConvW
 /// weight, so it happens once per tensor and is cached for the life of the model.
 pub struct Weights<'a> {
     data: &'a [u8],
-    /// The f16 weights [`Self::with_f16`] converted, one after another.
-    f16: Vec<f32>,
+    /// The f16 weights [`Self::with_f16`] converted, one after another, each
+    /// starting on a cache line.
+    f16: AVec<f32>,
     /// Byte offset of each converted f16 weight and where it starts in
     /// `f16`, by offset.
     f16_index: Vec<(usize, usize)>,
@@ -33,7 +36,7 @@ impl<'a> Weights<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             data,
-            f16: Vec::new(),
+            f16: AVec::new(0),
             f16_index: Vec::new(),
             quantized_weights_cache: RefCell::default(),
             qweights_cache: RefCell::default(),
@@ -49,7 +52,12 @@ impl<'a> Weights<'a> {
         let mut regions = regions.to_vec();
         regions.sort_unstable();
         regions.dedup();
-        self.f16 = vec![0.0; regions.iter().map(|&(_, len)| len / 2).sum()];
+        const LINE: usize = aligned_vec::CACHELINE_ALIGN / size_of::<f32>();
+        let total = regions
+            .iter()
+            .map(|&(_, len)| (len / 2).next_multiple_of(LINE))
+            .sum();
+        self.f16 = aligned_vec::avec![0.0; total];
         self.f16_index.reserve(regions.len());
         let mut start = 0;
         for (offset, len) in regions {
@@ -61,7 +69,7 @@ impl<'a> Weights<'a> {
                 .collect();
             halves.convert_to_f32_slice(&mut self.f16[start..start + halves.len()]);
             self.f16_index.push((offset, start));
-            start += halves.len();
+            start += halves.len().next_multiple_of(LINE);
         }
         self
     }
