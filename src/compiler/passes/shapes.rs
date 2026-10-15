@@ -17,7 +17,7 @@
 use crate::compiler::ir::{
     Binary, ConvAttrs, DType, Dim, Graph, Node, Op, PoolAttrs, Reduction, TargetDim, ValueId,
 };
-use crate::model::onnx_proto::TensorProto;
+use crate::model::onnx_proto::{NodeProto, TensorProto};
 use crate::model::tensor_to_array;
 use std::collections::HashMap;
 
@@ -344,6 +344,40 @@ fn conv(x: &[Dim], w: &[Dim], attrs: &ConvAttrs) -> Option<Shape> {
     Some(out)
 }
 
+/// The shape `ConvTranspose` of `x` by weights `w` produces, as lele's kernel
+/// computes it: without `output_padding`, `output_shape` or `auto_pad`, which
+/// it does not read.
+fn conv_transpose(x: &[Dim], w: &[Dim], attrs: &ConvAttrs, proto: &NodeProto) -> Option<Shape> {
+    let unread = ["output_padding", "output_shape"].iter().any(|&name| {
+        proto
+            .attribute
+            .iter()
+            .any(|a| a.name == name && a.ints.iter().any(|&i| i != 0))
+    });
+    if x.len() < 3
+        || w.len() != x.len()
+        || unread
+        || attrs.auto_pad.as_deref().is_some_and(|a| a != "NOTSET")
+    {
+        return None;
+    }
+    let spatial = x.len() - 2;
+    let group = attrs.group.unwrap_or(1);
+    let channels = fixed(&w[1]).map_or(Dim::Unknown, |c| Dim::Fixed(c * group));
+    let mut out = vec![x[0].clone(), channels];
+    for i in 0..spatial {
+        let (stride, dilation, (begin, end)) =
+            window_params(&attrs.strides, &attrs.dilations, &attrs.pads, i, spatial);
+        out.push(match (fixed(&x[2 + i]), fixed(&w[2 + i])) {
+            (Some(len), Some(kernel)) => {
+                Dim::Fixed((len - 1) * stride - begin - end + dilation * (kernel - 1) + 1)
+            }
+            _ => Dim::Unknown,
+        });
+    }
+    Some(out)
+}
+
 fn pool(x: &[Dim], attrs: &PoolAttrs) -> Option<Shape> {
     if x.len() < 3 {
         return None;
@@ -487,6 +521,11 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
                 .zip(shape(1))
                 .and_then(|(x, w)| conv(&x, &w, attrs)),
         ),
+        Op::ConvTranspose(attrs) => first(
+            shape(0)
+                .zip(shape(1))
+                .and_then(|(x, w)| conv_transpose(&x, &w, attrs, &node.proto)),
+        ),
         Op::MaxPool(attrs) | Op::AveragePool { pool: attrs, .. } => {
             let out = shape(0).and_then(|x| pool(&x, attrs));
             vec![out; n_out]
@@ -514,8 +553,7 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
                 *axis
             };
             let a = usize::try_from(a).ok().filter(|&a| a <= x.len())?;
-            let part = |dims: &[Dim]| product(dims).map_or(Dim::Unknown, Dim::Fixed);
-            Some(vec![part(&x[..a]), part(&x[a..])])
+            Some(vec![quotient(&x[..a], &[]), quotient(&x[a..], &[])])
         })),
         Op::Unsqueeze { axes } => first(shape(0).and_then(|x| {
             let axes = axes.clone().or_else(|| ints(1))?;
@@ -848,18 +886,55 @@ fn reshape_target(x: Option<&[Dim]>, target: Option<Shape>) -> Option<Shape> {
         })
         .collect();
     let infer = target.iter().position(|d| *d == Dim::Fixed(-1));
-    if let (Some(i), Some(total)) = (infer, x.and_then(product)) {
+    if let (Some(i), Some(x)) = (infer, x) {
         let others: Vec<Dim> = out
             .iter()
             .enumerate()
             .filter(|(j, _)| *j != i)
             .map(|(_, d)| d.clone())
             .collect();
-        if let Some(rest) = product(&others).filter(|&p| p > 0 && total % p == 0) {
-            out[i] = Dim::Fixed(total / rest);
-        }
+        out[i] = quotient(x, &others);
     }
     Some(out)
+}
+
+/// The product of `dims` as a number times symbolic dimensions, sorted, if
+/// none is unknown.
+fn monomial(dims: &[Dim]) -> Option<(i64, Vec<&str>)> {
+    let mut count = 1;
+    let mut symbols = Vec::new();
+    for d in dims {
+        match d {
+            Dim::Fixed(n) => count *= n,
+            Dim::Sym(s) => symbols.push(s.as_str()),
+            Dim::Unknown => return None,
+        }
+    }
+    symbols.sort_unstable();
+    Some((count, symbols))
+}
+
+/// The product of `total` divided by that of `part`, if it is a number or a
+/// symbolic dimension: `[batch, seq, 512] / [batch, seq, 128]` is 4, and
+/// `[n, 1, t] / [n, 1]` is `t`.
+fn quotient(total: &[Dim], part: &[Dim]) -> Dim {
+    let (Some((n, mut symbols)), Some((m, divisors))) = (monomial(total), monomial(part)) else {
+        return Dim::Unknown;
+    };
+    for s in divisors {
+        let Some(i) = symbols.iter().position(|&x| x == s) else {
+            return Dim::Unknown;
+        };
+        symbols.remove(i);
+    }
+    if m <= 0 || n % m != 0 {
+        return Dim::Unknown;
+    }
+    match (n / m, symbols.as_slice()) {
+        (q, []) => Dim::Fixed(q),
+        (1, [s]) => Dim::Sym(s.to_string()),
+        _ => Dim::Unknown,
+    }
 }
 
 /// Elements of output 0 of `node`, for the integer tensors it computes from
@@ -1504,5 +1579,92 @@ mod tests {
         use Dim::*;
         assert_eq!(shape("c"), [Fixed(1), Fixed(8), Fixed(16), Unknown]);
         assert_eq!(shape("p"), [Fixed(1), Fixed(8), Fixed(15), Unknown]);
+    }
+
+    /// As lele's kernel computes it: `(len - 1) * stride - pads +
+    /// dilation * (kernel - 1) + 1`, `group` times the channels of a group.
+    #[test]
+    fn infers_transposed_convolution_sizes() {
+        let attr = |name: &str, ints: &[i64]| AttributeProto {
+            name: name.to_string(),
+            ints: ints.to_vec(),
+            ..Default::default()
+        };
+        let mut conv = node("ConvTranspose", &["x", "w"], &["y"]);
+        conv.attribute = vec![attr("strides", &[4]), attr("pads", &[1, 2])];
+        let mut grouped = node("ConvTranspose", &["x2", "w"], &["z"]);
+        grouped.attribute = vec![
+            AttributeProto {
+                name: "group".to_string(),
+                i: 2,
+                ..Default::default()
+            },
+            attr("dilations", &[2]),
+        ];
+        let mut padded = node("ConvTranspose", &["x", "w"], &["u"]);
+        padded.attribute = vec![attr("strides", &[4]), attr("output_padding", &[1])];
+        let w = TensorProto {
+            name: "w".to_string(),
+            data_type: DType::F32.to_onnx(),
+            dims: vec![6, 3, 8],
+            float_data: vec![0.0; 6 * 3 * 8],
+            ..Default::default()
+        };
+        let g = run(GraphProto {
+            node: vec![conv, grouped, padded],
+            input: vec![input("x", &["1", "6", "10"]), input("x2", &["n", "6", "t"])],
+            output: vec![output("y"), output("z"), output("u")],
+            initializer: vec![w],
+            ..Default::default()
+        });
+        let shape = |name: &str| g.value(g.find_value(name).unwrap()).shape.clone();
+        use Dim::*;
+        assert_eq!(
+            shape("y"),
+            Some(vec![Fixed(1), Fixed(3), Fixed(9 * 4 - 3 + 7 + 1)])
+        );
+        let n = Sym("n".to_string());
+        assert_eq!(shape("z"), Some(vec![n, Fixed(6), Unknown]));
+        // lele's kernel does not pad the output.
+        assert_eq!(shape("u"), None);
+    }
+
+    /// A -1 in a reshape target, and the parts of a flattened shape, are
+    /// what their dimensions leave, symbolic ones included.
+    #[test]
+    fn reshapes_and_flattens_keep_symbolic_dimensions() {
+        let mut flatten = node("Flatten", &["x"], &["f"]);
+        flatten.attribute = vec![AttributeProto {
+            name: "axis".to_string(),
+            i: 1,
+            ..Default::default()
+        }];
+        let g = run(GraphProto {
+            node: vec![
+                node("Reshape", &["x", "heads"], &["h"]),
+                node("Reshape", &["x", "rest"], &["r"]),
+                node("Reshape", &["x", "odd"], &["o"]),
+                flatten,
+            ],
+            input: vec![input("x", &["batch", "seq", "512"])],
+            initializer: vec![
+                ints("heads", &[0, 0, -1, 128]),
+                ints("rest", &[0, -1]),
+                ints("odd", &[0, 0, -1, 3]),
+            ],
+            output: vec![output("h"), output("r"), output("o"), output("f")],
+            ..Default::default()
+        });
+        let shape = |name: &str| g.value(g.find_value(name).unwrap()).shape.clone().unwrap();
+        use Dim::*;
+        let (batch, seq) = (Sym("batch".to_string()), Sym("seq".to_string()));
+        assert_eq!(
+            shape("h"),
+            [batch.clone(), seq.clone(), Fixed(4), Fixed(128)]
+        );
+        // seq * 512 is not one dimension.
+        assert_eq!(shape("r"), [batch.clone(), Unknown]);
+        assert_eq!(shape("o"), [batch.clone(), seq, Unknown, Fixed(3)]);
+        assert_eq!(shape("f"), [batch, Unknown]);
     }
 }
