@@ -108,10 +108,12 @@ impl Schedule {
 /// A tensor's buffer is freed after its last reader and handed to later
 /// tensors. Views share the buffer of what they view, which therefore lives
 /// as long as the longest-lived view. `ty` gives the element type of a tensor by
-/// name; a buffer only holds tensors of one type.
+/// name; a buffer only holds tensors of one type. A node never writes into a
+/// buffer it reads, nor into one the `lookback` nodes before it read.
 pub(crate) fn solve_allocation(
     g: &Graph,
     ty: &dyn Fn(&str) -> ElemType,
+    lookback: usize,
 ) -> (Allocator, AnalysisData) {
     let mut schedule = Schedule::default();
     schedule.visit(g, ty);
@@ -176,11 +178,8 @@ pub(crate) fn solve_allocation(
                 all.insert(out.clone(), b);
                 continue;
             }
-            // Never write into a buffer this node reads, nor one the five
-            // nodes before it read: a user pattern may generate a whole run
-            // of nodes at once.
             let mut reserved = HashSet::new();
-            for prev in 0..=5 {
+            for prev in 0..=lookback {
                 if let Some(s) = id.checked_sub(prev).map(|i| &schedule.steps[i]) {
                     reserved.extend(s.inputs.iter().filter_map(|n| all.get(n)).copied());
                 }
@@ -253,22 +252,44 @@ mod tests {
                 nodes.push(node("Relu", &[&w[0]], &w[1]));
             }
             nodes.push(node("Add", &["v", &chain[7]], "y"));
-            let g = crate::compiler::ir::Graph::from_onnx(GraphProto {
-                node: nodes,
-                input: vec![ValueInfoProto {
-                    name: "x".to_string(),
-                    ..Default::default()
-                }],
-                output: vec![ValueInfoProto {
-                    name: "y".to_string(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            });
-            let (alloc, _) = solve_allocation(&g, &|_| ElemType::F32);
+            let g = graph(nodes, "y");
+            let (alloc, _) = solve_allocation(&g, &|_| ElemType::F32, 5);
             let buffer = |t: &str| alloc.tensor_to_buffer[t];
             let reused = chain.iter().any(|t| buffer(t) == buffer("a"));
             assert_eq!(reused, op == "Relu", "{op}");
+        }
+    }
+
+    fn graph(nodes: Vec<NodeProto>, output: &str) -> crate::compiler::ir::Graph {
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        crate::compiler::ir::Graph::from_onnx(GraphProto {
+            node: nodes,
+            input: vec![info("x")],
+            output: vec![info(output)],
+            ..Default::default()
+        })
+    }
+
+    /// A buffer is handed to the next node after its tensor's last reader,
+    /// unless one of the `lookback` nodes before read it.
+    #[test]
+    fn test_buffers_are_reused_after_the_lookback() {
+        let g = graph(
+            vec![
+                node("Relu", &["x"], "a"),
+                node("Relu", &["a"], "b"),
+                node("Relu", &["b"], "c"),
+            ],
+            "c",
+        );
+        for (lookback, reused) in [(0, true), (1, false)] {
+            let (alloc, _) = solve_allocation(&g, &|_| ElemType::F32, lookback);
+            let buffer = |t: &str| alloc.tensor_to_buffer[t];
+            assert_eq!(buffer("c") == buffer("a"), reused, "lookback {lookback}");
+            assert_ne!(buffer("b"), buffer("a"));
         }
     }
 }
