@@ -60,7 +60,7 @@ fn sole_producer(g: &Graph, v: Option<ValueId>, is_match: impl Fn(&Op) -> bool) 
 }
 
 /// A compile-time constant: an initializer or a `Constant`.
-fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorProto> {
+pub(super) fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorProto> {
     let v = v?;
     match g.data(v) {
         Some(t) => Some(t),
@@ -73,7 +73,7 @@ fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorProto> {
 
 /// The values of a compile-time constant, float16 ones (which
 /// `tensor_to_array` does not read) included.
-fn constant(g: &Graph, v: Option<ValueId>) -> Option<Vec<f32>> {
+pub(super) fn constant(g: &Graph, v: Option<ValueId>) -> Option<Vec<f32>> {
     let t = constant_tensor(g, v)?;
     if DType::from_onnx(t.data_type) == DType::F16 {
         // The bits, raw or one per element of `int32_data`.
