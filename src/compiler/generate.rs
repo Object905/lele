@@ -1,7 +1,7 @@
 use super::ir::{Binary, DType, Graph, Node, NodeId, Op};
 use super::weights::{WeightRef, Weights};
 use super::{Allocator, AnalysisData, Compiler, sanitize_name};
-use crate::model::onnx_proto::{NodeProto, ValueInfoProto};
+use crate::model::onnx_proto::{NodeProto, TensorProto, ValueInfoProto};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
@@ -89,6 +89,61 @@ impl<'a> OpContext<'a> {
             Some(w) if w.dtype == DType::F16 => w.read("weight_f16_raw"),
             _ => self.inputs[i].clone(),
         }
+    }
+}
+
+/// The node an [override](super::Compiler::with_override) generates code
+/// for, and what that code works with.
+pub struct Codegen<'c, 'a> {
+    ctx: &'c OpContext<'a>,
+}
+
+impl Codegen<'_, '_> {
+    /// The graph holding the node: the model's, or the branch of an `If`.
+    pub fn graph(&self) -> &Graph {
+        self.ctx.graph
+    }
+
+    /// The node.
+    pub fn node(&self) -> &Node {
+        self.ctx.ir()
+    }
+
+    /// The node in ONNX form, its attributes included.
+    pub fn proto(&self) -> &NodeProto {
+        self.ctx.node
+    }
+
+    /// The Rust expressions of the node's inputs: the variable holding an
+    /// input, the expression reading a weight, `""` for an omitted optional
+    /// input.
+    pub fn inputs(&self) -> &[String] {
+        &self.ctx.inputs
+    }
+
+    /// The Rust variables the node's code defines, one per output.
+    pub fn outputs(&self) -> &[String] {
+        &self.ctx.outputs
+    }
+
+    /// The buffer to write output 0 into, as an `&mut Vec` expression.
+    pub fn buffer(&self) -> &str {
+        &self.ctx.buf_expr
+    }
+
+    /// The element type input `i` is held in: `"f32"` or `"i64"`.
+    pub fn input_type(&self, i: usize) -> &'static str {
+        self.ctx.input_type(i).rust()
+    }
+
+    /// The contents of input `i` if it is a weight of the graph.
+    pub fn data(&self, i: usize) -> Option<&TensorProto> {
+        self.ctx.graph.data(self.node().input(i)?)
+    }
+
+    /// The indentation of the node's lines.
+    pub fn tab(&self) -> String {
+        self.ctx.tab()
     }
 }
 
@@ -611,24 +666,6 @@ pub(crate) fn generate_nodes(
     let nodes = ir_nodes.protos;
     let mut idx = 0;
     while idx < nodes.len() {
-        // Try to match patterns first
-        let mut matched_len = 0;
-        let remaining_nodes = &nodes[idx..];
-        for pattern in &compiler.patterns {
-            if let Some(len) = (pattern.matcher)(remaining_nodes) {
-                let table = weights.pattern_table();
-                (pattern.generator)(remaining_nodes, table, allocator, w, indent)?;
-                matched_len = len;
-                break;
-            }
-        }
-        if matched_len > 0 {
-            for _ in 0..matched_len {
-                *current_id += 1;
-            }
-            idx += matched_len;
-            continue;
-        }
         let node = nodes[idx];
         let id = ir_nodes.ids[idx];
         idx += 1;
@@ -747,7 +784,7 @@ pub(crate) fn generate_nodes(
 
         // 1. Override
         if let Some(handler) = compiler.overrides.get(op) {
-            handler(node, &inputs, &outputs, &ctx.buf_expr, w, indent)?;
+            handler(&Codegen { ctx: &ctx }, w)?;
             continue;
         }
 
@@ -869,8 +906,8 @@ mod tests {
     #[test]
     fn test_custom_op_override() {
         let mut compiler = Compiler::new();
-        compiler = compiler.with_override("CustomOp", |_node, inputs, outputs, _buf, w, indent| {
-            let tab = "    ".repeat(indent);
+        compiler = compiler.with_override("CustomOp", |c, w| {
+            let (tab, outputs, inputs) = (c.tab(), c.outputs(), c.inputs());
             writeln!(w, "{}// Custom implementation for {}", tab, outputs[0])?;
             writeln!(
                 w,
@@ -1087,6 +1124,25 @@ mod tests {
         assert!(!unpacked.code.contains("weight_f16_packed"));
         assert!(contains(&unpacked.weights, &raw));
         assert!(contains(&unpacked.weights, &bytes(&conv)));
+
+        // An override of `Conv` reads its weights as stored; the weights of
+        // the products are packed all the same.
+        let overridden = Compiler::new()
+            .with_optimizations(Optimizations {
+                weight_packing: true,
+                ..Default::default()
+            })
+            .with_override("Conv", |c, w| {
+                let (out, weight) = (&c.outputs()[0], &c.inputs()[1]);
+                writeln!(w, "{}let {out} = my_conv(&{weight});", c.tab())
+            })
+            .compile(&graph)
+            .unwrap();
+        let code = &overridden.code;
+        assert_eq!(code.matches("self.weight_f16_packed(").count(), 1, "{code}");
+        assert!(contains(&overridden.weights, &packed));
+        assert!(contains(&overridden.weights, &bytes(&conv)));
+        assert!(!contains(&overridden.weights, &conv_packed));
     }
 
     /// i64 tensors, casts and every output of a Split are written into the workspace,

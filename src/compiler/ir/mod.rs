@@ -534,17 +534,37 @@ impl Graph {
         proto: NodeProto,
         inputs: Vec<Option<ValueId>>,
     ) -> NodeId {
-        let last = *nodes
-            .iter()
-            .max_by_key(|&&n| self.order.iter().position(|&o| o == n))
-            .expect("nothing to fuse");
+        let last = self.last_of(nodes);
         let outputs = self.node(last).outputs.clone();
+        self.fuse_with_outputs(nodes, op, proto, inputs, outputs)
+    }
+
+    /// [`Graph::fuse`] producing `outputs`, which must be outputs of
+    /// `nodes`. Nothing outside `nodes` may read their other outputs, nor
+    /// read one of `outputs` before the last of `nodes` runs.
+    pub fn fuse_with_outputs(
+        &mut self,
+        nodes: &[NodeId],
+        op: Op,
+        proto: NodeProto,
+        inputs: Vec<Option<ValueId>>,
+        outputs: Vec<Option<ValueId>>,
+    ) -> NodeId {
+        let last = self.last_of(nodes);
         for &n in nodes {
             self.remove_node(n);
         }
         let id = self.insert_node(last, op, proto, inputs, outputs);
         self.order.retain(|&n| n != last);
         id
+    }
+
+    /// The node of `nodes` that runs last.
+    fn last_of(&self, nodes: &[NodeId]) -> NodeId {
+        *nodes
+            .iter()
+            .max_by_key(|&&n| self.order.iter().position(|&o| o == n))
+            .expect("nothing to fuse")
     }
 
     /// Removes `node`. Its outputs are left without a producer.

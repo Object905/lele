@@ -2,12 +2,11 @@
 
 use super::generate::ElemType;
 use super::ir::{DType, Graph, Layout, Op};
-use super::{WeightTable, sanitize_name};
+use super::sanitize_name;
 use crate::model::onnx_proto::TensorProto;
 use crate::model::{tensor_to_array, tensor_to_vec_u8};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 /// Where a weight lives in the weights file. Only this module knows where:
 /// code generation reads a weight through the expressions it builds.
@@ -96,9 +95,6 @@ pub(crate) struct Weights {
     pub data: Vec<u8>,
     /// Weights by sanitized name.
     lookup: HashMap<String, WeightRef>,
-    /// `lookup` in the form [`Compiler::with_pattern`](super::Compiler::with_pattern)
-    /// generators take, built on first use.
-    pattern_table: OnceLock<WeightTable>,
     /// Values of int64 and int32 weights by name, for code generation to
     /// inline.
     pub int64: HashMap<String, (Vec<i64>, Vec<usize>)>,
@@ -151,19 +147,6 @@ impl Weights {
     /// The weight holding the tensor `name`.
     pub(crate) fn get(&self, name: &str) -> Option<&WeightRef> {
         self.lookup.get(&sanitize_name(name))
-    }
-
-    /// The weights as pattern generators take them.
-    pub(crate) fn pattern_table(&self) -> &WeightTable {
-        self.pattern_table.get_or_init(|| {
-            self.lookup
-                .iter()
-                .map(|(name, w)| {
-                    let entry = (w.offset, w.len, w.shape.clone(), w.dtype.to_onnx());
-                    (name.clone(), entry)
-                })
-                .collect()
-        })
     }
 
     /// The values of `name`, if it is an int64 or int32 weight.
