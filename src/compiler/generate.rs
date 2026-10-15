@@ -918,7 +918,7 @@ mod tests {
         let mut ir = crate::compiler::ir::Graph::from_onnx(graph);
         crate::compiler::passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
-        let weights = Weights::collect(&ir, false);
+        let weights = Weights::collect(&ir);
         assert_eq!(var_types.get("indices"), ElemType::F32);
         assert_eq!(var_types.get("anchor"), ElemType::F32);
 
@@ -968,7 +968,7 @@ mod tests {
         let mut ir = crate::compiler::ir::Graph::from_onnx(graph);
         crate::compiler::passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
-        let weights = Weights::collect(&ir, false);
+        let weights = Weights::collect(&ir);
         let compiler = Compiler::new();
         let code: Vec<String> = products
             .iter()

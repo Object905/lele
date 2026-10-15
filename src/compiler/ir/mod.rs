@@ -39,6 +39,19 @@ pub enum Dim {
     Unknown,
 }
 
+/// How the contents of an initializer are laid out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Layout {
+    /// As ONNX stores a tensor: its elements in row-major order.
+    #[default]
+    Stored,
+    /// An f16 matrix `[k, n]` as [`pack_f16`](crate::kernels::matmul::pack_f16)
+    /// lays it out, or the f16 weights `[m, k, 1]` of a pointwise `Conv` as
+    /// it lays out their transpose `[k, m]`. Only the matrix product kernels
+    /// read such data, and passes leave it alone.
+    PackedF16,
+}
+
 /// A tensor: a graph input, an initializer, a node output, or a value a
 /// subgraph captures from an enclosing graph.
 #[derive(Clone, Debug)]
@@ -49,6 +62,8 @@ pub struct Value {
     pub shape: Option<Vec<Dim>>,
     /// Contents of an initializer.
     pub data: Option<TensorProto>,
+    /// How `data` is laid out.
+    pub layout: Layout,
     producer: Option<NodeId>,
     /// One entry per use, so a node that reads the value twice is listed
     /// twice. A node whose subgraph reads the value is listed once.
@@ -62,6 +77,7 @@ impl Value {
             dtype: DType::Undefined,
             shape: None,
             data: None,
+            layout: Layout::Stored,
             producer: None,
             consumers: Vec::new(),
         }
@@ -329,6 +345,22 @@ impl Graph {
         value.shape = Some(tensor.dims.iter().map(|&d| Dim::Fixed(d)).collect());
         value.data = Some(tensor);
         self.initializers.push(v);
+    }
+
+    /// Replaces the contents of initializer `v` by `tensor`, laid out as ONNX
+    /// stores it. Its readers then read `tensor`; a weight nothing reads is
+    /// not written to the weights file.
+    ///
+    /// # Panics
+    /// If `v` is not an initializer.
+    pub fn set_data(&mut self, v: ValueId, mut tensor: TensorProto) {
+        let value = &mut self.values[v.0 as usize];
+        assert!(value.data.is_some(), "{} is not an initializer", value.name);
+        tensor.name = value.name.clone();
+        value.dtype = DType::from_onnx(tensor.data_type);
+        value.shape = Some(tensor.dims.iter().map(|&d| Dim::Fixed(d)).collect());
+        value.data = Some(tensor);
+        value.layout = Layout::Stored;
     }
 
     /// Adds an initializer holding `tensor`, named `name` or, if a value has

@@ -317,7 +317,10 @@ impl Compiler {
         let pack = opt.weight_packing
             && self.patterns.is_empty()
             && !["MatMul", "Linear", "Conv"].iter().any(|op| self.overrides.contains_key(*op));
-        let weights = weights::Weights::collect(&ir, pack);
+        if pack {
+            passes::pack_weights(&mut ir, &|_| false);
+        }
+        let weights = weights::Weights::collect(&ir);
         let (graph_inputs, graph_outputs) = (ir.input_infos(), ir.output_infos());
         let (ids, protos) = lower_nodes(&ir);
         let protos: Vec<&NodeProto> = protos.iter().collect();
