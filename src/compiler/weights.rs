@@ -22,45 +22,41 @@ pub(crate) struct WeightRef {
     /// lays it out (or lays out its transpose: see
     /// [`Layout::PackedF16`]).
     pub packed: bool,
-    /// The value of a rank-0 weight, which code reads inline.
+    /// The value of a rank-0 weight, which code reads inline: it is not
+    /// written to the weights file, and has no offset there.
     pub scalar: Option<Scalar>,
 }
 
 impl WeightRef {
     /// The call of `lele::runtime::Weights` method `accessor` reading this
-    /// weight, on `self` in a model method.
+    /// weight, on `self` in a model method. A scalar, which is not in the
+    /// weights file, is read inline, as the type `accessor` reads.
     pub(crate) fn read(&self, accessor: &str) -> String {
-        format!(
-            "self.{accessor}({}, {}, &{:?})",
-            self.offset, self.len, self.shape
-        )
+        match self.scalar {
+            Some(scalar) => scalar.read(accessor),
+            None => format!(
+                "self.{accessor}({}, {}, &{:?})",
+                self.offset, self.len, self.shape
+            ),
+        }
     }
 
     /// The byte offset and length of this weight, as the arguments the
     /// runtime methods reading raw bytes (`pack_qweights`, ...) start with.
+    ///
+    /// # Panics
+    /// If this is a scalar, which is not in the weights file.
     pub(crate) fn bytes(&self) -> String {
+        assert!(
+            self.scalar.is_none(),
+            "a scalar weight has no bytes in the file"
+        );
         format!("{}, {}", self.offset, self.len)
     }
 
-    /// The expression reading this weight as `target`: a scalar inline, any
-    /// other weight through the accessor widening its type to `target`.
+    /// The expression reading this weight as `target`, through the accessor
+    /// widening its type to `target`.
     pub(crate) fn expr(&self, target: ElemType) -> String {
-        let float = |v: f32| match v {
-            _ if v.is_finite() => format!("{v:?}f32"),
-            _ if v.is_nan() => "f32::NAN".to_string(),
-            _ if v > 0.0 => "f32::INFINITY".to_string(),
-            _ => "f32::NEG_INFINITY".to_string(),
-        };
-        match (self.scalar, target) {
-            (Some(Scalar::Int(v)), ElemType::I64) => return format!("lele::scalar({v}i64)"),
-            (Some(Scalar::Int(v)), ElemType::F32) => {
-                return format!("lele::scalar({})", float(v as f32));
-            }
-            (Some(Scalar::Float(v)), ElemType::F32) => {
-                return format!("lele::scalar({})", float(v));
-            }
-            _ => {}
-        }
         let accessor = match target {
             ElemType::I64 => match self.dtype {
                 DType::I32 => "weight_i32_i64",
@@ -87,6 +83,32 @@ pub(crate) enum Scalar {
     Int(i64),
     /// Of an f32 or f16 weight.
     Float(f32),
+}
+
+impl Scalar {
+    /// The scalar inline, as the type `lele::runtime::Weights` method
+    /// `accessor` reads a weight as.
+    fn read(self, accessor: &str) -> String {
+        let (int, float) = match self {
+            Scalar::Int(v) => (v, v as f32),
+            Scalar::Float(v) => (v as i64, v),
+        };
+        let float = match float {
+            v if v.is_finite() => format!("{v:?}f32"),
+            v if v.is_nan() => "f32::NAN".to_string(),
+            v if v > 0.0 => "f32::INFINITY".to_string(),
+            _ => "f32::NEG_INFINITY".to_string(),
+        };
+        match accessor {
+            "weight_i64" | "weight_i32_i64" | "weight_bool_i64" => {
+                format!("lele::scalar({int}i64)")
+            }
+            "weight_i32" => format!("lele::scalar({int}i32)"),
+            "weight_f32" | "weight_f16" | "weight_u8" | "weight_i8" | "weight_i32_f32"
+            | "weight_i64_f32" => format!("lele::scalar({float})"),
+            _ => panic!("a scalar weight is not read through {accessor}"),
+        }
+    }
 }
 
 /// The weights file, with where each weight landed in it.
@@ -232,18 +254,23 @@ impl Weights {
                 .map(|&b| Scalar::Float(half::f16::from_le_bytes(b).to_f32())),
             _ => None,
         };
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            bytes.hash(&mut hasher);
-            hasher.finish()
+        // Code reads scalars inline, so they are not written.
+        let (offset, len) = if scalar.is_some() {
+            (0, 0)
+        } else {
+            let hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                hasher.finish()
+            };
+            *self.by_content.entry(hash).or_insert_with(|| {
+                self.data.resize(self.data.len().next_multiple_of(16), 0);
+                let offset = self.data.len();
+                self.data.extend_from_slice(&bytes);
+                (offset, bytes.len())
+            })
         };
-        let (offset, len) = *self.by_content.entry(hash).or_insert_with(|| {
-            self.data.resize(self.data.len().next_multiple_of(16), 0);
-            let offset = self.data.len();
-            self.data.extend_from_slice(&bytes);
-            (offset, bytes.len())
-        });
         // The first weight of a name wins.
         self.lookup.entry(sanitize_name(name)).or_insert(WeightRef {
             offset,
@@ -253,5 +280,56 @@ impl Weights {
             packed,
             scalar,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::compiler::Compiler;
+    use crate::compiler::ir::DType;
+    use crate::model::onnx_proto::{GraphProto, NodeProto, TensorProto, ValueInfoProto};
+
+    /// Code reads scalar weights inline, whatever their type, and the weights
+    /// file leaves them out.
+    #[test]
+    fn scalars_are_not_written() {
+        let info = |name: &str| ValueInfoProto {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let tensor = |name: &str, dtype: DType, dims: Vec<i64>, raw_data: Vec<u8>| TensorProto {
+            name: name.to_string(),
+            data_type: dtype.to_onnx(),
+            dims,
+            raw_data,
+            ..Default::default()
+        };
+        let node = |op: &str, input: &[&str], output: &str| NodeProto {
+            op_type: op.to_string(),
+            input: input.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            ..Default::default()
+        };
+        let row: Vec<u8> = [7.0f32, 9.0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let graph = GraphProto {
+            node: vec![
+                node("Add", &["x", "s"], "a"),
+                node("Add", &["a", "v"], "b"),
+                node("Identity", &["q"], "c"),
+            ],
+            initializer: vec![
+                tensor("s", DType::F32, vec![], 2.5f32.to_le_bytes().to_vec()),
+                tensor("v", DType::F32, vec![2], row.clone()),
+                tensor("q", DType::U8, vec![], vec![3]),
+            ],
+            input: vec![info("x")],
+            output: vec![info("b"), info("c")],
+            ..Default::default()
+        };
+        let result = Compiler::new().compile(&graph).unwrap();
+        let code = &result.code;
+        assert!(code.contains("lele::scalar(2.5f32)"), "{code}");
+        assert!(code.contains("lele::scalar(3.0f32)"), "{code}");
+        assert_eq!(result.weights, row);
     }
 }
