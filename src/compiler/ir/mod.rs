@@ -13,6 +13,7 @@
 //! patterns, which all work on `NodeProto`s, see the rewritten graph without
 //! changes.
 
+pub mod matching;
 mod op;
 
 pub use op::{
