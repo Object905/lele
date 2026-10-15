@@ -468,7 +468,30 @@ impl Compiler {
                 weights_expr += &format!(".with_{ty}(&{read:?})");
             }
         }
-        writeln!(&mut code, "        Self {{ weights: {weights_expr} }}")?;
+        // The weights of the integer products are packed here, numbered as the
+        // code reads them.
+        let prepared = weights.prepared.borrow();
+        if prepared.qweights.is_empty() && prepared.conv_weights.is_empty() {
+            writeln!(&mut code, "        Self {{ weights: {weights_expr} }}")?;
+        } else {
+            writeln!(&mut code, "        let weights = {weights_expr};")?;
+            let mut with = String::new();
+            for (name, packed) in [
+                ("qweights", &prepared.qweights),
+                ("conv_weights", &prepared.conv_weights),
+            ] {
+                if packed.is_empty() {
+                    continue;
+                }
+                writeln!(&mut code, "        let {name} = vec![")?;
+                for expr in packed {
+                    writeln!(&mut code, "            {expr},")?;
+                }
+                writeln!(&mut code, "        ];")?;
+                with += &format!(".with_{name}({name})");
+            }
+            writeln!(&mut code, "        Self {{ weights: weights{with} }}")?;
+        }
         writeln!(&mut code, "    }}")?;
         for method in &self.custom_methods {
             writeln!(&mut code, "{}", method)?;

@@ -5,6 +5,7 @@ use super::{WeightTable, sanitize_name};
 use crate::kernels::matmul::PACK_COLS;
 use crate::model::onnx_proto::TensorProto;
 use crate::model::{tensor_to_array, tensor_to_vec_u8};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -47,9 +48,39 @@ pub(crate) struct Weights {
     pub int64: HashMap<String, (Vec<i64>, Vec<usize>)>,
     /// Offset and length of each distinct content already written.
     by_content: HashMap<u64, (usize, usize)>,
+    /// Weights of the integer products, packed when the model is created.
+    pub prepared: RefCell<Prepared>,
+}
+
+/// Weights generated code prepares for the integer kernels when the model is
+/// created, as the expressions preparing each, in the order code numbers them.
+#[derive(Default)]
+pub(crate) struct Prepared {
+    pub qweights: Vec<String>,
+    pub conv_weights: Vec<String>,
+}
+
+/// The number of `expr` in `prepared`, added if new.
+fn number(prepared: &mut Vec<String>, expr: String) -> usize {
+    prepared.iter().position(|e| *e == expr).unwrap_or_else(|| {
+        prepared.push(expr);
+        prepared.len() - 1
+    })
 }
 
 impl Weights {
+    /// The number of the [`QWeights`](crate::kernels::QWeights) that `expr`
+    /// prepares from `weights` when the model is created.
+    pub(crate) fn qweights(&self, expr: String) -> usize {
+        number(&mut self.prepared.borrow_mut().qweights, expr)
+    }
+
+    /// The number of the [`ConvWeights`](crate::kernels::ConvWeights) that
+    /// `expr` prepares from `weights` when the model is created.
+    pub(crate) fn conv_weights(&self, expr: String) -> usize {
+        number(&mut self.prepared.borrow_mut().conv_weights, expr)
+    }
+
     /// Lays out the initializers and `Constant` values of `g` and its
     /// subgraphs: per graph, its initializers in model order, then each
     /// node's constant followed by its subgraphs' weights, in attribute

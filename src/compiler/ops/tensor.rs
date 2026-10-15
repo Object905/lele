@@ -378,16 +378,18 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         }
         Op::QLinearMatMulI8 => {
             // Produced by `Compiler::fuse_qdq_matmul`, so the weight is always
-            // an int8 initializer with a known blob offset. It is passed by
-            // offset rather than as a `TensorView` because the runtime packs it
-            // into an architecture-specific layout once and caches that.
-            let Some(weight) = ctx.weight(3) else {
+            // an int8 initializer, and its scale one too. The runtime packs it
+            // into an architecture-specific layout when the model is created.
+            let (Some(weight), Some(scale)) = (ctx.weight(3), ctx.weight_at_load(4, "")) else {
                 panic!(
-                    "QLinearMatMulI8 weight {} is not a known initializer",
+                    "QLinearMatMulI8 weight {} or its scale is not a known initializer",
                     ctx.node.input[3]
                 );
             };
-            let (offset, len, shape) = (weight.offset, weight.len, &weight.shape);
+            let n = ctx.weights.qweights(format!(
+                "weights.pack_qweights({}, {}, {}, {}, true, &lele::scalar(0.0f32), &{scale})",
+                weight.offset, weight.len, weight.shape[0], weight.shape[1],
+            ));
             // `fold_qdq_into_matmuls` may have given it the pair after the
             // product, the bias added after that, or both.
             let requant = requant_expr(ctx, inputs, I8_REQUANT);
@@ -397,8 +399,8 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             };
             writeln!(
                 w,
-                "{tab}let {} = self.qmatmul_i8(&{}, &{}, &{}, {offset}, {len}, {}, {}, &{}, {requant}, {bias}, {buf_expr});",
-                outputs[0], inputs[0], inputs[1], inputs[2], shape[0], shape[1], inputs[4],
+                "{tab}let {} = self.qmatmul_i8(&{}, &{}, &{}, self.qweights({n}), {requant}, {bias}, {buf_expr});",
+                outputs[0], inputs[0], inputs[1], inputs[2],
             )?;
         }
         Op::QLinearMatMulAct => {

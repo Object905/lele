@@ -40,6 +40,19 @@ impl<'a> OpContext<'a> {
         self.weights.get(self.node.input.get(i)?)
     }
 
+    /// The expression reading weight input `i` as f32 from `weights` when the
+    /// model is created, if input `i` is a weight; `default` if it is absent.
+    pub fn weight_at_load(&self, i: usize, default: &str) -> Option<String> {
+        if self.node.input.get(i).is_none_or(|name| name.is_empty()) {
+            return Some(default.to_string());
+        }
+        let expr = weight_expr(self.weight(i)?, ElemType::F32);
+        Some(match expr.strip_prefix("self.") {
+            Some(read) => format!("weights.{read}"),
+            None => expr,
+        })
+    }
+
     /// The element type input `i` is held in, whether it is a variable or a
     /// weight.
     pub fn input_type(&self, i: usize) -> ElemType {
@@ -952,6 +965,63 @@ mod tests {
                 "let anchor = lele::kernels::div_trunc(&indices, &lele::scalar(80.0f32), &mut buf_anchor);"
             ),
             "{result}"
+        );
+    }
+
+    /// Integer products of one static weight with the same zero point read
+    /// the same weights, packed once when the model is created; another zero
+    /// point packs them again.
+    #[test]
+    fn test_integer_weights_packed_at_load_by_number() {
+        let node = |input: &[&str], output: &str| NodeProto {
+            input: input.iter().map(|s| s.to_string()).collect(),
+            output: vec![output.to_string()],
+            op_type: "MatMulInteger".to_string(),
+            ..Default::default()
+        };
+        let products = [
+            node(&["a", "b", "", "zb"], "y0"),
+            node(&["a2", "b", "", "zb"], "y1"),
+            node(&["a", "b", "", "zb2"], "y2"),
+        ];
+        let tensor = |name: &str, dims: Vec<i64>, raw_data: Vec<u8>| {
+            crate::model::onnx_proto::TensorProto {
+                name: name.to_string(),
+                data_type: DType::U8.to_onnx(),
+                dims,
+                raw_data,
+                ..Default::default()
+            }
+        };
+        let graph = crate::model::onnx_proto::GraphProto {
+            node: products.to_vec(),
+            initializer: vec![
+                tensor("b", vec![2, 2], vec![1, 2, 3, 4]),
+                tensor("zb", vec![], vec![1]),
+                tensor("zb2", vec![], vec![2]),
+            ],
+            ..Default::default()
+        };
+        let mut ir = crate::compiler::ir::Graph::from_onnx(graph);
+        crate::compiler::passes::infer_dtypes(&mut ir);
+        let var_types = variable_types(&ir);
+        let weights = Weights::collect(&ir, false);
+        let compiler = Compiler::new();
+        let code: Vec<String> = products
+            .iter()
+            .map(|n| generate_one(n, &weights, &compiler, &var_types))
+            .collect();
+        for (code, n) in code.iter().zip([0, 0, 1]) {
+            assert!(code.contains("self.mat_mul_integer_packed(&"), "{code}");
+            assert!(code.contains(&format!(", self.qweights({n}), None, ")), "{code}");
+        }
+        let prepared = weights.prepared.borrow();
+        assert_eq!(prepared.qweights.len(), 2);
+        assert!(
+            prepared.qweights[0].starts_with("weights.pack_qweights(")
+                && prepared.qweights[0].ends_with(", false, &weights.weight_u8(16, 1, &[]), &lele::scalar(1.0f32))"),
+            "{}",
+            prepared.qweights[0]
         );
     }
 

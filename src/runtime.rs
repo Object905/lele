@@ -3,21 +3,13 @@
 //! Every generated model struct wraps a [`Weights`] and derefs to it, so the
 //! generated code reads weights and calls the fused ops below as `self.*`.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use aligned_vec::AVec;
 
 use crate::kernels::{self, ConvWeights, QWeights};
 use crate::tensor::TensorView;
 
-type QWeightCache = HashMap<(usize, usize, usize, usize, bool), (Vec<f32>, Vec<f32>, Arc<QWeights>)>;
-type ConvWeightCache = HashMap<(usize, usize, usize, bool), (Vec<f32>, Arc<ConvWeights>)>;
-
-/// A model's weight blob plus the weights prepared from it for the integer
-/// kernels. Preparing is architecture dependent and costs a full pass over the
-/// weight, so it happens once per tensor and is cached for the life of the model.
+/// A model's weight blob plus the weights prepared from it, when the model is
+/// created, for kernels that cannot read them as they are stored.
 pub struct Weights<'a> {
     data: &'a [u8],
     /// The weights [`Self::with_f16`], [`Self::with_u8`] and [`Self::with_i8`]
@@ -33,8 +25,10 @@ pub struct Weights<'a> {
     ints: AVec<i64>,
     i32_index: Vec<(usize, usize)>,
     bool_index: Vec<(usize, usize)>,
-    qweights_cache: RefCell<QWeightCache>,
-    conv_weights_cache: RefCell<ConvWeightCache>,
+    /// Weights of the integer products, packed by [`Self::with_qweights`] and
+    /// [`Self::with_conv_weights`], by the number generated code reads them by.
+    qweights: Vec<QWeights>,
+    conv_weights: Vec<ConvWeights>,
 }
 
 impl<'a> Weights<'a> {
@@ -48,8 +42,8 @@ impl<'a> Weights<'a> {
             ints: AVec::new(0),
             i32_index: Vec::new(),
             bool_index: Vec::new(),
-            qweights_cache: RefCell::default(),
-            conv_weights_cache: RefCell::default(),
+            qweights: Vec::new(),
+            conv_weights: Vec::new(),
         }
     }
 
@@ -225,53 +219,63 @@ impl<'a> Weights<'a> {
         &self.data[offset..offset + len]
     }
 
-    /// Symmetric int8 weights for QLinearMatMulI8 ([`kernels::prepare_quantized_weights`]).
-    fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &TensorView<f32>) -> Arc<QWeights> {
-        self.get_qweights(offset, len, k, n, true, &[0.0], &scale.data)
-    }
-
-    /// 8-bit weights packed for the integer GEMM, with their zero points
-    /// subtracted. Distinct initializers can share identical bytes, and one
-    /// initializer can sit behind several DequantizeLinear nodes carrying
-    /// different scales, so the key includes the shape and the cached entry
-    /// must match the zero points and scales bit for bit.
+    /// The `[k, n]` 8-bit weight at `offset` packed for the integer GEMM, with
+    /// its zero points subtracted and its scales applied, for
+    /// [`Self::with_qweights`].
     #[allow(clippy::too_many_arguments)]
-    fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> Arc<QWeights> {
-        let key = (offset, len, k, n, signed);
-        let same_bits = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
-        if let Some((_, _, w)) = self
-            .qweights_cache
-            .borrow()
-            .get(&key)
-            .filter(|(z, s, _)| same_bits(z, zero_point) && same_bits(s, scale))
-        {
-            return w.clone();
-        }
-        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
-        let w = Arc::new(QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, scale));
-        self.qweights_cache
-            .borrow_mut()
-            .insert(key, (zero_point.to_vec(), scale.to_vec(), w.clone()));
-        w
+    pub fn pack_qweights(
+        &self,
+        offset: usize,
+        len: usize,
+        k: usize,
+        n: usize,
+        signed: bool,
+        zero_point: &TensorView<f32>,
+        scale: &TensorView<f32>,
+    ) -> QWeights {
+        let zp: Vec<i32> = zero_point.data.iter().map(|&z| z as i32).collect();
+        QWeights::new(&self.data[offset..offset + len], k, n, signed, &zp, &scale.data)
     }
 
-    /// ConvInteger weights, prepared with their zero points, which the entry must match.
-    fn get_conv_weights(&self, offset: usize, len: usize, shape: [usize; 4], groups: usize, signed: bool, zero_point: &[f32]) -> Arc<ConvWeights> {
-        let key = (offset, len, groups, signed);
-        if let Some((_, w)) = self
-            .conv_weights_cache
-            .borrow()
-            .get(&key)
-            .filter(|(z, _)| z.as_slice() == zero_point)
-        {
-            return w.clone();
-        }
-        let zp: Vec<i32> = zero_point.iter().map(|&z| z as i32).collect();
-        let w = Arc::new(ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp));
-        self.conv_weights_cache
-            .borrow_mut()
-            .insert(key, (zero_point.to_vec(), w.clone()));
-        w
+    /// The 8-bit `ConvInteger` weight at `offset` prepared with its zero
+    /// points, for [`Self::with_conv_weights`].
+    pub fn pack_conv_weights(
+        &self,
+        offset: usize,
+        len: usize,
+        shape: [usize; 4],
+        groups: usize,
+        signed: bool,
+        zero_point: &TensorView<f32>,
+    ) -> ConvWeights {
+        let zp: Vec<i32> = zero_point.data.iter().map(|&z| z as i32).collect();
+        ConvWeights::new(&self.data[offset..offset + len], &shape, groups, signed, &zp)
+    }
+
+    /// Keeps the weights of the integer products, which
+    /// [`Self::pack_qweights`] packed when the model was created, for
+    /// [`Self::qweights`] to read by number.
+    pub fn with_qweights(mut self, qweights: Vec<QWeights>) -> Self {
+        self.qweights = qweights;
+        self
+    }
+
+    /// Keeps the weights of `ConvInteger`s, which
+    /// [`Self::pack_conv_weights`] prepared when the model was created, for
+    /// [`Self::conv_weights`] to read by number.
+    pub fn with_conv_weights(mut self, conv_weights: Vec<ConvWeights>) -> Self {
+        self.conv_weights = conv_weights;
+        self
+    }
+
+    /// Packed weights number `i` of [`Self::with_qweights`].
+    pub fn qweights(&self, i: usize) -> &QWeights {
+        &self.qweights[i]
+    }
+
+    /// Prepared weights number `i` of [`Self::with_conv_weights`].
+    pub fn conv_weights(&self, i: usize) -> &ConvWeights {
+        &self.conv_weights[i]
     }
 }
 
@@ -380,61 +384,41 @@ impl Weights<'_> {
     pub fn linear_quantized_packed<'c, 'd>(
         &self,
         input: &TensorView<'c>,
-        weight_offset: usize,
-        weight_len: usize,
-        weight_k: usize,
-        weight_n: usize,
-        weight_signed: bool,
-        weight_scale: TensorView<'c>,
-        weight_zero: TensorView<'c>,
+        weight: &QWeights,
         bias: TensorView<'c>,
         relu: bool,
         output_buf: &'d mut Vec<f32>,
     ) -> TensorView<'d> {
-        let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, &weight_zero.data, &weight_scale.data);
         let bias = (!bias.data.is_empty()).then_some(&bias.data[..]);
-        kernels::qlinear_dynamic(input, &w, bias, relu, output_buf)
+        kernels::qlinear_dynamic(input, weight, bias, relu, output_buf)
     }
 
-    /// MatMulInteger against a static weight packed once for the integer GEMM.
+    /// MatMulInteger against a static weight packed for the integer GEMM.
     pub fn mat_mul_integer_packed<'c, 'd>(
         &self,
         a: &TensorView<'c>,
-        weight_offset: usize,
-        weight_len: usize,
-        weight_k: usize,
-        weight_n: usize,
-        weight_signed: bool,
+        weight: &QWeights,
         a_zero_point: Option<&TensorView<'c>>,
-        b_zero_point: Option<&TensorView<'c>>,
         output_buf: &'d mut Vec<f32>,
     ) -> TensorView<'d> {
-        let zb = b_zero_point.map_or(&[0.0f32][..], |z| &z.data[..]);
-        let w = self.get_qweights(weight_offset, weight_len, weight_k, weight_n, weight_signed, zb, &[1.0]);
         let za = a_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
-        kernels::mat_mul_integer_qweights(a, za, &w, output_buf)
+        kernels::mat_mul_integer_qweights(a, za, weight, output_buf)
     }
 
-    /// ConvInteger against a static weight prepared once.
+    /// ConvInteger against a static weight prepared for it.
+    #[allow(clippy::too_many_arguments)]
     pub fn conv_integer_packed<'c, 'd>(
         &self,
         x: &TensorView<'c>,
-        weight_offset: usize,
-        weight_len: usize,
-        weight_shape: [usize; 4],
-        weight_signed: bool,
-        group: i64,
+        weight: &ConvWeights,
         x_zero_point: Option<&TensorView<'c>>,
-        w_zero_point: Option<&TensorView<'c>>,
         dilations: &[i64],
         pads: &[i64],
         strides: &[i64],
         output_buf: &'d mut Vec<f32>,
     ) -> TensorView<'d> {
-        let zw = w_zero_point.filter(|z| !z.data.is_empty()).map_or(&[0.0f32][..], |z| &z.data[..]);
-        let w = self.get_conv_weights(weight_offset, weight_len, weight_shape, group as usize, weight_signed, zw);
         let zx = x_zero_point.and_then(|z| z.data.first().copied()).unwrap_or(0.0) as i32;
-        kernels::conv_integer_packed(x, &w, zx, dilations, pads, strides, output_buf)
+        kernels::conv_integer_packed(x, weight, zx, dilations, pads, strides, output_buf)
     }
 
     /// `a` times a quantized `[k, n]` weight of integer codes, whose values are
@@ -498,17 +482,12 @@ impl Weights<'_> {
         input: &TensorView<'c>,
         input_scale: &TensorView<'c>,
         input_zero_point: &TensorView<'c>,
-        weight_offset: usize,
-        weight_len: usize,
-        weight_k: usize,
-        weight_n: usize,
-        weight_scale: &TensorView<'c>,
+        weight: &QWeights,
         requant: Option<kernels::Requant>,
         bias: Option<&TensorView<'c>>,
         output_buf: &'d mut Vec<f32>,
     ) -> TensorView<'d> {
-        let qw = self.get_quantized_weight(weight_offset, weight_len, weight_k, weight_n, weight_scale);
-        kernels::qmatmul_i8(input, input_scale, input_zero_point, &qw, requant, bias, output_buf)
+        kernels::qmatmul_i8(input, input_scale, input_zero_point, weight, requant, bias, output_buf)
     }
 
     pub fn linear<'c, 'd, B: kernels::WeightElem>(
