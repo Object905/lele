@@ -5,7 +5,7 @@ use super::super::{
     generate::{ElemType, OpContext, weight_expr},
     ir::{DType, Op, TargetDim},
 };
-use crate::compiler::passes::{ACT_REQUANT, I8_BIAS, I8_REQUANT};
+use crate::compiler::passes::{self, ACT_REQUANT, I8_BIAS, I8_REQUANT};
 use crate::model::onnx_proto::TensorProto;
 use std::io::Write;
 
@@ -164,6 +164,13 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 w,
                 "{}let {} = lele::kernels::where_op(&{}, &{}, &{}, {});",
                 tab, outputs[0], inputs[0], inputs[1], inputs[2], buf_expr
+            )?;
+        }
+        Op::Gather { .. } if let Some(index) = passes::selected_index(ctx.graph, ctx.ir()) => {
+            writeln!(
+                w,
+                "{tab}let {} = lele::kernels::select(&{}, {index});",
+                outputs[0], inputs[0]
             )?;
         }
         Op::Gather { axis } => {

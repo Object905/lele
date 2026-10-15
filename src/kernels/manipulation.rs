@@ -1028,6 +1028,32 @@ enum PadMode {
     Reflect,
 }
 
+/// Slab `index` of `data` along its outermost axis, as `Gather` of a scalar
+/// index along axis 0 takes it: a view of `data`, copied only where `data`
+/// owns its elements, as [`reshape`](crate::kernels::reshape) copies them.
+pub fn select<'a, T>(data: &TensorView<'a, T>, index: i64) -> TensorView<'a, T>
+where
+    T: Clone + std::fmt::Debug,
+{
+    let rows = data.shape[0];
+    let row = if index < 0 { index + rows as i64 } else { index };
+    assert!(
+        (0..rows as i64).contains(&row),
+        "select index {index} out of range for {rows} rows"
+    );
+    let shape = data.shape[1..].to_vec();
+    let len: usize = shape.iter().product();
+    let range = row as usize * len..(row as usize + 1) * len;
+    let data = match &data.data {
+        std::borrow::Cow::Borrowed(d) => std::borrow::Cow::Borrowed(&d[range]),
+        std::borrow::Cow::Owned(d) => std::borrow::Cow::Owned(d[range].to_vec()),
+    };
+    TensorView {
+        data,
+        shape: std::borrow::Cow::Owned(shape),
+    }
+}
+
 /// See [`borrow_run`] for when the result borrows from `data` rather than `out`.
 pub fn gather<'b: 'a, 'a, T, I>(
     data: &TensorView<'b, T>,
@@ -1823,6 +1849,26 @@ pub fn scatter_elements<'a, T: Copy + std::fmt::Debug, I: utils::AsI64 + Copy + 
 mod tests {
     use super::*;
     use crate::tensor::TensorView;
+
+    /// `select` takes what `gather` of the scalar index along axis 0 takes,
+    /// borrowing it from a borrowed input and copying it from an owned one.
+    #[test]
+    fn test_select_is_gather_of_a_scalar_index() {
+        let values: Vec<f32> = (0..24).map(|x| x as f32).collect();
+        let borrowed = TensorView::new(&values, &[4, 2, 3]);
+        let owned = TensorView::from_owned(values.clone(), vec![4, 2, 3]);
+        for index in [0i64, 2, 3, -1, -4] {
+            let mut out = Vec::new();
+            let want = gather(&borrowed, &TensorView::from_owned(vec![index], vec![]), 0, &mut out);
+            for (input, is_borrowed) in [(&borrowed, true), (&owned, false)] {
+                let got = select(input, index);
+                assert_eq!(got.shape.as_ref(), &[2, 3]);
+                assert_eq!(got.data.as_ref(), want.data.as_ref(), "{index}");
+                assert_eq!(matches!(got.data, std::borrow::Cow::Borrowed(_)), is_borrowed);
+            }
+        }
+        assert!(std::panic::catch_unwind(|| select(&borrowed, 4)).is_err());
+    }
 
     /// The examples of the ONNX ScatterElements spec, and a negative index.
     #[test]

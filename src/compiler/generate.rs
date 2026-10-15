@@ -625,7 +625,7 @@ fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
         {
             return true;
         }
-        let viewed = ["reshape", "unsqueeze", "squeeze"]
+        let viewed = ["reshape", "unsqueeze", "squeeze", "select"]
             .iter()
             .find_map(|f| rhs.strip_prefix(&format!("lele::kernels::{f}(&")))
             .or_else(|| rhs.strip_suffix(".clone()"))
@@ -844,6 +844,8 @@ mod tests {
         let layer = lele::kernels::gather(&arg, &self.weight_i64(0, 8, &[]), 0, &mut ws.buf_7);
         let swapped = lele::kernels::transpose(&x, &[1, 0], &mut buf_t);
         let half = lele::kernels::split_one(&m3, 1, &[0, 0], 0, &mut ws.buf_8);
+        let row = lele::kernels::select(&x2, 3);
+        let row_of_y = lele::kernels::select(&y, 0);
 ";
         for (var, safe) in [
             ("values", false),
@@ -864,6 +866,9 @@ mod tests {
             ("layer", true),
             ("swapped", false),
             ("half", false),
+            // Views of their operand.
+            ("row", true),
+            ("row_of_y", false),
         ] {
             assert_eq!(outlives_chunk(body, var, 0), safe, "{var}");
         }
