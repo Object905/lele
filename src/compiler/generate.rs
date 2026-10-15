@@ -1022,11 +1022,12 @@ mod tests {
         }
         let prepared = weights.prepared.borrow();
         assert_eq!(prepared.qweights.len(), 2);
-        assert!(
-            prepared.qweights[0].starts_with("weights.pack_qweights(")
-                && prepared.qweights[0].ends_with(", false, &weights.weight_u8(16, 1, &[]), &lele::scalar(1.0f32))"),
-            "{}",
-            prepared.qweights[0]
+        assert_eq!(
+            prepared.qweights,
+            [
+                "weights.pack_qweights(0, 4, 2, 2, false, &lele::scalar(1.0f32), &lele::scalar(1.0f32))",
+                "weights.pack_qweights(0, 4, 2, 2, false, &lele::scalar(2.0f32), &lele::scalar(1.0f32))",
+            ]
         );
     }
 

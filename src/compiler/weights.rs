@@ -28,7 +28,7 @@ pub(crate) struct WeightRef {
 /// The value of a rank-0 weight.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Scalar {
-    /// Of an int64, int32 or bool weight.
+    /// Of an int64, int32, 8-bit or bool weight.
     Int(i64),
     /// Of an f32 or f16 weight.
     Float(f32),
@@ -192,6 +192,8 @@ impl Weights {
             DType::I64 => bytes.first_chunk().map(|&b| Scalar::Int(i64::from_le_bytes(b))),
             DType::I32 => bytes.first_chunk().map(|&b| Scalar::Int(i32::from_le_bytes(b).into())),
             DType::Bool => Some(Scalar::Int((bytes[0] != 0).into())),
+            DType::U8 => Some(Scalar::Int(bytes[0].into())),
+            DType::I8 => Some(Scalar::Int((bytes[0] as i8).into())),
             DType::F32 => bytes.first_chunk().map(|&b| Scalar::Float(f32::from_le_bytes(b))),
             DType::F16 => bytes
                 .first_chunk()
