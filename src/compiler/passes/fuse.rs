@@ -10,7 +10,9 @@ use crate::compiler::ir::matching::{constant, constant_tensor, other_operand, so
 use crate::compiler::ir::{
     Activation, Binary, DType, Dim, Graph, NodeId, Op, Reduction, Unary, ValueId,
 };
+use crate::kernels::matmul::PACK_COLS;
 use crate::model::onnx_proto::{NodeProto, TensorProto};
+use crate::model::tensor_to_vec_u8;
 
 /// Runs every fusion on `g` and its subgraphs.
 pub(crate) fn fuse(g: &mut Graph) {
@@ -28,6 +30,7 @@ pub(crate) fn fuse(g: &mut Graph) {
     fuse_conv_act(g);
     fuse_dynamic_quant_linear(g);
     fuse_linear(g);
+    fuse_swiglu(g);
     fuse_embedding_concat(g);
     for id in g.node_ids() {
         for sub in g.node_mut(id).op.subgraphs_mut() {
@@ -861,6 +864,92 @@ fn fuse_linear(g: &mut Graph) {
     }
 }
 
+/// The gated product of a SwiGLU feed-forward → `SwiGlu`:
+///
+/// ```text
+/// y = Silu(Linear(x, w_gate, b_gate)) * Linear(x, w_value, b_value)
+/// ```
+///
+/// The weights must be constant f32 or f16 matrices `[k, n]` of one type,
+/// `n` a multiple of [`PACK_COLS`], and the biases constant vectors `[n]` of
+/// one type. `SwiGlu` reads them side by side, `[k, 2n]` and `[2n]`, as one
+/// product whose columns each come out as from its half alone
+/// ([`linear_swiglu`](crate::kernels::linear_swiglu)).
+fn fuse_swiglu(g: &mut Graph) {
+    for mul in binary_nodes(g, Binary::Mul) {
+        if !g.contains(mul) {
+            continue;
+        }
+        let fused = (0..2).find_map(|k| {
+            let node = g.node(mul);
+            let silu = sole_producer(g, node.input(k), |op| matches!(op, Op::Silu))?;
+            let linear = |op: &Op| matches!(op, Op::Linear);
+            let gate = sole_producer(g, g.node(silu).input(0), linear)?;
+            let value = sole_producer(g, node.input(1 - k), linear)?;
+            let (gn, vn) = (g.node(gate), g.node(value));
+            if gn.input(0).is_none() || gn.input(0) != vn.input(0) {
+                return None;
+            }
+            let operand = |i: usize| {
+                let (a, b) = (
+                    constant_tensor(g, gn.input(i))?,
+                    constant_tensor(g, vn.input(i))?,
+                );
+                (matches!(DType::from_onnx(a.data_type), DType::F32 | DType::F16)
+                    && a.data_type == b.data_type
+                    && a.dims == b.dims)
+                    .then_some((a, b))
+            };
+            let ((wg, wv), (bg, bv)) = (operand(1)?, operand(2)?);
+            let n = match wg.dims[..] {
+                [k, n] if k > 0 && n > 0 && n as usize % PACK_COLS == 0 => n,
+                _ => return None,
+            };
+            if bg.dims != [n] {
+                return None;
+            }
+            let name = g.value(gn.input(1)?).name.clone();
+            let weights = side_by_side(wg, wv)?;
+            let biases = side_by_side(bg, bv)?;
+            Some(([gate, value, silu, mul], gn.input(0), name, weights, biases))
+        });
+        if let Some((nodes, x, name, weights, biases)) = fused {
+            let proto = named_after(g, mul);
+            let w = g.new_initializer(&format!("{name}_swiglu"), weights);
+            let b = g.new_initializer(&format!("{name}_swiglu_bias"), biases);
+            g.fuse(&nodes, Op::SwiGlu, proto, vec![x, Some(w), Some(b)]);
+        }
+    }
+}
+
+/// Matrices `[k, n]`, or vectors `[n]`, `a` and `b` of one type side by side:
+/// each row of `a` followed by that of `b`, `[k, 2n]` (or `[2n]`).
+fn side_by_side(a: &TensorProto, b: &TensorProto) -> Option<TensorProto> {
+    let rows = match a.dims[..] {
+        [k, _] => k as usize,
+        [_] => 1,
+        _ => return None,
+    };
+    let (a_bytes, b_bytes) = (tensor_to_vec_u8(a).ok()?.0, tensor_to_vec_u8(b).ok()?.0);
+    if rows == 0 || a_bytes.len() != b_bytes.len() || a_bytes.len() % rows != 0 {
+        return None;
+    }
+    let row = a_bytes.len() / rows;
+    let raw_data = a_bytes
+        .chunks_exact(row)
+        .zip(b_bytes.chunks_exact(row))
+        .flat_map(|(a, b)| a.iter().chain(b).copied())
+        .collect();
+    let mut dims = a.dims.clone();
+    *dims.last_mut()? *= 2;
+    Some(TensorProto {
+        data_type: a.data_type,
+        dims,
+        raw_data,
+        ..Default::default()
+    })
+}
+
 /// The dynamically quantized linear layer ONNX Runtime's
 /// `quantize_dynamic` emits, optionally followed by `Relu`:
 ///
@@ -1273,6 +1362,76 @@ mod tests {
         assert_eq!(fused(&[2, 4]), ["Linear"]);
         assert_eq!(fused(&[5, 1, 4]), ["MatMul", "Add"]);
         assert_eq!(fused(&[1, 2, 4]), ["MatMul", "Add"]);
+    }
+
+    /// T-one's feed-forward: `Silu(Linear(x)) * Linear(x)`, either way round,
+    /// reads both weights side by side. Gates not a multiple of `PACK_COLS`
+    /// wide, and products of two inputs, stay as they are.
+    #[test]
+    fn fuses_swiglu() {
+        let floats = |name: &str, dims: &[i64], first: f32| TensorProto {
+            name: name.to_string(),
+            data_type: DType::F32.to_onnx(),
+            dims: dims.to_vec(),
+            float_data: (0..dims.iter().product::<i64>())
+                .map(|i| first + i as f32)
+                .collect(),
+            ..Default::default()
+        };
+        let graph = |n: i64, value_input: &str, swap: bool| {
+            let mut nodes = vec![
+                node("MatMul", &["x", "wg"], "mg"),
+                node("Add", &["mg", "bg"], "g"),
+                node("Sigmoid", &["g"], "s"),
+                node("Mul", &["g", "s"], "sg"),
+                node("MatMul", &[value_input, "wv"], "mv"),
+                node("Add", &["mv", "bv"], "v"),
+            ];
+            let (a, b) = if swap { ("v", "sg") } else { ("sg", "v") };
+            nodes.push(node("Mul", &[a, b], "y"));
+            let init = vec![
+                floats("wg", &[2, n], 0.0),
+                floats("bg", &[n], 100.0),
+                floats("wv", &[2, n], 200.0),
+                floats("bv", &[n], 300.0),
+            ];
+            (nodes, init)
+        };
+        let n = PACK_COLS as i64;
+        for swap in [false, true] {
+            let (nodes, init) = graph(n, "x", swap);
+            assert_eq!(fused(nodes, init), ["SwiGlu"], "swap {swap}");
+        }
+        let unfused = ["Linear", "Silu", "Linear", "Mul"];
+        let (nodes, init) = graph(n + 1, "x", false);
+        assert_eq!(fused(nodes, init), unfused);
+        let (nodes, init) = graph(n, "z", false);
+        assert_eq!(fused(nodes, init), unfused);
+
+        // The weights row by row, the gate's then the value's.
+        let (nodes, init) = graph(n, "x", false);
+        let mut ir = Graph::from_onnx(GraphProto {
+            node: nodes,
+            initializer: init,
+            output: vec![ValueInfoProto {
+                name: "y".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        fuse(&mut ir);
+        let (_, swiglu) = ir.nodes().next().unwrap();
+        let values = |i: usize| constant(&ir, swiglu.input(i)).unwrap();
+        let n = n as usize;
+        let row = |first: f32, i: usize| (0..n).map(move |j| first + (i * n + j) as f32);
+        let weights: Vec<f32> = (0..2)
+            .flat_map(|i| row(0.0, i).chain(row(200.0, i)))
+            .collect();
+        assert_eq!(values(1), weights);
+        assert_eq!(
+            values(2),
+            row(100.0, 0).chain(row(300.0, 0)).collect::<Vec<_>>()
+        );
     }
 
     #[test]

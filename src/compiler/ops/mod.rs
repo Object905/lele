@@ -88,7 +88,8 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::ScaleNorm { .. }
         | Op::SimAm { .. }
         | Op::Silu
-        | Op::Snake => fused::generate(ctx, w)?,
+        | Op::Snake
+        | Op::SwiGlu => fused::generate(ctx, w)?,
         Op::Loop { .. } | Op::Onnx { .. } => return Ok(false),
     }
     Ok(true)

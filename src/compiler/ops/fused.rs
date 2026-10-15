@@ -74,6 +74,14 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             ctx.matmul_weight(1),
             inputs[2]
         )?,
+        Op::SwiGlu => writeln!(
+            w,
+            "{tab}let {} = lele::kernels::linear_swiglu(&{}, &{}, &{}, {buf});",
+            outputs[0],
+            inputs[0],
+            ctx.matmul_weight(1),
+            inputs[2]
+        )?,
         Op::ConvAct { conv, act } => {
             let weight_shape = ctx
                 .weight(1)

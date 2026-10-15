@@ -546,6 +546,11 @@ pub enum Op {
     },
     /// `MatMul` + `Add`. Inputs: `[a, b, bias]`.
     Linear,
+    /// The gated product of a SwiGLU feed-forward, two `Linear`s of one input,
+    /// `silu` of the first times the second: `silu(x · w[:, :n] + b[:n]) *
+    /// (x · w[:, n:] + b[n:])`. Inputs: `[x, w, b]`, `w` `[k, 2n]` holding the
+    /// gate's weights then the value's, `b` `[2n]` their biases likewise.
+    SwiGlu,
     /// Dynamically quantized linear layer: `DynamicQuantizeLinear` of the
     /// activation, `MatMulInteger` against a quantized weight, rescale and
     /// bias, optionally ReLU. Inputs:
@@ -853,6 +858,7 @@ impl Op {
             Op::RmsNorm { .. } => "RmsNorm",
             Op::SimAm { .. } => "SimAm",
             Op::Linear => "Linear",
+            Op::SwiGlu => "SwiGlu",
             Op::QLinearDynamic { .. } => "QLinearDynamic",
             Op::EmbeddingConcat { .. } => "EmbeddingConcat",
             Op::ReshapeTo { .. } => "ReshapeTo",
@@ -1067,7 +1073,8 @@ impl Op {
             | Op::QWeightMatMul
             | Op::Silu
             | Op::Snake
-            | Op::Linear => {}
+            | Op::Linear
+            | Op::SwiGlu => {}
         }
     }
 }

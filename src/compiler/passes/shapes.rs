@@ -678,6 +678,16 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
         Op::MatMul | Op::MatMulInteger | Op::QWeightMatMul | Op::Linear => {
             first(shape(0).zip(shape(1)).and_then(|(a, b)| matmul(&a, &b)))
         }
+        // Half the columns of the product.
+        Op::SwiGlu => first(shape(0).zip(shape(1)).and_then(|(a, b)| {
+            let mut out = matmul(&a, &b)?;
+            let last = out.last_mut()?;
+            *last = match *last {
+                Dim::Fixed(n) if n % 2 == 0 => Dim::Fixed(n / 2),
+                _ => Dim::Unknown,
+            };
+            Some(out)
+        })),
         Op::QLinearDynamic { .. } => {
             first(shape(0).zip(shape(1)).and_then(|(a, b)| matmul(&a, &b)))
         }
