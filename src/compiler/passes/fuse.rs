@@ -5,7 +5,7 @@
 //! back. Every intermediate tensor must be read by the chain alone, so
 //! removing the chain cannot leave another reader without its input.
 
-use super::fold::exact_ints;
+use super::fold::{exact_ints, f16_values};
 use crate::compiler::ir::{
     Activation, Binary, DType, Dim, Graph, NodeId, Op, Reduction, Unary, ValueId,
 };
@@ -80,13 +80,7 @@ pub(super) fn constant_tensor(g: &Graph, v: Option<ValueId>) -> Option<&TensorPr
 pub(super) fn constant(g: &Graph, v: Option<ValueId>) -> Option<Vec<f32>> {
     let t = constant_tensor(g, v)?;
     if DType::from_onnx(t.data_type) == DType::F16 {
-        // The bits, raw or one per element of `int32_data`.
-        let bits: Vec<u16> = if t.raw_data.is_empty() {
-            t.int32_data.iter().map(|&x| x as u16).collect()
-        } else {
-            t.raw_data.as_chunks::<2>().0.iter().map(|&b| u16::from_le_bytes(b)).collect()
-        };
-        return Some(bits.into_iter().map(|b| half::f16::from_bits(b).to_f32()).collect());
+        return Some(f16_values(t));
     }
     tensor_to_array(t).ok().map(|(data, _)| data)
 }
