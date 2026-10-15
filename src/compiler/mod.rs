@@ -249,6 +249,12 @@ impl Compiler {
             passes::fold_shapes(&mut ir);
             if opt.constant_folding {
                 passes::fold_constants(&mut ir);
+                // Folding resolves shape computations inference left open
+                // (an `Expand` target selected by `Where`), whose results a
+                // second round of inference then knows the shapes of.
+                passes::infer_dtypes(&mut ir);
+                passes::fold_shapes(&mut ir);
+                passes::fold_constants(&mut ir);
             }
         }
         // Each round takes out at least one `If`, whose branch may fold into
