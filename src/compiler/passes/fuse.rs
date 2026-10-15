@@ -368,50 +368,93 @@ fn fuse_conv_scale(g: &mut Graph) {
     }
 }
 
+/// A LayerNorm before its shift, `x - mean(x)` normalized by
+/// `sqrt(mean((x - mean(x))^2) + eps)` and scaled, over the last axis, ending
+/// in `Mul` node `mul`: its nodes, `x`, the scale and `eps`.
+struct LayerNormChain {
+    nodes: Vec<NodeId>,
+    x: ValueId,
+    scale: Option<ValueId>,
+    epsilon: f32,
+}
+
+fn layer_norm_chain(g: &Graph, mul: NodeId) -> Option<LayerNormChain> {
+    let (div, scale) = (0..2).find_map(|k| {
+        let div = sole_producer(g, g.node(mul).input(k), binary(Binary::Div))?;
+        Some((div, g.node(mul).input(1 - k)))
+    })?;
+    let (centered, std) = (g.node(div).input(0)?, g.node(div).input(1));
+    let sqrt = sole_producer(g, std, unary(Unary::Sqrt))?;
+    let add_eps = sole_producer(g, g.node(sqrt).input(0), binary(Binary::Add))?;
+    let (var, eps) = (g.node(add_eps).input(0), g.node(add_eps).input(1));
+    let epsilon = constant(g, eps).filter(|e| e.len() == 1)?[0];
+    let var_mean = sole_producer(g, var, reduce_mean)?;
+    let pow = sole_producer(g, g.node(var_mean).input(0), binary(Binary::Pow))?;
+    if g.node(pow).input(0) != Some(centered) || !is_scalar(g, g.node(pow).input(1), 2.0) {
+        return None;
+    }
+    // Read by the Pow and the Div.
+    let sub = g.value(centered).producer()?;
+    if !binary(Binary::Sub)(&g.node(sub).op) || g.uses(centered) != 2 {
+        return None;
+    }
+    let x = g.node(sub).input(0)?;
+    let mean = sole_producer(g, g.node(sub).input(1), reduce_mean)?;
+    let fits = g.node(mean).input(0) == Some(x)
+        && reduces_last_axis(g, mean)
+        && reduces_last_axis(g, var_mean)
+        && per_column(g, x, scale);
+    fits.then(|| LayerNormChain {
+        nodes: vec![mean, sub, pow, var_mean, add_eps, sqrt, div, mul],
+        x,
+        scale,
+        epsilon,
+    })
+}
+
+/// Whether `v` is a constant of one element per column of `x` (the kernels
+/// read the first that many): of shape `[n]` or `[1, ..., n]`, with `n`
+/// `x`'s width where that is known.
+fn per_column(g: &Graph, x: ValueId, v: Option<ValueId>) -> bool {
+    let width = g.value(x).shape.as_deref().and_then(|s| s.last());
+    constant_tensor(g, v).is_some_and(|t| match (t.dims.split_last(), width) {
+        (Some((_, rest)), _) if rest.iter().any(|&d| d != 1) => false,
+        (Some((n, _)), Some(Dim::Fixed(w))) => n == w,
+        (Some((n, _)), _) => *n > 1,
+        (None, _) => false,
+    })
+}
+
 /// `x - mean(x)`, normalized by `sqrt(mean((x - mean(x))^2) + eps)`, then
-/// scaled and shifted, all over the last axis → `LayerNormalization`.
+/// scaled and maybe shifted, all over the last axis, with the operands of the
+/// scale's `Mul` and the shift's `Add` in either order → `LayerNormalization`.
 fn fuse_layer_norm(g: &mut Graph) {
+    // Shifted ones first: the unshifted chain is part of each.
     for add in binary_nodes(g, Binary::Add) {
         if !g.contains(add) {
             continue;
         }
         let fused = (0..2).find_map(|k| {
             let node = g.node(add);
-            let (scaled, bias) = (node.input(k)?, node.input(1 - k));
-            let mul = sole_producer(g, Some(scaled), binary(Binary::Mul))?;
-            let normed = g.node(mul).input(0)?;
-            let scale = g.node(mul).input(1);
-            let div = sole_producer(g, Some(normed), binary(Binary::Div))?;
-            let (centered, std) = (g.node(div).input(0)?, g.node(div).input(1));
-            let sqrt = sole_producer(g, std, unary(Unary::Sqrt))?;
-            let add_eps = sole_producer(g, g.node(sqrt).input(0), binary(Binary::Add))?;
-            let (var, eps) = (g.node(add_eps).input(0), g.node(add_eps).input(1));
-            let epsilon = constant(g, eps).filter(|e| e.len() == 1)?[0];
-            let var_mean = sole_producer(g, var, reduce_mean)?;
-            let pow = sole_producer(g, g.node(var_mean).input(0), binary(Binary::Pow))?;
-            if g.node(pow).input(0) != Some(centered) || !is_scalar(g, g.node(pow).input(1), 2.0) {
-                return None;
-            }
-            // Read by the Pow and the Div.
-            let sub = g.value(centered).producer()?;
-            if !binary(Binary::Sub)(&g.node(sub).op) || g.uses(centered) != 2 {
-                return None;
-            }
-            let x = g.node(sub).input(0)?;
-            let mean = sole_producer(g, g.node(sub).input(1), reduce_mean)?;
-            if g.node(mean).input(0) != Some(x)
-                || !reduces_last_axis(g, mean)
-                || !reduces_last_axis(g, var_mean)
-            {
-                return None;
-            }
-            let nodes = [mean, sub, pow, var_mean, add_eps, sqrt, div, mul, add];
-            Some((nodes, [Some(x), scale, bias], epsilon))
+            let (scaled, bias) = (node.input(k), node.input(1 - k));
+            let chain = layer_norm_chain(g, sole_producer(g, scaled, binary(Binary::Mul))?)?;
+            per_column(g, chain.x, bias).then_some((chain, bias))
         });
-        if let Some((nodes, inputs, epsilon)) = fused {
-            let op = Op::LayerNormalization { axis: -1, epsilon };
-            let proto = named_after(g, add);
-            g.fuse(&nodes, op, proto, inputs.to_vec());
+        if let Some((chain, bias)) = fused {
+            let op = Op::LayerNormalization { axis: -1, epsilon: chain.epsilon };
+            let nodes: Vec<_> = chain.nodes.into_iter().chain([add]).collect();
+            let inputs = vec![Some(chain.x), chain.scale, bias];
+            g.fuse(&nodes, op, named_after(g, add), inputs);
+        }
+    }
+    for mul in binary_nodes(g, Binary::Mul) {
+        if !g.contains(mul) {
+            continue;
+        }
+        if let Some(chain) = layer_norm_chain(g, mul) {
+            let op = Op::LayerNormalization { axis: -1, epsilon: chain.epsilon };
+            let inputs = vec![Some(chain.x), chain.scale];
+            g.fuse(&chain.nodes, op, named_after(g, mul), inputs);
         }
     }
 }
@@ -1580,11 +1623,44 @@ mod tests {
                     ..Default::default()
                 });
         }
-        let constants = vec![scalar("two", 2.0), scalar("eps", 1e-6)];
+        let per_column = |name: &str, dims: Vec<i64>| TensorProto {
+            name: name.to_string(),
+            data_type: DType::F32.to_onnx(),
+            float_data: vec![0.5; dims.iter().product::<i64>() as usize],
+            dims,
+            ..Default::default()
+        };
+        let constants = vec![
+            scalar("two", 2.0),
+            scalar("eps", 1e-6),
+            per_column("scale", vec![4]),
+            per_column("bias", vec![1, 1, 4]),
+        ];
         assert_eq!(
             fused(nodes.clone(), constants.clone()),
             ["LayerNormalization"]
         );
+
+        // Without a shift, as Moonshine's, and with the scale first.
+        let mut unshifted = nodes.clone();
+        unshifted[7] = node("Mul", &["scale", "n"], "s");
+        unshifted[8] = node("Identity", &["s"], "y");
+        assert_eq!(
+            fused(unshifted, constants.clone()),
+            ["LayerNormalization", "Identity"]
+        );
+
+        // A sum computed at run time, as a residual, is not a shift, and a
+        // scale of one element for all is not one per column.
+        let mut residual = nodes.clone();
+        residual[8] = node("Add", &["s", "r"], "y");
+        assert_eq!(
+            fused(residual, constants.clone()),
+            ["LayerNormalization", "Add"]
+        );
+        let mut one_scale = constants.clone();
+        one_scale[2] = per_column("scale", vec![1]);
+        assert_eq!(fused(nodes.clone(), one_scale).len(), 9);
 
         // Normalizing over another axis is not a LayerNorm over the last.
         nodes[3].attribute[0].ints = vec![1];
