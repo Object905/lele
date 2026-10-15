@@ -222,6 +222,7 @@ The `Compiler` takes the same settings: `with_input_shape("input", &[1, 512])`, 
 ./run_hojo_tts.sh "text"     # Hojo-TTS-Light voice cloning
 cd examples/moss-tts-nano && cargo run --release -- "text"  # MOSS-TTS-Nano
 cd examples/ppocr && cargo run --release -- image.png      # PP-OCRv6 OCR
+cargo run --release -p fireredvad-example -- [in.wav]       # FireRedVAD streaming VAD (16 kHz WAV)
 cargo run --release -p tone-example --bin tone -- in.wav    # T-one ASR (8 kHz WAV)
 cargo run --release -p tone-example --bin tone-live         # T-one, live from the microphone
 cargo run --release -p whisper-example --bin whisper -- in.wav [--lang en]  # Whisper ASR (16 kHz WAV)
@@ -234,6 +235,7 @@ cargo run --release -p whisper-example --bin whisper-live [-- --lang en]    # Wh
 |-------|------|---------|
 | **SenseVoiceSmall** | ASR | Multilingual speech recognition |
 | **Silero VAD** | VAD | Streaming voice activity detection |
+| **FireRedVAD** | VAD | Streaming voice activity detection (DFSMN, 10 ms frames, Kaldi fbank) |
 | **T-one** | ASR | Streaming Russian telephony speech recognition (8 kHz, CTC) |
 | **Whisper** (base, int8) | ASR | Multilingual speech recognition with language detection; encoder and decoder with a key/value cache |
 | **Supertonic 2** | TTS | 5 languages |
