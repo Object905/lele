@@ -41,7 +41,10 @@ pub mod generate;
 pub mod ir;
 pub mod ops;
 mod passes;
+mod specialize;
 mod weights;
+
+pub use specialize::InputValue;
 
 pub(crate) use generate::*;
 
@@ -117,6 +120,7 @@ pub struct Compiler {
     pub(crate) model_name: String,
     pub(crate) patterns: Vec<Pattern>,
     pub(crate) custom_methods: Vec<String>,
+    pub(crate) specialization: specialize::Specialization,
     pub optimizations: Optimizations,
 }
 
@@ -133,6 +137,7 @@ impl Compiler {
             model_name: "Model".to_string(),
             patterns: Vec::new(),
             custom_methods: Vec::new(),
+            specialization: Default::default(),
             optimizations: Optimizations::default(),
         }
     }
@@ -188,12 +193,45 @@ impl Compiler {
         self
     }
 
+    /// Compiles the model for input `name` of shape `shape` alone. The passes
+    /// know its dimensions, shape folding resolves what depends on them, and
+    /// buffers whose sizes become known are reserved by the workspace up
+    /// front. The generated `forward` panics on another shape.
+    pub fn with_input_shape(mut self, name: &str, shape: &[usize]) -> Self {
+        self.specialization
+            .shapes
+            .insert(name.to_string(), shape.to_vec());
+        self
+    }
+
+    /// Compiles the model for the symbolic dimension `name` (an input's
+    /// `dim_param`, such as `batch_size`) being `value`, in every input and
+    /// tensor that has it. The generated `forward` panics on inputs where it
+    /// is not.
+    pub fn with_dim(mut self, name: &str, value: usize) -> Self {
+        self.specialization.dims.insert(name.to_string(), value);
+        self
+    }
+
+    /// Compiles input `name` in as a constant holding `value`, its elements
+    /// in order, of the input's type: what depends on it alone is folded.
+    /// Its shape must be fixed, by the model or by
+    /// [`with_input_shape`](Self::with_input_shape). The generated `forward`
+    /// still takes the input, and panics on another value.
+    pub fn with_input_value(mut self, name: &str, value: impl Into<InputValue>) -> Self {
+        self.specialization
+            .values
+            .insert(name.to_string(), value.into());
+        self
+    }
+
     pub fn compile(
         &self,
         graph: &GraphProto,
     ) -> Result<CompilationResult, Box<dyn std::error::Error>> {
         let opt = self.optimizations;
         let mut ir = ir::Graph::from_onnx(graph.clone());
+        let inputs = self.specialization.apply(&mut ir)?;
         if opt.qdq_fusion {
             // Must precede folding, which would otherwise consume the int8
             // weights.
@@ -380,11 +418,16 @@ impl Compiler {
 
         // Inference Function
         writeln!(&mut code, "\n    // Inference Entry Point")?;
-        let args: Vec<String> = graph_inputs
+        // `forward` takes every input, those compiled in included.
+        let input_type = |i: &specialize::Input| {
+            i.fixed_type
+                .unwrap_or_else(|| var_types.get(&sanitize_name(&i.name)))
+        };
+        let args: Vec<String> = inputs
             .iter()
             .map(|i| {
                 let name = sanitize_name(&i.name);
-                match var_types.get(&name) {
+                match input_type(i) {
                     ElemType::F32 => format!("{}: TensorView<'a>", name),
                     ty => format!("{}: TensorView<'a, {}>", name, ty),
                 }
@@ -415,7 +458,7 @@ impl Compiler {
             "        let mut ws = {}Workspace::new();",
             struct_name
         )?;
-        let arg_names_str = graph_inputs
+        let arg_names_str = inputs
             .iter()
             .map(|i| sanitize_name(&i.name))
             .collect::<Vec<_>>()
@@ -449,6 +492,12 @@ impl Compiler {
             args.join(", ").replace("'a", "'w"),
             ret_sig.replace("'a", "'w")
         )?;
+        for input in &inputs {
+            let var = sanitize_name(&input.name);
+            for check in input.checks(struct_name, &var, input_type(input)) {
+                writeln!(&mut code, "        {check}")?;
+            }
+        }
         // Generate Body
         code.extend_from_slice(body_str.as_bytes());
         // Return outputs

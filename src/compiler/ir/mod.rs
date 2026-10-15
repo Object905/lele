@@ -331,6 +331,18 @@ impl Graph {
         self.initializers.push(v);
     }
 
+    /// Turns graph input `v` into an initializer holding `tensor`, replacing
+    /// the default value an initializer of its name gave it.
+    pub fn fix_input(&mut self, v: ValueId, tensor: TensorProto) {
+        self.inputs.retain(|&i| i != v);
+        let value = &mut self.values[v.0 as usize];
+        value.dtype = DType::from_onnx(tensor.data_type);
+        value.shape = Some(tensor.dims.iter().map(|&d| Dim::Fixed(d)).collect());
+        if value.data.replace(tensor).is_none() {
+            self.initializers.push(v);
+        }
+    }
+
     /// Number of reads of `v`, counting each graph output it is as one.
     pub fn uses(&self, v: ValueId) -> usize {
         self.value(v).consumers.len() + self.outputs.iter().filter(|&&o| o == v).count()
