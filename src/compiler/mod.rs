@@ -70,7 +70,8 @@ fn to_pascal_case(s: &str) -> String {
 pub struct Optimizations {
     /// Replaces nodes whose inputs are all known at compile time by
     /// initializers holding their result, computed with the kernels the
-    /// generated code would run.
+    /// generated code would run, and `If` nodes whose condition is known by
+    /// the branch they take.
     pub constant_folding: bool,
     /// Infers tensor shapes and replaces shape computations (`Shape`,
     /// `Gather` of dimensions, ...) by constants where the dimensions are
@@ -247,6 +248,16 @@ impl Compiler {
             passes::infer_dtypes(&mut ir);
             passes::fold_shapes(&mut ir);
             if opt.constant_folding {
+                passes::fold_constants(&mut ir);
+            }
+        }
+        // Each round takes out at least one `If`, whose branch may fold into
+        // the condition of another.
+        while opt.constant_folding && passes::inline_constant_ifs(&mut ir) {
+            passes::fold_constants(&mut ir);
+            if opt.shape_folding {
+                passes::infer_dtypes(&mut ir);
+                passes::fold_shapes(&mut ir);
                 passes::fold_constants(&mut ir);
             }
         }
