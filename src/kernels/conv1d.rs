@@ -232,8 +232,13 @@ fn conv1d_fused_at<'b, 'a>(
     };
     let pad_left = if pads.is_empty() { 0 } else { pads[0] as usize };
     let pad_right = if pads.len() > 1 { pads[1] as usize } else { 0 };
-    let output_len =
-        (input_len + pad_left + pad_right - dilation * (kernel_size - 1) - 1) / stride + 1;
+    // An input shorter than the kernel's reach has no outputs.
+    let padded_len = input_len + pad_left + pad_right;
+    let reach = dilation * (kernel_size - 1) + 1;
+    if padded_len < reach {
+        return TensorView::from_slice(&out[..0], vec![batch_size, out_channels, 0]);
+    }
+    let output_len = (padded_len - reach) / stride + 1;
     let total_output_size = batch_size * out_channels * output_len;
     // SAFETY: every element is written below before any is read (the group
     // count divides the channels, asserted above).
@@ -648,6 +653,57 @@ mod tests {
                 assert_same_bits(&fused.data, &want.data, &what);
             }
         }
+    }
+
+    /// Padding a depthwise conv `s * stride` less on the left and
+    /// `d * stride` less on the right drops `s` outputs at the start and `d`
+    /// at the end, the rest bit for bit, which is what folding slices into
+    /// its padding relies on: FireRedVAD's lookback filter as it folds in
+    /// two steps, stride 2 and dilation 2.
+    #[test]
+    fn test_depthwise_conv1d_less_padding_is_sliced_conv1d() {
+        let mut rng = Rng::new(13);
+        // (channels, kernel, stride, dilation, pads, slice)
+        for (c, k, stride, dilation, pads, (s, d)) in [
+            (128, 20, 1, 1, [19, 19], (0, 19)),
+            (128, 20, 1, 1, [19, 0], (19, 0)),
+            (8, 5, 2, 1, [4, 5], (1, 2)),
+            (8, 3, 1, 2, [4, 4], (3, 1)),
+        ] {
+            for len in [20, 29, 40] {
+                let x = rng.vec(c * len, -3.0, 3.0);
+                let w = rng.vec(c * k, -0.5, 0.5);
+                let x = TensorView::from_slice(&x, vec![1, c, len]);
+                let w = TensorView::from_slice(&w, vec![c, 1, k]);
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let (g, dil) = (c as i64, [dilation]);
+                let full = conv1d(&x, &w, None, &dil, g, &pads, &[stride], &mut a);
+                let less = [pads[0] - s * stride, pads[1] - d * stride];
+                let got = conv1d(&x, &w, None, &dil, g, &less, &[stride], &mut b);
+                let n = full.shape[2];
+                let keep = s as usize..n - d as usize;
+                assert_eq!(*got.shape, [1, c, keep.len()]);
+                let want: Vec<f32> = full
+                    .data
+                    .chunks_exact(n)
+                    .flat_map(|row| row[keep.clone()].to_vec())
+                    .collect();
+                let what = format!("k{k} stride {stride} dilation {dilation} len {len}");
+                assert_same_bits(&got.data, &want, &what);
+            }
+        }
+    }
+
+    /// An input shorter than the kernel, padding included, has no outputs.
+    #[test]
+    fn test_conv1d_short_input_is_empty() {
+        let x = vec![1.0; 4 * 19];
+        let w = vec![1.0; 4 * 20];
+        let x = TensorView::from_slice(&x, vec![1, 4, 19]);
+        let w = TensorView::from_slice(&w, vec![4, 1, 20]);
+        let mut out = Vec::new();
+        let y = conv1d(&x, &w, None, &[1], 4, &[0, 0], &[1], &mut out);
+        assert_eq!(*y.shape, [1, 4, 0]);
     }
 
     /// `conv1d_pointwise` is `conv1d` for f32 weights, and for f16 weights `conv1d` of

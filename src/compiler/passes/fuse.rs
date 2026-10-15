@@ -17,6 +17,7 @@ use crate::model::tensor_to_vec_u8;
 /// Runs every fusion on `g` and its subgraphs.
 pub(crate) fn fuse(g: &mut Graph) {
     fuse_pad_conv(g);
+    fuse_conv_slice(g);
     fuse_conv_batch_norm(g);
     fuse_conv_scale(g);
     fuse_layer_norm(g);
@@ -169,6 +170,105 @@ fn fuse_pad_conv(g: &mut Graph) {
         inputs[0] = p.input(0);
         let proto = g.node(conv).proto.clone();
         g.fuse(&[pad, conv], Op::Conv(merged), proto, inputs);
+    }
+}
+
+/// `Slice(Conv(x))` of a depthwise 1D `Conv`, slicing time alone with step
+/// 1 → the `Conv`, padding less, so that it computes only the outputs kept.
+///
+/// Output `t` of a `Conv` reads from input `t * stride - pad_left` on, so
+/// starting the slice `s` outputs in is padding `s * stride` less on the
+/// left, and ending it `d` outputs before the end is padding `d * stride`
+/// less on the right. The slice must cut no further than the padding
+/// reaches. Each kept output reads the same inputs with the same weights,
+/// and the depthwise kernel sums each output on its own, so it comes out
+/// the same; other convolutions run as products whose rounding depends on
+/// how many outputs there are. A `Conv` left too little input for any output
+/// has none ([`conv1d`](crate::kernels::conv1d)), as the slice would have
+/// kept none.
+///
+/// Streaming models slice what they need from a `Conv` that pads its
+/// cached history again: FireRedVAD's blocks pad 19 frames on both sides
+/// and keep `T` of the `T + 38` outputs.
+fn fuse_conv_slice(g: &mut Graph) {
+    let slices: Vec<NodeId> = g
+        .nodes()
+        .filter(|(_, n)| matches!(n.op, Op::Slice))
+        .map(|(id, _)| id)
+        .collect();
+    for slice in slices {
+        let node = g.node(slice);
+        let Some(conv) = sole_producer(g, node.input(0), |op| matches!(op, Op::Conv(_))) else {
+            continue;
+        };
+        let ints = |i: usize| constant_tensor(g, node.input(i)).and_then(exact_ints);
+        let (Some(starts), Some(ends)) = (ints(1), ints(2)) else {
+            continue;
+        };
+        let axes = match node.input(3) {
+            Some(_) => ints(3),
+            None => Some((0..starts.len() as i64).collect()),
+        };
+        let steps = match node.input(4) {
+            Some(_) => ints(4),
+            None => Some(vec![1; starts.len()]),
+        };
+        let (Some(axes), Some(steps)) = (axes, steps) else {
+            continue;
+        };
+        let c = g.node(conv);
+        let Op::Conv(attrs) = &c.op else {
+            unreachable!()
+        };
+        let stride = attrs.strides.as_ref().map_or(1, |s| s[0]);
+        let dilation = attrs.dilations.as_ref().map_or(1, |d| d[0]);
+        let depthwise = c
+            .input(1)
+            .and_then(|w| g.data(w))
+            .is_some_and(|w| w.dims.len() == 3 && w.dims[1] == 1 && Some(w.dims[0]) == attrs.group);
+        let explicit = matches!(
+            attrs.auto_pad.as_deref(),
+            None | Some("NOTSET" | "VALID" | "")
+        );
+        let fits = depthwise
+            && (stride == 1 || dilation == 1)
+            && explicit
+            && starts.len() == 1
+            && matches!(axes[..], [2 | -1])
+            && steps == [1];
+        if !fits {
+            continue;
+        }
+        // Outputs cut at the start and at the end. Without the length, only a
+        // start counted from the front and an end counted from the back tell.
+        let len = match g.value(node.input(0).unwrap()).shape.as_deref() {
+            Some([_, _, Dim::Fixed(n)]) => Some(*n),
+            _ => None,
+        };
+        let to_end = ends[0] >= i32::MAX as i64;
+        let (start, dropped) = match (len, starts[0], ends[0]) {
+            (Some(n), s, e) => {
+                let clamp = |i: i64| if i < 0 { (i + n).max(0) } else { i.min(n) };
+                let (s, e) = (clamp(s), clamp(e));
+                if s >= e {
+                    continue;
+                }
+                (s, n - e)
+            }
+            (None, s, e) if s >= 0 && (e < 0 || to_end) => (s, if to_end { 0 } else { -e }),
+            _ => continue,
+        };
+        let pads = attrs.pads.clone().unwrap_or_else(|| vec![0, 0]);
+        let new_pads = vec![pads[0] - start * stride, pads[1] - dropped * stride];
+        if new_pads.iter().any(|&p| p < 0) {
+            continue;
+        }
+        let mut sliced = attrs.clone();
+        sliced.auto_pad = None;
+        sliced.pads = Some(new_pads);
+        let inputs = c.inputs().to_vec();
+        let proto = c.proto.clone();
+        g.fuse(&[conv, slice], Op::Conv(sliced), proto, inputs);
     }
 }
 
@@ -1309,6 +1409,65 @@ mod tests {
             ];
             let g = fused_graph(nodes, initializer);
             assert_eq!(g.nodes().count(), 2);
+        }
+    }
+
+    /// FireRedVAD's lookback filter: padded 19 frames on both sides, of
+    /// which two slices keep the outputs that read no padding.
+    #[test]
+    fn folds_slices_into_conv_padding() {
+        let mut conv = node("Conv", &["x", "w"], "c");
+        conv.attribute.push(attr("pads", &[19, 19]));
+        conv.attribute
+            .push(crate::model::onnx_proto::AttributeProto {
+                name: "group".to_string(),
+                i: 4,
+                r#type: 2, // INT
+                ..Default::default()
+            });
+        let nodes = vec![
+            conv,
+            node("Slice", &["c", "zero", "minus19", "time"], "s"),
+            node("Slice", &["s", "start", "end", "axis", "step"], "y"),
+        ];
+        let initializer = |w: &[i64], start: i64, step: i64, axis: i64| {
+            vec![
+                floats("w", w, &vec![0.5; w.iter().product::<i64>() as usize]),
+                ints("zero", &[0]),
+                ints("minus19", &[-19]),
+                ints("time", &[2]),
+                ints("start", &[start]),
+                ints("end", &[i64::MAX]),
+                ints("axis", &[axis]),
+                ints("step", &[step]),
+            ]
+        };
+        let pads = |g: &Graph| -> Vec<Option<Vec<i64>>> {
+            g.nodes()
+                .map(|(_, n)| match &n.op {
+                    Op::Conv(attrs) => attrs.pads.clone(),
+                    _ => None,
+                })
+                .collect()
+        };
+        let g = fused_graph(nodes.clone(), initializer(&[4, 1, 20], 19, 1, -1));
+        assert_eq!(pads(&g), [Some(vec![0, 0])]);
+        assert_eq!(g.nodes().next().unwrap().1.input(0), g.find_value("x"));
+
+        // A second slice cutting into the input, with a step or along
+        // channels stays; the first still folds.
+        for (w, start, step, axis) in [
+            (&[4, 1, 20][..], 20, 1, -1),
+            (&[4, 1, 20], 19, 2, -1),
+            (&[4, 1, 20], 1, 1, 1),
+        ] {
+            let g = fused_graph(nodes.clone(), initializer(w, start, step, axis));
+            assert_eq!(pads(&g), [Some(vec![19, 0]), None], "{start} {step} {axis}");
+        }
+        // Slices of a 2D or a dense conv stay.
+        for w in [&[4, 1, 20, 1][..], &[4, 4, 20]] {
+            let g = fused_graph(nodes.clone(), initializer(w, 19, 1, -1));
+            assert_eq!(g.nodes().count(), 3, "{w:?}");
         }
     }
 
