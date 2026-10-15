@@ -173,6 +173,22 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 outputs[0], inputs[0]
             )?;
         }
+        // An 8-bit table, as a quantized embedding, is read as stored and only
+        // the rows taken widened.
+        Op::Gather { axis }
+            if let Some(table) = ctx.weight(0)
+                && let Some(ty) = match table.dtype {
+                    DType::U8 => Some("u8"),
+                    DType::I8 => Some("i8"),
+                    _ => None,
+                } =>
+        {
+            writeln!(
+                w,
+                "{tab}let {} = lele::kernels::gather_widened(&self.weight_{ty}_stored({}, {}, &{:?}), &{}, {axis}, {buf_expr});",
+                outputs[0], table.offset, table.len, table.shape, inputs[1],
+            )?;
+        }
         Op::Gather { axis } => {
             writeln!(
                 w,

@@ -219,6 +219,22 @@ impl<'a> Weights<'a> {
         &self.data[offset..offset + len]
     }
 
+    /// A u8 weight as stored, for kernels that widen what they read of it
+    /// ([`kernels::gather_widened`]).
+    pub fn weight_u8_stored(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, u8> {
+        TensorView::new(&self.data[offset..offset + len], shape)
+    }
+
+    /// An i8 weight as stored, for kernels that widen what they read of it
+    /// ([`kernels::gather_widened`]).
+    pub fn weight_i8_stored(&self, offset: usize, len: usize, shape: &'a [usize]) -> TensorView<'a, i8> {
+        let bytes = &self.data[offset..offset + len];
+        // SAFETY: `i8` and `u8` have the same size and alignment, and every
+        // byte is a valid `i8`.
+        let signed = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i8, bytes.len()) };
+        TensorView::new(signed, shape)
+    }
+
     /// The `[k, n]` 8-bit weight at `offset` packed for the integer GEMM, with
     /// its zero points subtracted and its scales applied, for
     /// [`Self::with_qweights`].
