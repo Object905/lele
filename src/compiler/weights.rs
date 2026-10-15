@@ -1,5 +1,6 @@
 //! Layout of the weights file.
 
+use super::generate::ElemType;
 use super::ir::{ConvAttrs, DType, Graph, Op, ValueId};
 use super::{WeightTable, sanitize_name};
 use crate::kernels::matmul::PACK_COLS;
@@ -9,13 +10,14 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-/// Where a weight lives in the weights file.
+/// Where a weight lives in the weights file. Only this module knows where:
+/// code generation reads a weight through the expressions it builds.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WeightRef {
     /// Byte offset.
-    pub offset: usize,
+    offset: usize,
     /// Length in bytes.
-    pub len: usize,
+    len: usize,
     pub shape: Vec<usize>,
     pub dtype: DType,
     /// An f16 matrix stored as [`pack_f16`](crate::kernels::matmul::pack_f16)
@@ -23,6 +25,60 @@ pub(crate) struct WeightRef {
     pub packed: bool,
     /// The value of a rank-0 weight, which code reads inline.
     pub scalar: Option<Scalar>,
+}
+
+impl WeightRef {
+    /// The call of `lele::runtime::Weights` method `accessor` reading this
+    /// weight, on `self` in a model method.
+    pub(crate) fn read(&self, accessor: &str) -> String {
+        format!(
+            "self.{accessor}({}, {}, &{:?})",
+            self.offset, self.len, self.shape
+        )
+    }
+
+    /// The byte offset and length of this weight, as the arguments the
+    /// runtime methods reading raw bytes (`pack_qweights`, ...) start with.
+    pub(crate) fn bytes(&self) -> String {
+        format!("{}, {}", self.offset, self.len)
+    }
+
+    /// The expression reading this weight as `target`: a scalar inline, any
+    /// other weight through the accessor widening its type to `target`.
+    pub(crate) fn expr(&self, target: ElemType) -> String {
+        let float = |v: f32| match v {
+            _ if v.is_finite() => format!("{v:?}f32"),
+            _ if v.is_nan() => "f32::NAN".to_string(),
+            _ if v > 0.0 => "f32::INFINITY".to_string(),
+            _ => "f32::NEG_INFINITY".to_string(),
+        };
+        match (self.scalar, target) {
+            (Some(Scalar::Int(v)), ElemType::I64) => return format!("lele::scalar({v}i64)"),
+            (Some(Scalar::Int(v)), ElemType::F32) => {
+                return format!("lele::scalar({})", float(v as f32));
+            }
+            (Some(Scalar::Float(v)), ElemType::F32) => {
+                return format!("lele::scalar({})", float(v));
+            }
+            _ => {}
+        }
+        let accessor = match target {
+            ElemType::I64 => match self.dtype {
+                DType::I32 => "weight_i32_i64",
+                DType::Bool => "weight_bool_i64",
+                _ => "weight_i64",
+            },
+            ElemType::F32 => match self.dtype {
+                DType::U8 => "weight_u8",
+                DType::I8 => "weight_i8",
+                DType::I32 => "weight_i32_f32",
+                DType::I64 => "weight_i64_f32",
+                DType::F16 => "weight_f16",
+                _ => "weight_f32",
+            },
+        };
+        self.read(accessor)
+    }
 }
 
 /// The value of a rank-0 weight.
@@ -119,8 +175,14 @@ impl Weights {
     }
 
     /// Byte offset and length of every weight of `dtype` stored as it is (not
-    /// packed), in file order, for the runtime to widen once at load.
-    pub(crate) fn regions(&self, dtype: DType) -> Vec<(usize, usize)> {
+    /// packed) that `code` reads through `accessor`, in file order, for the
+    /// runtime to widen once at load.
+    pub(crate) fn read_through(
+        &self,
+        dtype: DType,
+        accessor: &str,
+        code: &str,
+    ) -> Vec<(usize, usize)> {
         let mut regions: Vec<_> = self
             .lookup
             .values()
@@ -129,6 +191,7 @@ impl Weights {
             .collect();
         regions.sort_unstable();
         regions.dedup();
+        regions.retain(|(offset, len)| code.contains(&format!("self.{accessor}({offset}, {len},")));
         regions
     }
 

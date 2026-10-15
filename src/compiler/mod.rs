@@ -451,6 +451,11 @@ impl Compiler {
         // i64, are widened once, here, not on every read; those the kernels
         // take as they are stored are left so.
         let mut weights_expr = "lele::runtime::Weights::new(data)".to_string();
+        let read_code = [all_code.as_str()]
+            .into_iter()
+            .chain(self.custom_methods.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
         use ir::DType;
         for (dtype, ty) in [
             (DType::F16, "f16"),
@@ -459,15 +464,7 @@ impl Compiler {
             (DType::I32, "i32_i64"),
             (DType::Bool, "bool_i64"),
         ] {
-            let read: Vec<_> = weights
-                .regions(dtype)
-                .into_iter()
-                .filter(|(offset, len)| {
-                    let read = format!("self.weight_{ty}({offset}, {len},");
-                    all_code.contains(&read)
-                        || self.custom_methods.iter().any(|m| m.contains(&read))
-                })
-                .collect();
+            let read = weights.read_through(dtype, &format!("weight_{ty}"), &read_code);
             if !read.is_empty() {
                 weights_expr += &format!(".with_{ty}(&{read:?})");
             }
@@ -595,7 +592,7 @@ impl Compiler {
             .map(|o| {
                 let name = sanitize_name(&o.name);
                 if let Some(weight) = weights.get(&o.name) {
-                    weight_expr(weight, var_types.get(&name))
+                    weight.expr(var_types.get(&name))
                 } else {
                     name
                 }

@@ -1,5 +1,5 @@
 use super::ir::{Binary, DType, Graph, Node, NodeId, Op};
-use super::weights::{Scalar, WeightRef, Weights};
+use super::weights::{WeightRef, Weights};
 use super::{Allocator, AnalysisData, Compiler, sanitize_name};
 use crate::model::onnx_proto::{NodeProto, ValueInfoProto};
 use std::collections::{HashMap, HashSet};
@@ -46,7 +46,7 @@ impl<'a> OpContext<'a> {
         if self.node.input.get(i).is_none_or(|name| name.is_empty()) {
             return Some(default.to_string());
         }
-        let expr = weight_expr(self.weight(i)?, ElemType::F32);
+        let expr = self.weight(i)?.expr(ElemType::F32);
         Some(match expr.strip_prefix("self.") {
             Some(read) => format!("weights.{read}"),
             None => expr,
@@ -85,14 +85,8 @@ impl<'a> OpContext<'a> {
     /// (packed or not), for the kernel to widen as it reads it.
     pub fn matmul_weight(&self, i: usize) -> String {
         match self.weight(i) {
-            Some(w) if w.packed => format!(
-                "self.weight_f16_packed({}, {}, &{:?})",
-                w.offset, w.len, w.shape
-            ),
-            Some(w) if w.dtype == DType::F16 => format!(
-                "self.weight_f16_raw({}, {}, &{:?})",
-                w.offset, w.len, w.shape
-            ),
+            Some(w) if w.packed => w.read("weight_f16_packed"),
+            Some(w) if w.dtype == DType::F16 => w.read("weight_f16_raw"),
             _ => self.inputs[i].clone(),
         }
     }
@@ -162,42 +156,6 @@ impl VarTypes {
     pub fn is_i64(&self, name: &str) -> bool {
         self.get(name) == ElemType::I64
     }
-}
-
-/// Expression reading weight `w` from the weights file as `target`.
-pub(crate) fn weight_expr(w: &WeightRef, target: ElemType) -> String {
-    let float = |v: f32| match v {
-        _ if v.is_finite() => format!("{v:?}f32"),
-        _ if v.is_nan() => "f32::NAN".to_string(),
-        _ if v > 0.0 => "f32::INFINITY".to_string(),
-        _ => "f32::NEG_INFINITY".to_string(),
-    };
-    match (w.scalar, target) {
-        (Some(Scalar::Int(v)), ElemType::I64) => return format!("lele::scalar({v}i64)"),
-        (Some(Scalar::Int(v)), ElemType::F32) => {
-            return format!("lele::scalar({})", float(v as f32));
-        }
-        (Some(Scalar::Float(v)), ElemType::F32) => {
-            return format!("lele::scalar({})", float(v));
-        }
-        _ => {}
-    }
-    let accessor = match target {
-        ElemType::I64 => match w.dtype {
-            DType::I32 => "weight_i32_i64",
-            DType::Bool => "weight_bool_i64",
-            _ => "weight_i64",
-        },
-        ElemType::F32 => match w.dtype {
-            DType::U8 => "weight_u8",
-            DType::I8 => "weight_i8",
-            DType::I32 => "weight_i32_f32",
-            DType::I64 => "weight_i64_f32",
-            DType::F16 => "weight_f16",
-            _ => "weight_f32",
-        },
-    };
-    format!("self.{accessor}({}, {}, &{:?})", w.offset, w.len, w.shape)
 }
 
 pub(crate) fn collect_recursive_metrics(
@@ -703,7 +661,7 @@ pub(crate) fn generate_nodes(
                     } else {
                         var_types.get(&name)
                     };
-                    weight_expr(weight, target)
+                    weight.expr(target)
                 } else {
                     name
                 }
