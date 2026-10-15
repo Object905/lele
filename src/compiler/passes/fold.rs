@@ -435,6 +435,10 @@ fn fold_int(op: &Op, inputs: &[&Const]) -> Option<(Vec<i64>, Vec<usize>)> {
             let values = (0..n as i64).map(|i| start + i * delta).collect();
             (values, vec![n])
         }
+        Op::Gather { axis } => {
+            let (x, indices) = (inputs.first()?, inputs.get(1)?);
+            gather(ints(0)?, &x.shape, ints(1)?, &indices.shape, *axis)?
+        }
         Op::Reduce {
             reduction,
             axes,
@@ -570,6 +574,35 @@ fn fold_int(op: &Op, inputs: &[&Const]) -> Option<(Vec<i64>, Vec<usize>)> {
     };
     let largest = inputs.iter().map(|c| c.data.len()).max().unwrap_or(0);
     (values.len() <= largest.max(MAX_GROWN)).then_some((values, shape))
+}
+
+/// `Gather` of `data` of `shape` at `indices` of `index_shape` along `axis`,
+/// if the axis and every index are in range.
+fn gather<T: Copy>(
+    data: &[T],
+    shape: &[usize],
+    indices: &[i64],
+    index_shape: &[usize],
+    axis: i64,
+) -> Option<(Vec<T>, Vec<usize>)> {
+    let rank = shape.len() as i64;
+    let axis = usize::try_from(if axis < 0 { axis + rank } else { axis }).ok()?;
+    let n = *shape.get(axis)?;
+    let outer: usize = shape[..axis].iter().product();
+    let inner: usize = shape[axis + 1..].iter().product();
+    let rows: Vec<usize> = indices
+        .iter()
+        .map(|&i| usize::try_from(if i < 0 { i + n as i64 } else { i }).ok().filter(|&i| i < n))
+        .collect::<Option<_>>()?;
+    let mut out = Vec::with_capacity(outer * rows.len() * inner);
+    for o in 0..outer {
+        for &r in &rows {
+            let at = (o * n + r) * inner;
+            out.extend_from_slice(data.get(at..at + inner)?);
+        }
+    }
+    let out_shape = [&shape[..axis], index_shape, &shape[axis + 1..]].concat();
+    Some((out, out_shape))
 }
 
 /// `f` of the elements of `inputs` at each position of their broadcast
@@ -814,6 +847,12 @@ fn fold_op(op: &Op, inputs: &[&Const]) -> Option<(Vec<f32>, Vec<usize>)> {
         Op::Cast { .. } => {
             let x = inputs.first()?;
             Some((x.data.clone(), x.shape.clone()))
+        }
+        // Integer tables are gathered exactly by `fold_int`.
+        Op::Gather { axis } => {
+            let (x, indices) = (inputs.first()?, inputs.get(1)?);
+            let (data, shape) = gather(&x.data, &x.shape, indices.ints.as_deref()?, &indices.shape, *axis)?;
+            (data.len() <= x.data.len().max(MAX_GROWN)).then_some((data, shape))
         }
         Op::Transpose { perm } => {
             let x = inputs.first()?;
@@ -1153,6 +1192,43 @@ mod tests {
         assert_eq!((&get("y").dims, &get("y").float_data), (&vec![], &vec![575.0]));
         assert_eq!((&get("rows").dims, &get("rows").int64_data), (&vec![2, 1], &vec![8, -10]));
         assert_eq!((&get("max").dims, &get("max").int64_data), (&vec![2], &vec![5, 3]));
+    }
+
+    /// Gathers from constant tables at constant indices fold, float ones (as
+    /// SenseVoice's embedding of its fixed prompt) and integer ones exactly;
+    /// an index out of range stays.
+    #[test]
+    fn folds_gathers_of_constants() {
+        let mut columns = node("Gather", &["m", "last"], "c");
+        columns.attribute.push(AttributeProto {
+            name: "axis".to_string(),
+            i: 1,
+            r#type: 2, // INT
+            ..Default::default()
+        });
+        let big = (1 << 40) + 1;
+        let g = fold(GraphProto {
+            node: vec![
+                node("Gather", &["table", "ids"], "e"),
+                columns,
+                node("Gather", &["table", "far"], "out_of_range"),
+            ],
+            initializer: vec![
+                floats("table", &[3, 2], &[0.5, 1.5, 2.5, 3.5, 4.5, 5.5]),
+                ints("ids", &[1, 2], &[2, -3]),
+                ints("m", &[2, 2], &[1, big, 3, 4]),
+                ints("last", &[], &[-1]),
+                ints("far", &[1], &[3]),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            g.node.iter().map(|n| n.op_type.as_str()).collect::<Vec<_>>(),
+            ["Gather"]
+        );
+        let get = |name: &str| g.initializer.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(*get("e"), floats("e", &[1, 2, 2], &[4.5, 5.5, 0.5, 1.5]));
+        assert_eq!(*get("c"), ints("c", &[2], &[big, 4]));
     }
 
     /// Integer arithmetic on constants is folded exactly: integer division
