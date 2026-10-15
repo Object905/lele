@@ -12,7 +12,6 @@ use aligned_vec::AVec;
 use crate::kernels::{self, ConvWeights, QWeights};
 use crate::tensor::TensorView;
 
-type QuantizedWeightCache = HashMap<(usize, usize, usize, usize), (Vec<f32>, Arc<QWeights>)>;
 type QWeightCache = HashMap<(usize, usize, usize, usize, bool), (Vec<f32>, Vec<f32>, Arc<QWeights>)>;
 type ConvWeightCache = HashMap<(usize, usize, usize, bool), (Vec<f32>, Arc<ConvWeights>)>;
 
@@ -29,7 +28,6 @@ pub struct Weights<'a> {
     f16_index: Vec<(usize, usize)>,
     u8_index: Vec<(usize, usize)>,
     i8_index: Vec<(usize, usize)>,
-    quantized_weights_cache: RefCell<QuantizedWeightCache>,
     qweights_cache: RefCell<QWeightCache>,
     conv_weights_cache: RefCell<ConvWeightCache>,
 }
@@ -42,7 +40,6 @@ impl<'a> Weights<'a> {
             f16_index: Vec::new(),
             u8_index: Vec::new(),
             i8_index: Vec::new(),
-            quantized_weights_cache: RefCell::default(),
             qweights_cache: RefCell::default(),
             conv_weights_cache: RefCell::default(),
         }
@@ -220,35 +217,25 @@ impl<'a> Weights<'a> {
         &self.data[offset..offset + len]
     }
 
-    /// Int8 weights for QLinearMatMulI8.
+    /// Symmetric int8 weights for QLinearMatMulI8 ([`kernels::prepare_quantized_weights`]).
     fn get_quantized_weight(&self, offset: usize, len: usize, k: usize, n: usize, scale: &TensorView<f32>) -> Arc<QWeights> {
-        // Distinct initializers can share identical bytes, and one initializer
-        // can sit behind several DequantizeLinear nodes carrying different
-        // scales, so the key must include the shape and the cached entry must
-        // match the exact scale.
-        let key = (offset, len, k, n);
-        let same_bits = |s: &[f32]| s.len() == scale.data.len() && s.iter().zip(scale.data.iter()).all(|(a, b)| a.to_bits() == b.to_bits());
-        if let Some((_, qw)) = self.quantized_weights_cache.borrow().get(&key).filter(|(s, _)| same_bits(s)) {
-            return qw.clone();
-        }
-        let raw = &self.data[offset..offset + len];
-        let qw = Arc::new(kernels::prepare_quantized_weights(raw, k, n, &scale.data));
-        self.quantized_weights_cache
-            .borrow_mut()
-            .insert(key, (scale.data.to_vec(), qw.clone()));
-        qw
+        self.get_qweights(offset, len, k, n, true, &[0.0], &scale.data)
     }
 
     /// 8-bit weights packed for the integer GEMM, with their zero points
-    /// subtracted, so the cached entry must match those and the scales.
+    /// subtracted. Distinct initializers can share identical bytes, and one
+    /// initializer can sit behind several DequantizeLinear nodes carrying
+    /// different scales, so the key includes the shape and the cached entry
+    /// must match the zero points and scales bit for bit.
     #[allow(clippy::too_many_arguments)]
     fn get_qweights(&self, offset: usize, len: usize, k: usize, n: usize, signed: bool, zero_point: &[f32], scale: &[f32]) -> Arc<QWeights> {
         let key = (offset, len, k, n, signed);
+        let same_bits = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
         if let Some((_, _, w)) = self
             .qweights_cache
             .borrow()
             .get(&key)
-            .filter(|(z, s, _)| z.as_slice() == zero_point && s.as_slice() == scale)
+            .filter(|(z, s, _)| same_bits(z, zero_point) && same_bits(s, scale))
         {
             return w.clone();
         }
