@@ -303,6 +303,10 @@ impl Compiler {
         }
         passes::infer_dtypes(&mut ir);
         let var_types = variable_types(&ir);
+        // Casts between types held alike are left to the element types to
+        // tell apart.
+        passes::bypass_view_casts(&mut ir, &|name| var_types.get(&sanitize_name(name)));
+        let var_types = variable_types(&ir);
         // A user pattern generates a whole run of nodes at once, and may read
         // the inputs of its first nodes after writing the outputs of later ones.
         let lookback = if self.patterns.is_empty() { 0 } else { 5 };
