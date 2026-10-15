@@ -1,5 +1,5 @@
 use super::ir::{Binary, DType, Graph, Node, NodeId, Op};
-use super::weights::{WeightRef, Weights};
+use super::weights::{Scalar, WeightRef, Weights};
 use super::{Allocator, AnalysisData, Compiler, sanitize_name};
 use crate::model::onnx_proto::{NodeProto, ValueInfoProto};
 use std::collections::{HashMap, HashSet};
@@ -153,11 +153,21 @@ impl VarTypes {
 
 /// Expression reading weight `w` from the weights file as `target`.
 pub(crate) fn weight_expr(w: &WeightRef, target: ElemType) -> String {
-    if let Some(v) = w.scalar {
-        return match target {
-            ElemType::I64 => format!("lele::scalar({v}i64)"),
-            ElemType::F32 => format!("lele::scalar({:?}f32)", v as f32),
-        };
+    let float = |v: f32| match v {
+        _ if v.is_finite() => format!("{v:?}f32"),
+        _ if v.is_nan() => "f32::NAN".to_string(),
+        _ if v > 0.0 => "f32::INFINITY".to_string(),
+        _ => "f32::NEG_INFINITY".to_string(),
+    };
+    match (w.scalar, target) {
+        (Some(Scalar::Int(v)), ElemType::I64) => return format!("lele::scalar({v}i64)"),
+        (Some(Scalar::Int(v)), ElemType::F32) => {
+            return format!("lele::scalar({})", float(v as f32));
+        }
+        (Some(Scalar::Float(v)), ElemType::F32) => {
+            return format!("lele::scalar({})", float(v));
+        }
+        _ => {}
     }
     let accessor = match target {
         ElemType::I64 => match w.dtype {

@@ -481,10 +481,10 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         }
         op @ (Op::Identity | Op::Constant { .. }) => {
             if let Some(weight) = ctx.weights.get(&ctx.node.output[0])
-                && weight.dtype == DType::I64
+                && matches!(weight.dtype, DType::I64 | DType::F32 | DType::F16)
                 && weight.scalar.is_some()
             {
-                let weight = weight_expr(weight, ElemType::I64);
+                let weight = weight_expr(weight, ElemType::of(weight.dtype));
                 writeln!(w, "{}let {} = {};", tab, outputs[0], weight)?;
             } else if let Some(weight) = ctx.weights.get(&ctx.node.output[0]) {
                 let weight_fn = match weight.dtype {

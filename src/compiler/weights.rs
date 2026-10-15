@@ -20,8 +20,17 @@ pub(crate) struct WeightRef {
     /// An f16 matrix stored as [`pack_f16`](crate::kernels::matmul::pack_f16)
     /// lays it out (or lays out its transpose: see [`Packing`]).
     pub packed: bool,
-    /// The value of a rank-0 integer or bool weight, which code reads inline.
-    pub scalar: Option<i64>,
+    /// The value of a rank-0 weight, which code reads inline.
+    pub scalar: Option<Scalar>,
+}
+
+/// The value of a rank-0 weight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Scalar {
+    /// Of an int64, int32 or bool weight.
+    Int(i64),
+    /// Of an f32 or f16 weight.
+    Float(f32),
 }
 
 /// The weights file, with where each weight landed in it.
@@ -149,9 +158,13 @@ impl Weights {
         }
         let scalar = match dtype {
             _ if !shape.is_empty() => None,
-            DType::I64 => bytes.first_chunk().map(|&b| i64::from_le_bytes(b)),
-            DType::I32 => bytes.first_chunk().map(|&b| i32::from_le_bytes(b) as i64),
-            DType::Bool => Some((bytes[0] != 0) as i64),
+            DType::I64 => bytes.first_chunk().map(|&b| Scalar::Int(i64::from_le_bytes(b))),
+            DType::I32 => bytes.first_chunk().map(|&b| Scalar::Int(i32::from_le_bytes(b).into())),
+            DType::Bool => Some(Scalar::Int((bytes[0] != 0).into())),
+            DType::F32 => bytes.first_chunk().map(|&b| Scalar::Float(f32::from_le_bytes(b))),
+            DType::F16 => bytes
+                .first_chunk()
+                .map(|&b| Scalar::Float(half::f16::from_le_bytes(b).to_f32())),
             _ => None,
         };
         if let Some(packing) = packing {
