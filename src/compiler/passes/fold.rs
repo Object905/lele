@@ -435,6 +435,57 @@ fn fold_int(op: &Op, inputs: &[&Const]) -> Option<(Vec<i64>, Vec<usize>)> {
             let values = (0..n as i64).map(|i| start + i * delta).collect();
             (values, vec![n])
         }
+        Op::Reduce {
+            reduction,
+            axes,
+            keepdims,
+        } => {
+            let (x, values) = (inputs.first()?, ints(0)?);
+            let (f, init): (fn(i64, i64) -> Option<i64>, i64) = match reduction {
+                Reduction::Sum => (i64::checked_add, 0),
+                Reduction::Prod => (i64::checked_mul, 1),
+                Reduction::Max => (|a, b| Some(a.max(b)), i64::MIN),
+                Reduction::Mean | Reduction::L2 => return None,
+            };
+            let axes = match inputs.get(1) {
+                Some(_) => ints(1)?.to_vec(),
+                None => axes.clone().unwrap_or_default(),
+            };
+            let rank = x.shape.len() as i64;
+            // No axes reduce all, as the kernels do.
+            let mut reduced = vec![axes.is_empty(); x.shape.len()];
+            for a in axes {
+                let a = if a < 0 { a + rank } else { a };
+                *reduced.get_mut(usize::try_from(a).ok()?)? = true;
+            }
+            // Each input element's output index, from its coordinates along
+            // the kept axes.
+            let kept: Vec<usize> = (0..x.shape.len())
+                .map(|d| if reduced[d] { 1 } else { x.shape[d] })
+                .collect();
+            let mut out = vec![init; kept.iter().product()];
+            for (flat, &v) in values.iter().enumerate() {
+                let (mut rest, mut at, mut stride) = (flat, 0, 1);
+                for d in (0..x.shape.len()).rev() {
+                    let coord = rest % x.shape[d];
+                    rest /= x.shape[d];
+                    if !reduced[d] {
+                        at += coord * stride;
+                        stride *= kept[d];
+                    }
+                }
+                out[at] = f(out[at], v)?;
+            }
+            let shape = if *keepdims {
+                kept
+            } else {
+                (0..x.shape.len())
+                    .filter(|&d| !reduced[d])
+                    .map(|d| x.shape[d])
+                    .collect()
+            };
+            (out, shape)
+        }
         Op::Reshape => {
             let (x, target) = (inputs.first()?, ints(1)?);
             let values = x.ints.clone()?;
@@ -1044,6 +1095,64 @@ mod tests {
             int64_data: v.to_vec(),
             ..Default::default()
         }
+    }
+
+    /// Integer reductions fold exactly, over all axes where none are given,
+    /// as torch's unbiased variance takes `n - 1` of a dimension; a product
+    /// that overflows stays.
+    #[test]
+    fn folds_integer_reductions() {
+        let reduce = |op: &str, input: &[&str], out: &str, axes: &[i64], keepdims: i64| {
+            let mut n = node(op, input, out);
+            n.attribute.push(AttributeProto {
+                name: "keepdims".to_string(),
+                i: keepdims,
+                r#type: 2, // INT
+                ..Default::default()
+            });
+            if !axes.is_empty() {
+                n.attribute.push(AttributeProto {
+                    name: "axes".to_string(),
+                    ints: axes.to_vec(),
+                    r#type: 7, // INTS
+                    ..Default::default()
+                });
+            }
+            n
+        };
+        let mut cast = node("Cast", &["n"], "nf");
+        cast.attribute.push(AttributeProto {
+            name: "to".to_string(),
+            i: DType::F32.to_onnx() as i64,
+            r#type: 2, // INT
+            ..Default::default()
+        });
+        let g = fold(GraphProto {
+            node: vec![
+                reduce("ReduceProd", &["dims"], "n", &[], 0),
+                cast,
+                node("Sub", &["nf", "one"], "y"),
+                reduce("ReduceSum", &["m"], "rows", &[1], 1),
+                reduce("ReduceMax", &["m", "last"], "max", &[], 0),
+                reduce("ReduceProd", &["huge"], "overflow", &[], 0),
+            ],
+            initializer: vec![
+                ints("dims", &[1], &[576]),
+                floats("one", &[], &[1.0]),
+                ints("m", &[2, 3], &[1, 5, 2, -4, -9, 3]),
+                ints("last", &[1], &[-1]),
+                ints("huge", &[2], &[1 << 40, 1 << 40]),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            g.node.iter().map(|n| n.op_type.as_str()).collect::<Vec<_>>(),
+            ["ReduceProd"]
+        );
+        let get = |name: &str| g.initializer.iter().find(|t| t.name == name).unwrap();
+        assert_eq!((&get("y").dims, &get("y").float_data), (&vec![], &vec![575.0]));
+        assert_eq!((&get("rows").dims, &get("rows").int64_data), (&vec![2, 1], &vec![8, -10]));
+        assert_eq!((&get("max").dims, &get("max").int64_data), (&vec![2], &vec![5, 3]));
     }
 
     /// Integer arithmetic on constants is folded exactly: integer division
