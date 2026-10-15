@@ -166,7 +166,7 @@ Convert an ONNX model into Rust source code:
 cargo run --release --bin lele_gen -- <model.onnx> <output.rs>
 ```
 
-This produces `<output.rs>` (the model code) and `<output>_weights.bin` (the weights).
+This produces `<output.rs>` (the model code) and `<output>_weights.bin` (the weights). `--shape input=1,512`, `--dim batch_size=1` and `--value sr=16000` compile the model for fixed inputs (see [Fixed Inputs](#fixed-inputs)).
 
 ### Option 2: Build-Script Integration (`lele-build`)
 
