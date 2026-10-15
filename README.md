@@ -194,6 +194,22 @@ fn main() -> lele_build::Result {
 
 `build_models` does the same for several models listed in one `model.toml`. Set `HF_ENDPOINT` to use a mirror, `LELE_SKIP_MODEL_GEN=1` to skip generation, and `LELE_FORCE_REGEN=1` to regenerate. If a download or the code generation fails, the build fails with the error.
 
+### Fixed Inputs
+
+A model that always runs on inputs of one shape, or with an input that never changes, can be compiled for them. Shape folding then resolves what depends on the fixed dimensions, constant folding what depends on the fixed values (an `If` on a fixed value runs its branch in place), and the workspace allocates its buffers once, up front:
+
+```toml
+[codegen.shapes]   # input shapes, by input name
+input = [1, 512]
+state = [2, 1, 128]
+[codegen.dims]     # named symbolic dimensions (`dim_param`), in every input
+batch_size = 1
+[codegen.values]   # inputs compiled in as constants: a number or a list
+sr = 16000
+```
+
+The `Compiler` takes the same settings: `with_input_shape("input", &[1, 512])`, `with_dim("batch_size", 1)` and `with_input_value("sr", 16000)`. The generated `forward` still takes every input, and panics on an input of another shape or value. When every tensor's shape is known, `<Model>Workspace::BYTES` gives the size of the workspace, which `<Model>Workspace::new` allocates and running the model never grows. With several models in one `model.toml`, each setting applies to the models that have the input or dimension it names.
+
 ### Running Examples
 
 ```bash
