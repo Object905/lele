@@ -172,14 +172,12 @@ pub fn conv1d_silu<'b, 'a>(
     strides: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let shape = conv1d_fused(
-        input, weights, bias, dilations, group, pads, strides, false, out,
-    )
-    .shape
-    .into_owned();
-    let len = shape.iter().product();
-    crate::kernels::bias_act::silu_inplace(&mut out[..len]);
-    TensorView::from_slice(&out[..len], shape)
+    use crate::kernels::bias_act::{Act, activated};
+    activated(Act::Silu, out, |out| {
+        conv1d_fused(
+            input, weights, bias, dilations, group, pads, strides, false, out,
+        )
+    })
 }
 
 /// `unfold_bytes` bounds the input unfolded whole ([`IM2COL_BYTES`]; others in tests).

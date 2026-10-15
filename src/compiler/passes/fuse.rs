@@ -32,6 +32,7 @@ pub(crate) fn fuse(g: &mut Graph) {
     fuse_dynamic_quant_linear(g);
     fuse_linear(g);
     fuse_swiglu(g);
+    fuse_product_act(g);
     fuse_embedding_concat(g);
     for id in g.node_ids() {
         for sub in g.node_mut(id).op.subgraphs_mut() {
@@ -1019,7 +1020,7 @@ fn fuse_linear(g: &mut Graph) {
         if let Some((mm, bias)) = fused {
             let inputs = vec![g.node(mm).input(0), g.node(mm).input(1), bias];
             let proto = named_after(g, mm);
-            g.fuse(&[mm, add], Op::Linear, proto, inputs);
+            g.fuse(&[mm, add], Op::Linear { act: None }, proto, inputs);
         }
     }
 }
@@ -1043,7 +1044,7 @@ fn fuse_swiglu(g: &mut Graph) {
         let fused = (0..2).find_map(|k| {
             let node = g.node(mul);
             let silu = sole_producer(g, node.input(k), |op| matches!(op, Op::Silu))?;
-            let linear = |op: &Op| matches!(op, Op::Linear);
+            let linear = |op: &Op| matches!(op, Op::Linear { act: None });
             let gate = sole_producer(g, g.node(silu).input(0), linear)?;
             let value = sole_producer(g, node.input(1 - k), linear)?;
             let (gn, vn) = (g.node(gate), g.node(value));
@@ -1170,8 +1171,81 @@ fn fuse_dynamic_quant_linear(g: &mut Graph) {
         });
         if let Some((nodes, inputs, relu)) = fused {
             let proto = named_after(g, add);
-            g.fuse(&nodes, Op::QLinearDynamic { relu }, proto, inputs);
+            let act = relu.then_some(Activation::Relu);
+            g.fuse(&nodes, Op::QLinearDynamic { act }, proto, inputs);
         }
+    }
+}
+
+/// An activation of a product → the product, applying it: `Relu`,
+/// `Sigmoid`, `Silu` or erf `Gelu` of a `MatMul`, `Linear`, `Gemm` or
+/// `QLinearDynamic` whose output nothing else reads. A `MatMul` becomes a
+/// `Linear` without a bias.
+///
+/// The product's kernel writes its output, and the activation then runs over
+/// it in place ([`activated`](crate::kernels::activated)) with the
+/// arithmetic of its own kernel, so the result is unchanged bit for bit; the
+/// activation needs no buffer of its own and no call.
+fn fuse_product_act(g: &mut Graph) {
+    let acts: Vec<(NodeId, Activation)> = g
+        .nodes()
+        .filter_map(|(id, n)| {
+            let act = match &n.op {
+                Op::Unary(Unary::Relu) => Activation::Relu,
+                Op::Unary(Unary::Sigmoid) => Activation::Sigmoid,
+                Op::Silu => Activation::Silu,
+                Op::Gelu { approximate } if approximate.as_deref().is_none_or(|a| a == "none") => {
+                    Activation::GeluErf
+                }
+                _ => return None,
+            };
+            Some((id, act))
+        })
+        .collect();
+    for (id, act) in acts {
+        let x = g.node(id).input(0);
+        // f16 is held as f32 and goes through the same kernels.
+        let float = x.is_some_and(|x| {
+            matches!(g.value(x).dtype, DType::F32 | DType::F16 | DType::Undefined)
+        });
+        let is_product = |op: &Op| {
+            matches!(
+                op,
+                Op::MatMul
+                    | Op::Linear { act: None }
+                    | Op::Gemm { act: None, .. }
+                    | Op::QLinearDynamic { act: None }
+            )
+        };
+        let Some(product) = sole_producer(g, x, is_product).filter(|_| float) else {
+            continue;
+        };
+        let node = g.node(product);
+        let mut inputs = node.inputs().to_vec();
+        let op = match node.op.clone() {
+            Op::MatMul => {
+                inputs.resize(3, None);
+                Op::Linear { act: Some(act) }
+            }
+            Op::Linear { .. } => Op::Linear { act: Some(act) },
+            Op::Gemm {
+                alpha,
+                beta,
+                trans_a,
+                trans_b,
+                ..
+            } => Op::Gemm {
+                alpha,
+                beta,
+                trans_a,
+                trans_b,
+                act: Some(act),
+            },
+            Op::QLinearDynamic { .. } => Op::QLinearDynamic { act: Some(act) },
+            _ => unreachable!(),
+        };
+        let proto = node.proto.clone();
+        g.fuse(&[product, id], op, proto, inputs);
     }
 }
 
@@ -1641,7 +1715,8 @@ mod tests {
             let (nodes, init) = graph(n, "x", swap);
             assert_eq!(fused(nodes, init), ["SwiGlu"], "swap {swap}");
         }
-        let unfused = ["Linear", "Silu", "Linear", "Mul"];
+        // Unfused, the gate's `Linear` applies the SiLU.
+        let unfused = ["Linear", "Linear", "Mul"];
         let (nodes, init) = graph(n + 1, "x", false);
         assert_eq!(fused(nodes, init), unfused);
         let (nodes, init) = graph(n, "z", false);
@@ -1681,6 +1756,70 @@ mod tests {
             node("Add", &["b", "m"], "y"),
         ];
         assert_eq!(fused(nodes, vec![]), ["Relu", "Linear"]);
+    }
+
+    /// FireRedVAD's `Linear` → `Relu` and output `Sigmoid`, a `MatMul` →
+    /// erf `Gelu` (MOSS, pocket) and a `Gemm` → `Silu`: each becomes the
+    /// product applying the activation. Not when another node reads the
+    /// product, nor a tanh `Gelu`.
+    #[test]
+    fn fuses_activations_into_products() {
+        let acts = |g: &Graph| -> Vec<(String, Option<Activation>)> {
+            g.nodes()
+                .map(|(_, n)| {
+                    let act = match &n.op {
+                        Op::Linear { act } | Op::Gemm { act, .. } => *act,
+                        _ => None,
+                    };
+                    (n.op.op_type().to_string(), act)
+                })
+                .collect()
+        };
+        let one = |product: NodeProto, act: NodeProto| fused_graph(vec![product, act], vec![]);
+        let linear = || {
+            vec![
+                node("MatMul", &["x", "w"], "m"),
+                node("Add", &["m", "b"], "p"),
+            ]
+        };
+        let mut nodes = linear();
+        nodes.push(node("Relu", &["p"], "y"));
+        let g = fused_graph(nodes, vec![]);
+        assert_eq!(acts(&g), [("Linear".into(), Some(Activation::Relu))]);
+        let mut nodes = linear();
+        nodes.push(node("Sigmoid", &["p"], "y"));
+        let g = fused_graph(nodes, vec![]);
+        assert_eq!(acts(&g), [("Linear".into(), Some(Activation::Sigmoid))]);
+
+        let g = one(node("MatMul", &["x", "w"], "p"), node("Gelu", &["p"], "y"));
+        assert_eq!(acts(&g), [("Linear".into(), Some(Activation::GeluErf))]);
+        assert_eq!(g.nodes().next().unwrap().1.input(2), None);
+        let nodes = vec![
+            node("Gemm", &["x", "w"], "p"),
+            node("Sigmoid", &["p"], "s"),
+            node("Mul", &["p", "s"], "y"),
+        ];
+        let g = fused_graph(nodes, vec![]);
+        assert_eq!(acts(&g), [("Gemm".into(), Some(Activation::Silu))]);
+
+        let mut tanh = node("Gelu", &["p"], "y");
+        tanh.attribute
+            .push(crate::model::onnx_proto::AttributeProto {
+                name: "approximate".to_string(),
+                s: b"tanh".to_vec(),
+                r#type: 3, // STRING
+                ..Default::default()
+            });
+        assert_eq!(
+            one(node("MatMul", &["x", "w"], "p"), tanh).nodes().count(),
+            2
+        );
+        let nodes = vec![
+            node("MatMul", &["x", "w"], "p"),
+            node("Relu", &["p"], "r"),
+            node("Add", &["p", "r"], "y"),
+        ];
+        assert_eq!(fused_graph(nodes, vec![]).nodes().count(), 3);
     }
 
     /// T-one's ScaleNorm: `gamma * (x / (ReduceL2(x) * scale + eps))`, of an

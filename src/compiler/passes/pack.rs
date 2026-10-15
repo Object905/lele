@@ -91,7 +91,7 @@ fn packable(g: &Graph, v: ValueId, skip: &dyn Fn(&Node) -> bool) -> Option<Packi
     let read_by = |id| {
         let node = g.node(id);
         let op_reads = match (&node.op, packing) {
-            (Op::MatMul | Op::Linear | Op::SwiGlu, Packing::Matrix) => true,
+            (Op::MatMul | Op::Linear { .. } | Op::SwiGlu, Packing::Matrix) => true,
             (Op::Conv(conv), Packing::Transposed) => is_pointwise(conv),
             _ => false,
         };

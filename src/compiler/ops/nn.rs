@@ -144,17 +144,19 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             beta,
             trans_a,
             trans_b,
+            act,
         } => {
             let c = if inputs.len() > 2 && !inputs[2].is_empty() {
                 format!("Some(&{})", inputs[2])
             } else {
                 "None".to_string()
             };
-            writeln!(
-                w,
-                "{}let {} = lele::kernels::gemm(&{}, &{}, {}, {:?}, {:?}, {}, {}, {});",
-                tab, outputs[0], inputs[0], inputs[1], c, alpha, beta, trans_a, trans_b, buf_expr
-            )?;
+            super::fused::write_product(w, &tab, &outputs[0], buf_expr, *act, |buf| {
+                format!(
+                    "lele::kernels::gemm(&{}, &{}, {c}, {alpha:?}, {beta:?}, {trans_a}, {trans_b}, {buf})",
+                    inputs[0], inputs[1]
+                )
+            })?;
         }
         Op::Lstm => {
             let bias = if inputs.len() > 3 && !ctx.node.input[3].is_empty() {

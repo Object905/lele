@@ -29,6 +29,7 @@ pub(crate) mod test_util;
 pub mod timing;
 pub mod utils;
 pub(crate) mod window2d;
+pub use bias_act::{Act, act_inplace, activated};
 pub use conv_integer::{ConvWeights, conv_integer, conv_integer_packed};
 pub use conv1d::{conv1d, conv1d_pointwise};
 pub use conv1d::{conv1d_fused, conv1d_silu};

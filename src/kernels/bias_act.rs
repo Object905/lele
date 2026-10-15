@@ -1,8 +1,9 @@
-//! Bias and activation applied in place to one row of a convolution output.
+//! Bias and activation applied in place to a convolution or product output.
 
 use crate::kernels::conv2d::Activation;
 use crate::kernels::simd::simd_call;
 use crate::kernels::simd_math as vm;
+use crate::tensor::TensorView;
 use fearless_simd::{Level, Simd};
 use fearless_simd_macros::simd;
 
@@ -90,23 +91,78 @@ macro_rules! map_inplace {
     }};
 }
 
-/// `data[i] = silu(data[i])`, element for element as
-/// [`silu`](crate::kernels::silu) computes it.
-pub(crate) fn silu_inplace(data: &mut [f32]) {
+/// An activation applied in place to the output of a product or a
+/// convolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Act {
+    Relu,
+    Silu,
+    Sigmoid,
+    /// GELU as [`gelu_erf`](crate::kernels::gelu_erf) computes it.
+    GeluErf,
+}
+
+/// `data[i] = act(data[i])`, element for element as the activation's own
+/// kernel ([`relu`](crate::kernels::relu), [`silu`](crate::kernels::silu),
+/// [`sigmoid`](crate::kernels::sigmoid), [`gelu_erf`](crate::kernels::gelu_erf))
+/// computes it.
+pub fn act_inplace(act: Act, data: &mut [f32]) {
     let level = Level::new();
+    let run = |data: &mut [f32]| match act {
+        Act::Relu => simd_call!(level, max = Avx2, relu_simd(data)),
+        Act::Silu => simd_call!(level, max = Avx2, silu_simd(data)),
+        Act::Sigmoid => simd_call!(level, max = Avx2, sigmoid_simd(data)),
+        Act::GeluErf => simd_call!(level, max = Avx2, gelu_erf_simd(data)),
+    };
+    // Shorter than a vector: through a padded copy, as those kernels do.
     if data.len() < 16 {
         let mut padded = [0.0f32; 16];
         padded[..data.len()].copy_from_slice(data);
-        simd_call!(level, max = Avx2, silu_simd(&mut padded));
+        run(&mut padded);
         data.copy_from_slice(&padded[..data.len()]);
     } else {
-        simd_call!(level, max = Avx2, silu_simd(data));
+        run(data);
     }
+}
+
+/// The output of `product`, which writes it to the start of `out`, with
+/// `act` applied in place ([`act_inplace`]): what the activation's kernel
+/// would make of it, without a buffer for the product alone.
+pub fn activated<'a, F>(act: Act, out: &'a mut Vec<f32>, product: F) -> TensorView<'a>
+where
+    F: for<'b> FnOnce(&'b mut Vec<f32>) -> TensorView<'b>,
+{
+    let (shape, len, at) = {
+        let y = product(out);
+        let at = y.data.as_ptr();
+        (y.shape.into_owned(), y.data.len(), at)
+    };
+    assert!(
+        std::ptr::eq(at, out.as_ptr()),
+        "activated: the product is not at the start of its buffer"
+    );
+    act_inplace(act, &mut out[..len]);
+    TensorView::from_slice(&out[..len], shape)
+}
+
+#[simd]
+fn relu_simd<S: Simd>(simd: S, data: &mut [f32]) {
+    map_inplace!(simd, data, vm::relu)
 }
 
 #[simd]
 fn silu_simd<S: Simd>(simd: S, data: &mut [f32]) {
     map_inplace!(simd, data, vm::silu)
+}
+
+#[simd]
+fn sigmoid_simd<S: Simd>(simd: S, data: &mut [f32]) {
+    map_inplace!(simd, data, vm::sigmoid)
+}
+
+#[simd]
+fn gelu_erf_simd<S: Simd>(simd: S, data: &mut [f32]) {
+    map_inplace!(simd, data, vm::gelu_erf)
 }
 
 #[inline(always)]
@@ -170,6 +226,52 @@ mod tests {
                 assert!(data.iter().all(|&v| v == 1.0), "{level:?} len {len}");
             }
         }
+    }
+
+    /// `act_inplace` is each activation's own kernel, bit for bit, at every
+    /// length, signed zeros and saturating values included.
+    #[test]
+    fn test_act_inplace_is_the_activation_kernel() {
+        use crate::kernels::test_util::assert_same_bits;
+        let mut rng = Rng::new(3);
+        for &len in AWKWARD_LENS {
+            let mut src = rng.vec(len, -12.0, 12.0);
+            for (x, special) in src.iter_mut().zip([-0.0, 0.0, 100.0, -100.0]) {
+                *x = special;
+            }
+            let x = TensorView::from_slice(&src, vec![len]);
+            for act in [Act::Relu, Act::Silu, Act::Sigmoid, Act::GeluErf] {
+                let mut buf = Vec::new();
+                let want = match act {
+                    Act::Relu => crate::kernels::relu(&x, &mut buf),
+                    Act::Silu => crate::kernels::silu(&x, &mut buf),
+                    Act::Sigmoid => crate::kernels::sigmoid(&x, &mut buf),
+                    Act::GeluErf => crate::kernels::gelu_erf(&x, &mut buf),
+                };
+                let mut got = src.clone();
+                act_inplace(act, &mut got);
+                assert_same_bits(&got, &want.data, &format!("{act:?} len {len}"));
+            }
+        }
+    }
+
+    /// `activated` hands the product its buffer and applies the activation to
+    /// what it wrote, keeping its shape.
+    #[test]
+    fn test_activated_is_the_product_then_the_activation() {
+        use crate::kernels::test_util::assert_same_bits;
+        let mut rng = Rng::new(5);
+        let (a, b) = (rng.vec(3 * 20, -1.0, 1.0), rng.vec(20 * 24, -1.0, 1.0));
+        let a = TensorView::from_slice(&a, vec![3, 20]);
+        let b = TensorView::from_slice(&b, vec![20, 24]);
+        let (mut p, mut r, mut out) = (Vec::new(), Vec::new(), Vec::new());
+        let product = crate::kernels::matmul(&a, &b, &mut p);
+        let want = crate::kernels::gelu_erf(&product, &mut r);
+        let got = activated(Act::GeluErf, &mut out, |out| {
+            crate::kernels::matmul(&a, &b, out)
+        });
+        assert_eq!(got.shape, want.shape);
+        assert_same_bits(&got.data, &want.data, "matmul then gelu");
     }
 
     #[test]
