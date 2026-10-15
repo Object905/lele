@@ -316,8 +316,9 @@ mod tests {
         }
     }
 
-    /// `y = Relu(x)` and the positions along the first dimension of `x`, for
-    /// `x` of shape `[N, 4]`, and whether the sample rate `sr` is 16000.
+    /// `y = Relu(x)`, `y` plus a `[7, 1, 4]` constant, and the positions
+    /// along the first dimension of `x`, for `x` of shape `[N, 4]`, and
+    /// whether the sample rate `sr` is 16000.
     fn graph() -> GraphProto {
         let int = |name: &str, v: i64| TensorProto {
             name: name.to_string(),
@@ -325,9 +326,22 @@ mod tests {
             int64_data: vec![v],
             ..Default::default()
         };
+        let mut constant = node("Constant", &[], "c");
+        constant.attribute = vec![crate::model::onnx_proto::AttributeProto {
+            name: "value".to_string(),
+            t: Some(TensorProto {
+                data_type: DType::F32.to_onnx(),
+                dims: vec![7, 1, 4],
+                float_data: vec![0.5; 28],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
         GraphProto {
             node: vec![
                 node("Relu", &["x"], "y"),
+                constant,
+                node("Add", &["c", "y"], "z"),
                 node("Shape", &["x"], "s"),
                 node("Gather", &["s", "zero"], "n"),
                 node("Range", &["zero", "n", "one"], "positions"),
@@ -338,7 +352,7 @@ mod tests {
                 input("x", DType::F32, &["N", "4"]),
                 input("sr", DType::I64, &[]),
             ],
-            output: ["y", "positions", "is_16k"]
+            output: ["z", "positions", "is_16k"]
                 .iter()
                 .map(|o| ValueInfoProto {
                     name: o.to_string(),
@@ -377,6 +391,43 @@ mod tests {
             assert!(code.contains(check), "{code}");
             assert!(!code.contains(r#""sr""#), "{code}");
         }
+    }
+
+    /// With every shape fixed, the workspace allocates each buffer when made,
+    /// at the size of its largest tensor. A constant, read from the weights,
+    /// takes none.
+    #[test]
+    fn fixed_shapes_size_the_workspace() {
+        // Only the buffer of the scalars `n` and `is_16k` has a fixed size.
+        let general = code(Compiler::new());
+        assert_eq!(
+            general.matches("Vec::with_capacity(").count(),
+            1,
+            "{general}"
+        );
+        assert!(general.contains("Vec::with_capacity(1),"), "{general}");
+        assert!(general.contains("..Default::default()"), "{general}");
+        assert!(!general.contains("BYTES"), "{general}");
+        let fixed = code(
+            Compiler::new()
+                .with_dim("N", 2)
+                .with_input_value("sr", 16000),
+        );
+        let reserved: Vec<&str> = fixed
+            .lines()
+            .filter(|l| l.contains("Vec::with_capacity("))
+            .map(str::trim)
+            .collect();
+        // `y` (2 x 4) and `z` (7 x 2 x 4), in f32.
+        assert_eq!(
+            reserved,
+            [
+                "buf_0: Vec::with_capacity(8),",
+                "buf_1: Vec::with_capacity(56),"
+            ],
+            "{fixed}"
+        );
+        assert!(fixed.contains("pub const BYTES: usize = 256;"), "{fixed}");
     }
 
     /// An input compiled in is folded where it is read, and `forward` still

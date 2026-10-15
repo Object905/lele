@@ -380,9 +380,39 @@ impl Compiler {
             }
         }
         writeln!(&mut code, "}}")?;
+        // Buffers whose tensors all have fixed shapes are allocated once, at
+        // their largest size, when the workspace is made.
+        let mut used: Vec<usize> = used_buffers.iter().copied().collect();
+        used.sort();
+        let sized: Vec<(usize, usize)> = used
+            .iter()
+            .filter_map(|&b| Some((b, allocator.buffer_lens[b]?)))
+            .collect();
         writeln!(&mut code, "impl {}Workspace {{", struct_name)?;
+        if sized.len() == used.len() {
+            let bytes: usize = sized
+                .iter()
+                .map(|&(b, len)| len * allocator.buffer_types[b].size())
+                .sum();
+            writeln!(
+                &mut code,
+                "    /// Bytes of the buffers `new` allocates. Every tensor's shape is fixed, so the buffers never grow."
+            )?;
+            writeln!(&mut code, "    pub const BYTES: usize = {bytes};")?;
+        }
         writeln!(&mut code, "    pub fn new() -> Self {{")?;
-        writeln!(&mut code, "        Self::default()")?;
+        if sized.is_empty() {
+            writeln!(&mut code, "        Self::default()")?;
+        } else {
+            writeln!(&mut code, "        Self {{")?;
+            for (b, len) in &sized {
+                writeln!(&mut code, "            buf_{b}: Vec::with_capacity({len}),")?;
+            }
+            if sized.len() < used.len() {
+                writeln!(&mut code, "            ..Default::default()")?;
+            }
+            writeln!(&mut code, "        }}")?;
+        }
         writeln!(&mut code, "    }}")?;
         writeln!(&mut code, "}}")?;
         // Main struct: wraps the weights and derefs to them, so the weight
