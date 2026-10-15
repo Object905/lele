@@ -153,6 +153,12 @@ impl VarTypes {
 
 /// Expression reading weight `w` from the weights file as `target`.
 pub(crate) fn weight_expr(w: &WeightRef, target: ElemType) -> String {
+    if let Some(v) = w.scalar {
+        return match target {
+            ElemType::I64 => format!("lele::scalar({v}i64)"),
+            ElemType::F32 => format!("lele::scalar({:?}f32)", v as f32),
+        };
+    }
     let accessor = match target {
         ElemType::I64 => match w.dtype {
             DType::I32 => "weight_i32_i64",
@@ -591,6 +597,7 @@ fn outlives_chunk(body: &str, var: &str, depth: usize) -> bool {
         // A tensor owning its data moves out of the chunk.
         if rhs.contains("&mut ws.buf_")
             || rhs.starts_with("self.weight_")
+            || rhs.starts_with("lele::scalar(")
             || rhs.starts_with("lele::kernels::scatter_nd_owned(")
         {
             return true;
@@ -932,7 +939,7 @@ mod tests {
         let result = generate_one(&div, &weights, &Compiler::new(), &var_types);
         assert!(
             result.contains(
-                "let anchor = lele::kernels::div_trunc(&indices, &self.weight_i64_f32(16, 8, &[]), &mut buf_anchor);"
+                "let anchor = lele::kernels::div_trunc(&indices, &lele::scalar(80.0f32), &mut buf_anchor);"
             ),
             "{result}"
         );

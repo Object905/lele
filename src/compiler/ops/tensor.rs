@@ -2,7 +2,7 @@
 //! quantization.
 
 use super::super::{
-    generate::{ElemType, OpContext},
+    generate::{ElemType, OpContext, weight_expr},
     ir::{DType, Op, TargetDim},
 };
 use crate::compiler::passes::{ACT_REQUANT, I8_BIAS, I8_REQUANT};
@@ -480,7 +480,13 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             )?;
         }
         op @ (Op::Identity | Op::Constant { .. }) => {
-            if let Some(weight) = ctx.weights.get(&ctx.node.output[0]) {
+            if let Some(weight) = ctx.weights.get(&ctx.node.output[0])
+                && weight.dtype == DType::I64
+                && weight.scalar.is_some()
+            {
+                let weight = weight_expr(weight, ElemType::I64);
+                writeln!(w, "{}let {} = {};", tab, outputs[0], weight)?;
+            } else if let Some(weight) = ctx.weights.get(&ctx.node.output[0]) {
                 let weight_fn = match weight.dtype {
                     DType::U8 => "weight_u8",
                     DType::I8 => "weight_i8",
