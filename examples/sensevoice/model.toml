@@ -15,4 +15,3 @@ dest = "sensevoice.int8.tokens.txt"
 [codegen]
 class_name = "SenseVoice"
 model_file = "sensevoice.int8.onnx"
-custom_methods = ["embedding_concat"]

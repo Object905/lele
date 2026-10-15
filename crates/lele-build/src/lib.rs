@@ -97,8 +97,6 @@ pub mod config {
         pub class_name: String,
         #[serde(default)]
         pub model_file: Option<String>,
-        #[serde(default)]
-        pub custom_methods: Vec<String>,
         /// The inputs the model is compiled for.
         #[serde(flatten)]
         pub inputs: InputConfig,
@@ -410,7 +408,6 @@ pub fn generate_model_code(
     model_path: impl AsRef<Path>,
     class_name: &str,
     output_dir: impl AsRef<Path>,
-    _custom_methods: &[String],
 ) -> Result {
     generate_model_code_for(model_path, class_name, output_dir, &Default::default())
 }

@@ -63,7 +63,7 @@ fn main() -> Result {
     }
 
     for (onnx, class_name) in stale {
-        generate_model_code(onnx, class_name, output_dir, &[])?;
+        generate_model_code(onnx, class_name, output_dir)?;
     }
 
     Ok(())
