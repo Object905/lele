@@ -443,11 +443,18 @@ impl Compiler {
         writeln!(&mut code, "}}")?;
         writeln!(&mut code, "\nimpl<'a> {}<'a> {{", struct_name)?;
         writeln!(&mut code, "    pub fn new(data: &'a [u8]) -> Self {{")?;
-        // f16, u8 and i8 weights read as f32 are widened once, here, not on
-        // every read; those the kernels take as they are stored are left so.
+        // f16, u8 and i8 weights read as f32, and i32 and bool ones read as
+        // i64, are widened once, here, not on every read; those the kernels
+        // take as they are stored are left so.
         let mut weights_expr = "lele::runtime::Weights::new(data)".to_string();
         use ir::DType;
-        for (dtype, ty) in [(DType::F16, "f16"), (DType::U8, "u8"), (DType::I8, "i8")] {
+        for (dtype, ty) in [
+            (DType::F16, "f16"),
+            (DType::U8, "u8"),
+            (DType::I8, "i8"),
+            (DType::I32, "i32_i64"),
+            (DType::Bool, "bool_i64"),
+        ] {
             let read: Vec<_> = weights
                 .regions(dtype)
                 .into_iter()
