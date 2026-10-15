@@ -91,7 +91,8 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 Some(_) => format!("Some(&{})", inputs[2]),
                 None => "None".to_string(),
             };
-            if *act == Activation::Silu {
+            // 1-D SiLU goes with the 1-D kernels below.
+            if *act == Activation::Silu && weight_shape.len() != 3 {
                 // Attributes as written, with ONNX defaults.
                 let ints = |v: &Option<Vec<i64>>, default: &[i64]| {
                     v.clone().unwrap_or_else(|| default.to_vec())
@@ -139,10 +140,14 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                     outputs[0], inputs[0], inputs[1], dilations, pads, strides,
                 )?;
             } else {
+                let (kernel, relu) = match act {
+                    Activation::Silu => ("conv1d_silu", ""),
+                    _ => ("conv1d_fused", " true,"),
+                };
                 // Pads are [begin, end], or [begin, _, end, _] as computed above.
                 writeln!(
                     w,
-                    "{tab}let {} = lele::kernels::conv1d_fused(&{}, &{}, {bias}, &[{}], {groups}, &[{}, {}], &[{}], true, {buf});",
+                    "{tab}let {} = lele::kernels::{kernel}(&{}, &{}, {bias}, &[{}], {groups}, &[{}, {}], &[{}],{relu} {buf});",
                     outputs[0],
                     inputs[0],
                     inputs[1],

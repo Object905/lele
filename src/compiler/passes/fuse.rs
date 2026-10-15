@@ -806,7 +806,8 @@ fn fuse_conv_bias(g: &mut Graph) {
     }
 }
 
-/// `Conv` followed by `Relu`, or a 2D `Conv` followed by `Silu` → `ConvAct`.
+/// `Conv` followed by `Relu`, or a 2D or non-pointwise 1D `Conv` followed by
+/// `Silu` → `ConvAct`.
 fn fuse_conv_act(g: &mut Graph) {
     let acts: Vec<(NodeId, Activation)> = g
         .nodes()
@@ -827,8 +828,16 @@ fn fuse_conv_act(g: &mut Graph) {
         let Op::Conv(attrs) = g.node(conv).op.clone() else {
             unreachable!()
         };
-        // Only the 2D kernel fuses SiLU.
-        if act == Activation::Silu && attrs.kernel_shape.as_ref().is_none_or(|k| k.len() < 2) {
+        // SiLU fuses into a 2D kernel, or into a 1D one whose constant weights
+        // say it is 1D; not into a pointwise one, whose weights are read by
+        // the matrix product kernels, packed.
+        let weight_dims = constant_tensor(g, g.node(conv).input(1)).map(|w| w.dims.as_slice());
+        let silu_fuses = match (attrs.kernel_shape.as_deref(), weight_dims) {
+            (_, Some(&[_, _, k])) => k > 1,
+            (Some(k), _) => k.len() >= 2,
+            (None, _) => false,
+        };
+        if act == Activation::Silu && !silu_fuses {
             continue;
         }
         let inputs = g.node(conv).inputs().to_vec();
@@ -1305,6 +1314,26 @@ mod tests {
             node("Mul", &["c", "s"], "y"),
         ];
         assert_eq!(fused(nodes, vec![]), ["ConvAct"]);
+
+        // A 1D one, as T-one's depthwise convolution, fuses; a pointwise one,
+        // and one whose rank is not known, do not.
+        let weights = |dims: &[i64]| TensorProto {
+            name: "w".to_string(),
+            data_type: DType::F32.to_onnx(),
+            dims: dims.to_vec(),
+            float_data: vec![0.5; dims.iter().product::<i64>() as usize],
+            ..Default::default()
+        };
+        let nodes = || {
+            vec![
+                node("Conv", &["x", "w"], "c"),
+                node("Sigmoid", &["c"], "s"),
+                node("Mul", &["c", "s"], "y"),
+            ]
+        };
+        assert_eq!(fused(nodes(), vec![weights(&[4, 1, 31])]), ["ConvAct"]);
+        assert_eq!(fused(nodes(), vec![weights(&[4, 4, 1])]), ["Conv", "Silu"]);
+        assert_eq!(fused(nodes(), vec![]), ["Conv", "Silu"]);
     }
 
     #[test]
