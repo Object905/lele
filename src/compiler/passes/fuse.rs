@@ -482,6 +482,57 @@ fn fuse_scale_norm(g: &mut Graph) {
     }
 }
 
+/// A `ScaleNorm` of the result of another → `ScaleNormPair`, run where the
+/// first ran, whose result other nodes may read too (T-one's `norm_out`
+/// feeds the next layer's residual and its `norm_feed_forward1`). The second
+/// norm's gamma must be an initializer, to be there at that point.
+///
+/// Runs after [`bypass_view_casts`](super::bypass_view_casts): T-one casts
+/// each norm's result to f16 and back to f32 before the next, which lele
+/// holds alike.
+pub(crate) fn fuse_scale_norm_pairs(g: &mut Graph) {
+    for id in g.node_ids() {
+        for sub in g.node_mut(id).op.subgraphs_mut() {
+            fuse_scale_norm_pairs(sub);
+        }
+    }
+    for second in g.node_ids() {
+        if !g.contains(second) {
+            continue;
+        }
+        let node = g.node(second);
+        let Op::ScaleNorm {
+            scale: next_scale,
+            epsilon: next_epsilon,
+        } = node.op
+        else {
+            continue;
+        };
+        let (y, next_gamma) = (node.input(0), node.input(1));
+        let Some(first) = y.and_then(|y| g.value(y).producer()) else {
+            continue;
+        };
+        let Op::ScaleNorm { scale, epsilon } = g.node(first).op else {
+            continue;
+        };
+        if next_gamma.is_none_or(|v| g.data(v).is_none()) {
+            continue;
+        }
+        let op = Op::ScaleNormPair {
+            scale,
+            epsilon,
+            next_scale,
+            next_epsilon,
+        };
+        let inputs = vec![g.node(first).input(0), g.node(first).input(1), next_gamma];
+        let outputs = vec![y, g.node(second).output(0)];
+        let proto = named_after(g, first);
+        g.remove_node(first);
+        g.remove_node(second);
+        g.insert_node(first, op, proto, inputs, outputs);
+    }
+}
+
 /// An unscaled RMSNorm, `x * (1 / sqrt(ReduceMean(x^2) + eps))` over the
 /// last axis of an `x` of known width, ending in `Mul` node `mul`: its nodes,
 /// `x`, `eps` and the width.
@@ -1612,6 +1663,90 @@ mod tests {
         let mut nodes = nodes(false);
         nodes[1].attribute[0].ints = vec![1];
         assert_eq!(fused(nodes, constants).len(), 6);
+    }
+
+    /// T-one's layer boundary: `norm_out` of a layer, read by the next one's
+    /// residual and by its `norm_feed_forward1`, becomes one `ScaleNormPair`
+    /// where `norm_out` ran, before the residual. A second gamma that is not an
+    /// initializer (here a `Constant` node) leaves both norms.
+    #[test]
+    fn fuses_scale_norm_pairs() {
+        let norm = |x: &str, gamma: &str, y: &str| {
+            let name = |s: &str| format!("{y}_{s}");
+            let mut l2 = node("ReduceL2", &[x], &name("norm"));
+            l2.attribute.push(crate::model::onnx_proto::AttributeProto {
+                name: "axes".to_string(),
+                ints: vec![-1],
+                ..Default::default()
+            });
+            vec![
+                l2,
+                node("Mul", &[&name("norm"), "scale"], &name("scaled")),
+                node("Add", &[&name("scaled"), "eps"], &name("denom")),
+                node("Div", &[x, &name("denom")], &name("normed")),
+                node("Mul", &[gamma, &name("normed")], y),
+            ]
+        };
+        let graph = |constant_gamma: bool| {
+            let mut cast = node("Cast", &["input"], "x");
+            cast.attribute
+                .push(crate::model::onnx_proto::AttributeProto {
+                    name: "to".to_string(),
+                    i: 1,
+                    ..Default::default()
+                });
+            let mut nodes = vec![cast];
+            if constant_gamma {
+                let mut constant = node("Constant", &[], "gamma2");
+                constant
+                    .attribute
+                    .push(crate::model::onnx_proto::AttributeProto {
+                        name: "value".to_string(),
+                        t: Some(scalar("", 2.0)),
+                        ..Default::default()
+                    });
+                nodes.push(constant);
+            }
+            nodes.extend(norm("x", "gamma1", "y1"));
+            nodes.push(node("Add", &["y1", "x"], "residual"));
+            nodes.extend(norm("y1", "gamma2", "y2"));
+            nodes.push(node("Add", &["residual", "y2"], "out"));
+            let mut init = vec![
+                scalar("scale", 0.5),
+                scalar("eps", 1e-8),
+                scalar("gamma1", 1.5),
+            ];
+            if !constant_gamma {
+                init.push(scalar("gamma2", 2.0));
+            }
+            (nodes, init)
+        };
+        let paired = |(nodes, init): (Vec<NodeProto>, Vec<TensorProto>)| {
+            let mut ir = Graph::from_onnx(GraphProto {
+                node: nodes,
+                initializer: init,
+                output: vec![ValueInfoProto {
+                    name: "out".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            crate::compiler::passes::infer_dtypes(&mut ir);
+            fuse(&mut ir);
+            fuse_scale_norm_pairs(&mut ir);
+            ir.nodes()
+                .map(|(_, n)| n.op.op_type().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paired(graph(false)),
+            ["Cast", "ScaleNormPair", "Add", "Add"]
+        );
+        let ops = paired(graph(true));
+        assert_eq!(
+            ops,
+            ["Cast", "Constant", "ScaleNorm", "Add", "ScaleNorm", "Add"]
+        );
     }
 
     /// RMSNorm as SmolLM2 writes it, and as Hojo-TTS does, scaling in f16

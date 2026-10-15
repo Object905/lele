@@ -86,6 +86,7 @@ pub(crate) fn dispatch_builtin(ctx: &mut OpContext, w: &mut dyn Write) -> std::i
         | Op::QLinearDynamic { .. }
         | Op::RmsNorm { .. }
         | Op::ScaleNorm { .. }
+        | Op::ScaleNormPair { .. }
         | Op::SimAm { .. }
         | Op::Silu
         | Op::Snake

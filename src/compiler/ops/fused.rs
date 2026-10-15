@@ -34,6 +34,31 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             "{tab}let {} = lele::kernels::scale_norm(&{}, &{}, {scale:?}, {epsilon:?}, {buf});",
             outputs[0], inputs[0], inputs[1]
         )?,
+        Op::ScaleNormPair {
+            scale,
+            epsilon,
+            next_scale,
+            next_epsilon,
+        } => {
+            // Each result into its workspace buffer, or one local to the chunk.
+            let mut bufs = Vec::new();
+            for (raw, out) in ctx.node.output.iter().zip(outputs) {
+                bufs.push(
+                    match ctx.allocator.and_then(|a| a.tensor_to_buffer.get(raw)) {
+                        Some(idx) => format!("&mut ws.buf_{idx}"),
+                        None => {
+                            writeln!(w, "{tab}let mut buf_{out} = Vec::<f32>::new();")?;
+                            format!("&mut buf_{out}")
+                        }
+                    },
+                );
+            }
+            writeln!(
+                w,
+                "{tab}let ({}, {}) = lele::kernels::scale_norm_pair(&{}, &{}, {scale:?}, {epsilon:?}, &{}, {next_scale:?}, {next_epsilon:?}, {}, {});",
+                outputs[0], outputs[1], inputs[0], inputs[1], inputs[2], bufs[0], bufs[1]
+            )?;
+        }
         Op::RmsNorm { epsilon } => writeln!(
             w,
             "{tab}let {} = lele::kernels::rms_norm(&{}, &{}, -1, {epsilon:?}, {buf});",

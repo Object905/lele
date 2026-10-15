@@ -662,6 +662,7 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
         | Op::Snake
         | Op::Softmax { .. }
         | Op::Trilu { .. } => first(shape(0)),
+        Op::ScaleNormPair { .. } => vec![shape(0); n_out],
         Op::DynamicQuantizeLinear => {
             let mut out = vec![shape(0), Some(Vec::new()), Some(Vec::new())];
             out.truncate(n_out);

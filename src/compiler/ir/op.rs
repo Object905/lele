@@ -530,6 +530,15 @@ pub enum Op {
         scale: f32,
         epsilon: f32,
     },
+    /// A `ScaleNorm` of `x`, then one of its result: both results, as
+    /// T-one's layers end and begin. Inputs: `[x, gamma, next_gamma]`;
+    /// outputs: `[y, next]`.
+    ScaleNormPair {
+        scale: f32,
+        epsilon: f32,
+        next_scale: f32,
+        next_epsilon: f32,
+    },
     /// `x / sqrt(ReduceMean(x^2, last axis) + epsilon) * gamma` (RMSNorm).
     /// Inputs: `[x, gamma]`.
     RmsNorm {
@@ -855,6 +864,7 @@ impl Op {
             Op::Silu => "Silu",
             Op::Snake => "Snake",
             Op::ScaleNorm { .. } => "ScaleNorm",
+            Op::ScaleNormPair { .. } => "ScaleNormPair",
             Op::RmsNorm { .. } => "RmsNorm",
             Op::SimAm { .. } => "SimAm",
             Op::Linear => "Linear",
@@ -1014,6 +1024,17 @@ impl Op {
             Op::ScaleNorm { scale, epsilon } => {
                 set_attr_f(attrs, "scale", scale, 1.0);
                 set_attr_f(attrs, "epsilon", epsilon, 0.0);
+            }
+            Op::ScaleNormPair {
+                scale,
+                epsilon,
+                next_scale,
+                next_epsilon,
+            } => {
+                set_attr_f(attrs, "scale", scale, 1.0);
+                set_attr_f(attrs, "epsilon", epsilon, 0.0);
+                set_attr_f(attrs, "next_scale", next_scale, 1.0);
+                set_attr_f(attrs, "next_epsilon", next_epsilon, 0.0);
             }
             Op::RmsNorm { epsilon } => set_attr_f(attrs, "epsilon", epsilon, 0.0),
             Op::SimAm {
