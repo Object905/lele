@@ -1434,7 +1434,10 @@ mod tests {
             .code;
         let line = code.lines().find(|l| l.contains("let r = ")).unwrap_or_else(|| panic!("{code}"));
         assert!(line.contains("lele::kernels::conv1d_fused(&x, "), "{line}");
-        assert!(line.contains("&[0, 1], &[1], true, "), "{line}");
+        assert!(
+            line.contains("&[0, 1], &[1], Some(lele::kernels::Act::Relu), "),
+            "{line}"
+        );
     }
 
     /// A chunk returns what later chunks read. The nodes of `If` branches

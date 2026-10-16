@@ -53,7 +53,7 @@ lele is not an interpreter. It **compiles ONNX graphs into Rust source code** at
   - **LayerNorm**: 9-node subgraph (ReduceMean→Sub→Pow→ReduceMean→Add→Sqrt→Div→Mul→Add) → one `layer_norm` call
   - **GELU**: 5-node subgraph (Div→Erf→Add→Mul→Mul) → one `gelu` call
   - **Conv + Add(bias)**: Conv→Add → single-pass fused bias convolution
-  - **Conv + SiLU**: Conv→Sigmoid→Mul → single-pass `conv2d_silu`
+  - **Conv + SiLU**: Conv→Sigmoid→Mul → single-pass `conv2d_fused` with SiLU
   - **Conv + ReLU**, **SiLU** (single / double / triple), **Linear** (MatMul→Add), **Embedding Concat**, **Quantized Linear** (6-node DynamicQuantizeLinear chain)
 - **Constant folding**: Shape, Unsqueeze, Squeeze, Concat, Slice, Cast, and ConstantOfShape with all-constant inputs are evaluated at compile time and removed from the graph.
 - **Buffer allocation**: Liveness analysis assigns each tensor to a reusable workspace buffer with zero-copy aliasing for Reshape/Squeeze/Unsqueeze/Identity/Cast.

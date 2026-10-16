@@ -148,11 +148,6 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             inputs[2]
         )?,
         Op::ConvAct { conv, act } => {
-            // What `fuse_conv_act` makes.
-            assert!(
-                matches!(act, Activation::Relu | Activation::Silu),
-                "ConvAct with {act:?}"
-            );
             let weight_shape = ctx
                 .weight(1)
                 .map(|weight| weight.shape.clone())
@@ -161,25 +156,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 Some(_) => format!("Some(&{})", inputs[2]),
                 None => "None".to_string(),
             };
-            // 1-D SiLU goes with the 1-D kernels below.
-            if *act == Activation::Silu && weight_shape.len() != 3 {
-                // Attributes as written, with ONNX defaults.
-                let ints = |v: &Option<Vec<i64>>, default: &[i64]| {
-                    v.clone().unwrap_or_else(|| default.to_vec())
-                };
-                writeln!(
-                    w,
-                    "{tab}let {} = lele::kernels::conv2d_silu(&{}, &{}, {bias}, &{:?}, {}, &{:?}, &{:?}, {buf});",
-                    outputs[0],
-                    inputs[0],
-                    inputs[1],
-                    ints(&conv.dilations, &[1, 1]),
-                    conv.group.unwrap_or(1),
-                    ints(&conv.pads, &[0, 0, 0, 0]),
-                    ints(&conv.strides, &[1, 1]),
-                )?;
-                return Ok(());
-            }
+            let act = act_arg(Some(*act));
             let strides = ConvAttrs::per_axis(&conv.strides);
             let dilations = ConvAttrs::per_axis(&conv.dilations);
             let groups = conv.group.unwrap_or(1) as usize;
@@ -206,18 +183,14 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             if weight_shape.len() >= 4 {
                 writeln!(
                     w,
-                    "{tab}let {} = lele::kernels::conv2d_fused(&{}, &{}, {bias}, &{:?}, {groups}, &{:?}, &{:?}, true, {buf});",
+                    "{tab}let {} = lele::kernels::conv2d_fused(&{}, &{}, {bias}, &{:?}, {groups}, &{:?}, &{:?}, {act}, {buf});",
                     outputs[0], inputs[0], inputs[1], dilations, pads, strides,
                 )?;
             } else {
-                let (kernel, relu) = match act {
-                    Activation::Silu => ("conv1d_silu", ""),
-                    _ => ("conv1d_fused", " true,"),
-                };
                 // Pads are [begin, end], or [begin, _, end, _] as computed above.
                 writeln!(
                     w,
-                    "{tab}let {} = lele::kernels::{kernel}(&{}, &{}, {bias}, &[{}], {groups}, &[{}, {}], &[{}],{relu} {buf});",
+                    "{tab}let {} = lele::kernels::conv1d_fused(&{}, &{}, {bias}, &[{}], {groups}, &[{}, {}], &[{}], {act}, {buf});",
                     outputs[0],
                     inputs[0],
                     inputs[1],

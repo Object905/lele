@@ -319,7 +319,8 @@ pub fn matmul_fused_add_act<'a, B: WeightElem>(
     // How the bias broadcasts against the output.
     let bias_shape = utils::broadcast_shapes(&out_shape, &bias.shape);
     assert!(
-        bias_shape.as_ref() == Some(&out_shape) && bias_data.len() == bias.shape.iter().product(),
+        bias_shape.as_ref() == Some(&out_shape)
+            && bias_data.len() == bias.shape.iter().product::<usize>(),
         "MatMul output {out_shape:?} and bias {:?} do not broadcast",
         bias.shape
     );

@@ -1,5 +1,5 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-use crate::kernels::bias_act::bias_act_inplace;
+use crate::kernels::bias_act::{Act, activated, bias_act_inplace};
 use crate::kernels::matmul::{Accum, MatMut, MatRef, Par, matmul as strided_matmul};
 use crate::kernels::matmul_nn;
 use crate::kernels::simd::simd_call;
@@ -25,38 +25,12 @@ pub fn conv2d<'b, 'a>(
     strides: &[i64],
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    return conv2d_fused(
-        input, weights, bias, dilations, group, pads, strides, false, out,
-    );
+    conv2d_fused(
+        input, weights, bias, dilations, group, pads, strides, None, out,
+    )
 }
 
-/// 2D Convolution with fused SiLU activation (x * sigmoid(x)).
-/// Avoids separate sigmoid + mul passes over the output.
-pub fn conv2d_silu<'b, 'a>(
-    input: &TensorView<'b>,
-    weights: &TensorView<'b>,
-    bias: Option<&TensorView<'b>>,
-    dilations: &[i64],
-    group: i64,
-    pads: &[i64],
-    strides: &[i64],
-    out: &'a mut Vec<f32>,
-) -> TensorView<'a> {
-    return conv2d_activation(
-        Level::new(),
-        input,
-        weights,
-        bias,
-        dilations,
-        group,
-        pads,
-        strides,
-        Activation::SiLU,
-        IM2COL_BYTES,
-        out,
-    );
-}
-
+/// The activations the convolution kernels apply as they write the output.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Activation {
     None,
@@ -64,7 +38,10 @@ pub(crate) enum Activation {
     SiLU,
 }
 
-/// 2D Convolution with optional fused ReLU activation.
+/// 2D convolution, then `act`. The kernels apply ReLU and SiLU as they write the
+/// output; any other runs over it in place ([`activated`]), as its own kernel computes
+/// it, with no second buffer.
+#[allow(clippy::too_many_arguments)]
 pub fn conv2d_fused<'b, 'a>(
     input: &TensorView<'b>,
     weights: &TensorView<'b>,
@@ -73,27 +50,44 @@ pub fn conv2d_fused<'b, 'a>(
     group: i64,
     pads: &[i64],
     strides: &[i64],
-    relu: bool,
+    act: Option<Act>,
     out: &'a mut Vec<f32>,
 ) -> TensorView<'a> {
-    let act = if relu {
-        Activation::Relu
-    } else {
-        Activation::None
+    let conv = |act: Activation, out: &'a mut Vec<f32>| {
+        conv2d_activation(
+            Level::new(),
+            input,
+            weights,
+            bias,
+            dilations,
+            group,
+            pads,
+            strides,
+            act,
+            IM2COL_BYTES,
+            out,
+        )
     };
-    return conv2d_activation(
-        Level::new(),
-        input,
-        weights,
-        bias,
-        dilations,
-        group,
-        pads,
-        strides,
-        act,
-        IM2COL_BYTES,
-        out,
-    );
+    match act {
+        None => conv(Activation::None, out),
+        Some(Act::Relu) => conv(Activation::Relu, out),
+        Some(Act::Silu) => conv(Activation::SiLU, out),
+        Some(act) => activated(act, out, |out| {
+            conv2d_activation(
+                Level::new(),
+                input,
+                weights,
+                bias,
+                dilations,
+                group,
+                pads,
+                strides,
+                Activation::None,
+                IM2COL_BYTES,
+                out,
+            )
+        }),
+    }
 }
 
 /// Most bytes of unfolded input per band of output rows: about half of L2, so the
@@ -1820,6 +1814,60 @@ mod tests {
                     assert_eq!(got.shape.as_ref(), &[batch, oc, oh_n, ow_n]);
                     let what = format!("{case:?} groups {groups} of {ocg} band {band_bytes}");
                     assert_close(&got.data, &want, 1e-5, &what);
+                }
+            }
+        }
+    }
+
+    /// `conv2d_fused` with an activation the kernels do not apply themselves is
+    /// `conv2d` then that activation's kernel, bit for bit: dense, grouped and
+    /// depthwise convolutions.
+    #[test]
+    fn test_conv2d_fused_is_conv2d_then_the_activation() {
+        use crate::kernels::bias_act::{Act, act_inplace};
+        use crate::kernels::test_util::assert_same_bits;
+        let mut rng = Rng::new(13);
+        for case in WINDOW_CASES {
+            let ([c, h, w], [kh, kw], strides, dilations, pads) = *case;
+            for (groups, oc) in [(1, 4), (c, c), (c, 2 * c)] {
+                let cg = c / groups;
+                let x = rng.vec(2 * c * h * w, -1.0, 1.0);
+                let wt = rng.vec(oc * cg * kh * kw, -1.0, 1.0);
+                let b = rng.vec(oc, -1.0, 1.0);
+                let to_i64 = |v: &[usize]| v.iter().map(|&v| v as i64).collect::<Vec<_>>();
+                let (dil, pad, stride) = (to_i64(&dilations), to_i64(&pads), to_i64(&strides));
+                let input = TensorView::from_slice(&x, vec![2, c, h, w]);
+                let weights = TensorView::from_slice(&wt, vec![oc, cg, kh, kw]);
+                let bias = TensorView::from_slice(&b, vec![oc]);
+                let g = groups as i64;
+                let (mut c_buf, mut out) = (Vec::new(), Vec::new());
+                let conv = conv2d(
+                    &input,
+                    &weights,
+                    Some(&bias),
+                    &dil,
+                    g,
+                    &pad,
+                    &stride,
+                    &mut c_buf,
+                );
+                for act in [Act::Sigmoid, Act::GeluErf] {
+                    let mut want = conv.data.to_vec();
+                    act_inplace(act, &mut want);
+                    let got = conv2d_fused(
+                        &input,
+                        &weights,
+                        Some(&bias),
+                        &dil,
+                        g,
+                        &pad,
+                        &stride,
+                        Some(act),
+                        &mut out,
+                    );
+                    assert_eq!(got.shape, conv.shape);
+                    let what = format!("{case:?} groups {groups} -> {oc} {act:?}");
+                    assert_same_bits(&got.data, &want, &what);
                 }
             }
         }

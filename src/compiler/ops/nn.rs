@@ -107,7 +107,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             {
                 return writeln!(
                     w,
-                    "{}let {} = lele::kernels::conv1d_pointwise(&{}, &{}, {}, false, {});",
+                    "{}let {} = lele::kernels::conv1d_pointwise(&{}, &{}, {}, None, {});",
                     tab,
                     outputs[0],
                     inputs[0],

@@ -334,30 +334,6 @@ fn widened<'s, T>(widened: &'s [T], index: &[(usize, usize)], offset: usize, len
 /// Fused ops the compiler's patterns emit as `self.<op>(...)`.
 #[allow(clippy::too_many_arguments)]
 impl Weights<'_> {
-    pub fn conv1d_relu<'c, 'd>(
-        &self,
-        input: TensorView<'c>,
-        weight: TensorView<'c>,
-        bias: Option<&TensorView<'c>>,
-        stride: usize,
-        dilation: usize,
-        groups: usize,
-        padding: usize,
-        output_buf: &'d mut Vec<f32>,
-    ) -> TensorView<'d> {
-        kernels::conv1d_fused(
-            &input,
-            &weight,
-            bias,
-            &[dilation as i64],
-            groups as i64,
-            &[padding as i64, padding as i64],
-            &[stride as i64],
-            true,
-            output_buf,
-        )
-    }
-
     pub fn layer_norm<'c, 'd>(
         &self,
         input: &TensorView<'c>,
