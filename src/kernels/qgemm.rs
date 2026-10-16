@@ -366,23 +366,6 @@ pub(crate) struct Epilogue<'a> {
     pub act: Option<Act>,
 }
 
-impl Epilogue<'_> {
-    pub(crate) fn relu(&self) -> bool {
-        self.act == Some(Act::Relu)
-    }
-}
-
-/// `act` of 16 results, as vectors of 8: ReLU as a `max` of each, any other through
-/// [`act_f32x8`].
-#[inline(always)]
-pub(crate) fn act_pair<S: Simd>(simd: S, act: Option<Act>, x: [f32x8<S>; 2]) -> [f32x8<S>; 2] {
-    use fearless_simd::prelude::*;
-    match act {
-        None => x,
-        Some(Act::Relu) => x.map(|x| x.max(f32x8::splat(simd, 0.0))),
-        Some(act) => act_f32x8(simd, act, x),
-    }
-}
 
 /// A `u8` `QuantizeLinear` -> `DequantizeLinear` round trip of a product, as static-QDQ
 /// graphs follow every product with:
@@ -616,7 +599,10 @@ fn finish<S: Simd, const R: usize>(simd: S, t: &Tile, acc: [[i32x8<S>; 2]; R], c
             let x = simd.cvt_f32_i32x8(acc[r][v]) * col_scale[v];
             requant!(simd, f32x8, t.requant, x) + bias[v]
         });
-        let vals = act_pair(simd, t.act, vals);
+        let vals = match t.act {
+            None => vals,
+            Some(act) => act_f32x8(simd, act, vals),
+        };
         let row = &mut c[r * t.ldc..][..t.width];
         if t.width == NR {
             for v in 0..2 {
@@ -1216,8 +1202,7 @@ pub(crate) fn run_at(
             );
             sgemm(&a[..m * k], b, m, k, n, &mut c[..m * n]);
             simd_call!(level, epilogue_simd(m, n, &w.scale, e, c));
-            // `epilogue_simd` applies ReLU; another activation goes over the rows after.
-            if let Some(act) = e.act.filter(|_| !e.relu()) {
+            if let Some(act) = e.act {
                 act_inplace_at(level, act, &mut c[..m * n]);
             }
         }),
@@ -1277,8 +1262,8 @@ fn sgemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, c: &mut [f32]) {
     }
 }
 
-/// `c[i][j] = relu?(requant?(c[i][j] * e.scale * col_scale[j]) + bias[j])`, in place: a
-/// ReLU as the epilogue's activation is applied here, any other by the caller.
+/// `c[i][j] = requant?(c[i][j] * e.scale * col_scale[j]) + bias[j]`, in place; the
+/// caller applies the activation.
 #[simd]
 fn epilogue_simd<S: Simd>(
     simd: S,
@@ -1300,13 +1285,13 @@ fn epilogue_simd<S: Simd>(
                 .map_or(zero, |b| f32x8::from_slice(simd, &b[8 * i..][..8]));
             let x = f32x8::from_slice(simd, o) * s;
             let x = requant!(simd, f32x8, e.requant, x) + b;
-            (if e.relu() { x.max(zero) } else { x }).store_slice(o);
+            x.store_slice(o);
         }
         let done = chunks.len() * 8;
         for (j, o) in rest.iter_mut().enumerate() {
             let x = *o * (e.scale * col_scale[done + j]);
             let x = e.requant.map_or(x, |r| r.apply(x)) + e.bias.map_or(0.0, |b| b[done + j]);
-            *o = if e.relu() { x.max(0.0) } else { x };
+            *o = x;
         }
     }
 }

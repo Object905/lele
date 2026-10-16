@@ -413,7 +413,6 @@ fn finish<S: Simd, const R: usize, const V: usize>(
     };
     let (scale, col_term, bias) = (vecs(t.scale), ivecs(t.col_term), vecs(t.bias));
     let factor = t.row_sum_factor.map(|f| ivecs(f));
-    let zero = f32x16::splat(simd, 0.0);
     for r in 0..R {
         let rs = i32x16::splat(simd, row_sums[r]);
         let vals: [f32x16<S>; V] = core::array::from_fn(|v| {
@@ -425,7 +424,6 @@ fn finish<S: Simd, const R: usize, const V: usize>(
             let x = requant!(simd, f32x16, t.requant, x) + bias[v];
             match t.act {
                 None => x,
-                Some(Act::Relu) => x.max(zero),
                 Some(act) => act_f32x16(act, x),
             }
         });

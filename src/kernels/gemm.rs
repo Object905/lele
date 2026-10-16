@@ -1,5 +1,4 @@
 use crate::kernels::bias_act::{Act, act_inplace, bias_act_inplace};
-use crate::kernels::conv2d::Activation;
 use crate::kernels::matmul::{
     Accum, Codes, MatMut, MatRef, Par, matmul as strided_matmul, matmul_act as strided_matmul_act,
     matmul_codes, matmul_f16_a, matmul_f16_act, matmul_f16_packed_a, matmul_f16_packed_act,
@@ -337,7 +336,7 @@ pub fn matmul_fused_add_act<'a, B: WeightElem>(
         let first = bias.shape.iter().position(|&d| d != 1);
         let trailing = first.map_or(&[][..], |f| &bias.shape[f..]);
         if bias_data.len() == 1 {
-            bias_act_inplace(out, bias_data[0], Activation::None);
+            bias_act_inplace(out, bias_data[0], None);
         } else if out_shape.ends_with(trailing) {
             for chunk in out.chunks_exact_mut(bias_data.len()) {
                 for (o, &b) in chunk.iter_mut().zip(bias_data) {

@@ -1,37 +1,34 @@
 //! Bias and activation applied in place to a convolution or product output.
 
-use crate::kernels::conv2d::Activation;
 use crate::kernels::simd::simd_call;
 use crate::kernels::simd_math as vm;
 use crate::tensor::TensorView;
-use fearless_simd::{Level, Simd};
+use fearless_simd::{Level, Simd, f32x8, f32x16};
 use fearless_simd_macros::simd;
 
-/// `data[i] = act(data[i] + bias)`.
-pub(crate) fn bias_act_inplace(data: &mut [f32], bias: f32, act: Activation) {
+/// `data[i] = act?(data[i] + bias)`.
+pub(crate) fn bias_act_inplace(data: &mut [f32], bias: f32, act: Option<Act>) {
     bias_act_inplace_at(Level::new(), data, bias, act)
 }
 
-fn bias_act_inplace_at(level: Level, data: &mut [f32], bias: f32, act: Activation) {
+pub(crate) fn bias_act_inplace_at(level: Level, data: &mut [f32], bias: f32, act: Option<Act>) {
     // The kernels need a whole vector. A shorter row goes through a padded
     // copy made here rather than in them: its `memcpy` calls would give
     // every call, long rows included, a stack frame and saved registers.
+    let run = |data: &mut [f32]| match act {
+        None => simd_call!(level, max = Avx2, bias_add_simd(data, bias)),
+        Some(Act::Relu) => simd_call!(level, max = Avx2, bias_relu_simd(data, bias)),
+        Some(Act::Silu) => simd_call!(level, max = Avx2, bias_silu_simd(data, bias)),
+        Some(Act::Sigmoid) => simd_call!(level, max = Avx2, bias_sigmoid_simd(data, bias)),
+        Some(Act::GeluErf) => simd_call!(level, max = Avx2, bias_gelu_erf_simd(data, bias)),
+    };
     if data.len() < 16 {
         let mut padded = [0.0f32; 16];
         padded[..data.len()].copy_from_slice(data);
-        bias_act_vectors(level, &mut padded, bias, act);
+        run(&mut padded);
         data.copy_from_slice(&padded[..data.len()]);
     } else {
-        bias_act_vectors(level, data, bias, act);
-    }
-}
-
-/// Needs `data.len() >= 16`.
-fn bias_act_vectors(level: Level, data: &mut [f32], bias: f32, act: Activation) {
-    match act {
-        Activation::None => simd_call!(level, max = Avx2, bias_add_simd(data, bias)),
-        Activation::Relu => simd_call!(level, max = Avx2, bias_relu_simd(data, bias)),
-        Activation::SiLU => simd_call!(level, max = Avx2, bias_silu_simd(data, bias)),
+        run(data);
     }
 }
 
@@ -105,10 +102,7 @@ pub enum Act {
 /// `act` of every lane, as [`act_inplace`] computes it: kernels that end in an
 /// activation apply this to their results before storing them.
 #[inline(always)]
-pub(crate) fn act_f32x16<S: Simd>(
-    act: Act,
-    x: fearless_simd::f32x16<S>,
-) -> fearless_simd::f32x16<S> {
+pub(crate) fn act_f32x16<S: Simd>(act: Act, x: f32x16<S>) -> f32x16<S> {
     match act {
         Act::Relu => vm::relu(x),
         Act::Silu => vm::silu(x),
@@ -123,10 +117,10 @@ pub(crate) fn act_f32x16<S: Simd>(
 pub(crate) fn act_f32x8<S: Simd, const V: usize>(
     simd: S,
     act: Act,
-    x: [fearless_simd::f32x8<S>; V],
-) -> [fearless_simd::f32x8<S>; V] {
+    x: [f32x8<S>; V],
+) -> [f32x8<S>; V] {
     use fearless_simd::prelude::*;
-    let zero = fearless_simd::f32x8::splat(simd, 0.0);
+    let zero = f32x8::splat(simd, 0.0);
     let (lo, hi) = act_f32x16(act, x[0].combine(if V > 1 { x[V - 1] } else { zero })).split();
     core::array::from_fn(|v| if v == 0 { lo } else { hi })
 }
@@ -179,72 +173,71 @@ where
     TensorView::from_slice(&out[..len], shape)
 }
 
-#[simd]
-fn relu_simd<S: Simd>(simd: S, data: &mut [f32]) {
-    map_inplace!(simd, data, vm::relu)
+/// `act_simd!(name, f)` and `bias_act_simd!(name, f)` define the in-place
+/// kernels of one activation: one function per activation, so that no body
+/// (or, in debug builds, stack frame) holds all of them.
+macro_rules! act_simd {
+    ($name:ident, $f:path) => {
+        /// Needs `data.len() >= 16`.
+        #[simd]
+        fn $name<S: Simd>(simd: S, data: &mut [f32]) {
+            map_inplace!(simd, data, $f)
+        }
+    };
 }
 
-#[simd]
-fn silu_simd<S: Simd>(simd: S, data: &mut [f32]) {
-    map_inplace!(simd, data, vm::silu)
+macro_rules! bias_act_simd {
+    ($name:ident, $f:path) => {
+        /// Needs `data.len() >= 16`.
+        #[simd]
+        fn $name<S: Simd>(simd: S, data: &mut [f32], bias: f32) {
+            map_inplace!(simd, data, bias, $f)
+        }
+    };
 }
 
-#[simd]
-fn sigmoid_simd<S: Simd>(simd: S, data: &mut [f32]) {
-    map_inplace!(simd, data, vm::sigmoid)
-}
-
-#[simd]
-fn gelu_erf_simd<S: Simd>(simd: S, data: &mut [f32]) {
-    map_inplace!(simd, data, vm::gelu_erf)
-}
+act_simd!(relu_simd, vm::relu);
+act_simd!(silu_simd, vm::silu);
+act_simd!(sigmoid_simd, vm::sigmoid);
+act_simd!(gelu_erf_simd, vm::gelu_erf);
+bias_act_simd!(bias_add_simd, identity);
+bias_act_simd!(bias_relu_simd, vm::relu);
+bias_act_simd!(bias_silu_simd, vm::silu);
+bias_act_simd!(bias_sigmoid_simd, vm::sigmoid);
+bias_act_simd!(bias_gelu_erf_simd, vm::gelu_erf);
 
 #[inline(always)]
-fn identity<S: Simd>(x: fearless_simd::f32x16<S>) -> fearless_simd::f32x16<S> {
+fn identity<S: Simd>(x: f32x16<S>) -> f32x16<S> {
     x
-}
-
-#[simd]
-fn bias_add_simd<S: Simd>(simd: S, data: &mut [f32], bias: f32) {
-    map_inplace!(simd, data, bias, identity)
-}
-
-#[simd]
-fn bias_relu_simd<S: Simd>(simd: S, data: &mut [f32], bias: f32) {
-    map_inplace!(simd, data, bias, vm::relu)
-}
-
-#[simd]
-fn bias_silu_simd<S: Simd>(simd: S, data: &mut [f32], bias: f32) {
-    map_inplace!(simd, data, bias, vm::silu)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_close, levels};
+    use crate::kernels::test_util::{AWKWARD_LENS, Rng, assert_same_bits, levels};
 
-    fn reference(x: f32, bias: f32, act: Activation) -> f64 {
-        let v = x as f64 + bias as f64;
-        match act {
-            Activation::None => v,
-            Activation::Relu => v.max(0.0),
-            Activation::SiLU => v / (1.0 + (-v).exp()),
-        }
-    }
-
+    /// `bias_act_inplace` is the bias added, then `act_inplace`, bit for bit.
     #[test]
-    fn test_bias_act_matches_reference_at_every_level_and_length() {
+    fn test_bias_act_is_bias_then_the_activation_at_every_level_and_length() {
         let mut rng = Rng::new(7);
         for level in levels() {
-            for act in [Activation::None, Activation::Relu, Activation::SiLU] {
+            for act in [
+                None,
+                Some(Act::Relu),
+                Some(Act::Silu),
+                Some(Act::Sigmoid),
+                Some(Act::GeluErf),
+            ] {
                 for &len in AWKWARD_LENS {
                     let src = rng.vec(len, -12.0, 12.0);
                     let bias = rng.f32(-2.0, 2.0);
                     let mut got = src.clone();
                     bias_act_inplace_at(level, &mut got, bias, act);
-                    let want: Vec<f64> = src.iter().map(|&x| reference(x, bias, act)).collect();
-                    assert_close(&got, &want, 1e-5, &format!("{level:?} len {len}"));
+                    let mut want: Vec<f32> = src.iter().map(|&x| x + bias).collect();
+                    if let Some(act) = act {
+                        act_inplace_at(level, act, &mut want);
+                    }
+                    assert_same_bits(&got, &want, &format!("{level:?} {act:?} len {len}"));
                 }
             }
         }
@@ -256,7 +249,7 @@ mod tests {
         for level in levels() {
             for &len in AWKWARD_LENS {
                 let mut data = vec![0.0f32; len];
-                bias_act_inplace_at(level, &mut data, 1.0, Activation::None);
+                bias_act_inplace_at(level, &mut data, 1.0, None);
                 assert!(data.iter().all(|&v| v == 1.0), "{level:?} len {len}");
             }
         }
@@ -266,7 +259,6 @@ mod tests {
     /// length, signed zeros and saturating values included.
     #[test]
     fn test_act_inplace_is_the_activation_kernel() {
-        use crate::kernels::test_util::assert_same_bits;
         let mut rng = Rng::new(3);
         for &len in AWKWARD_LENS {
             let mut src = rng.vec(len, -12.0, 12.0);
@@ -293,7 +285,6 @@ mod tests {
     /// what it wrote, keeping its shape.
     #[test]
     fn test_activated_is_the_product_then_the_activation() {
-        use crate::kernels::test_util::assert_same_bits;
         let mut rng = Rng::new(5);
         let (a, b) = (rng.vec(3 * 20, -1.0, 1.0), rng.vec(20 * 24, -1.0, 1.0));
         let a = TensorView::from_slice(&a, vec![3, 20]);
@@ -311,7 +302,7 @@ mod tests {
     #[test]
     fn test_bias_act_leaves_neighbours_alone() {
         let mut buf = vec![5.0f32; 40];
-        bias_act_inplace(&mut buf[10..23], 1.0, Activation::Relu);
+        bias_act_inplace(&mut buf[10..23], 1.0, Some(Act::Relu));
         assert!(buf[..10].iter().all(|&v| v == 5.0));
         assert!(buf[10..23].iter().all(|&v| v == 6.0));
         assert!(buf[23..].iter().all(|&v| v == 5.0));
