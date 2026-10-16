@@ -41,6 +41,14 @@ pub(super) fn write_product(
     }
 }
 
+/// An activation as the kernels take it: `None` or `Some(lele::kernels::Act::…)`.
+fn act_arg(act: Option<Activation>) -> String {
+    match act {
+        None => "None".to_string(),
+        Some(act) => format!("Some(lele::kernels::Act::{})", act.name()),
+    }
+}
+
 pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Result<()> {
     let tab = ctx.tab();
     let (inputs, outputs, buf) = (&ctx.inputs, &ctx.outputs, &ctx.buf_expr);
@@ -113,16 +121,23 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                 outputs[0], inputs[0]
             )?;
         }
+        // The product kernels apply the activation as they write the output.
         Op::Linear { act } => {
-            let (x, weight) = (&inputs[0], ctx.matmul_weight(1));
-            match ctx.ir().input(2) {
-                Some(_) => write_product(w, &tab, &outputs[0], buf, *act, |buf| {
-                    format!("self.linear(&{x}, &{weight}, &{}, {buf})", inputs[2])
-                })?,
-                None => write_product(w, &tab, &outputs[0], buf, *act, |buf| {
-                    format!("lele::kernels::matmul(&{x}, &{weight}, {buf})")
-                })?,
-            }
+            let (x, weight, out) = (&inputs[0], ctx.matmul_weight(1), &outputs[0]);
+            let call = match (ctx.ir().input(2), act) {
+                (Some(_), None) => format!("self.linear(&{x}, &{weight}, &{}", inputs[2]),
+                (Some(_), Some(_)) => format!(
+                    "self.linear_act(&{x}, &{weight}, &{}, {}",
+                    inputs[2],
+                    act_arg(*act)
+                ),
+                (None, None) => format!("lele::kernels::matmul(&{x}, &{weight}"),
+                (None, Some(_)) => format!(
+                    "lele::kernels::matmul_act(&{x}, &{weight}, {}",
+                    act_arg(*act)
+                ),
+            };
+            writeln!(w, "{tab}let {out} = {call}, {buf});")?
         }
         Op::SwiGlu => writeln!(
             w,
@@ -215,10 +230,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
         }
         Op::QLinearDynamic { act } => {
             let (x, scale, zero_point, bias) = (&inputs[0], &inputs[2], &inputs[3], &inputs[4]);
-            // The kernels apply a ReLU themselves; another activation follows.
-            let relu = *act == Some(Activation::Relu);
-            let act = act.filter(|_| !relu);
-            let out = &outputs[0];
+            let (out, act) = (&outputs[0], act_arg(*act));
             // A static weight with static scales and zero points is packed for
             // the integer GEMM when the model is created.
             let at_load = (
@@ -236,25 +248,16 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
                         weight.shape[1],
                         weight.dtype == DType::I8,
                     ));
-                    write_product(w, &tab, out, buf, act, |buf| {
-                        format!(
-                            "self.linear_quantized_packed(&{x}, self.qweights({n}), {bias}, {relu}, {buf})"
-                        )
-                    })?
+                    writeln!(
+                        w,
+                        "{tab}let {out} = self.linear_quantized_packed(&{x}, self.qweights({n}), {bias}, {act}, {buf});"
+                    )?
                 }
-                _ => {
-                    let method = if relu {
-                        "linear_quantized_relu"
-                    } else {
-                        "linear_quantized"
-                    };
-                    write_product(w, &tab, out, buf, act, |buf| {
-                        format!(
-                            "self.{method}(&{x}, {}, {scale}, {zero_point}, {bias}, {buf})",
-                            inputs[1]
-                        )
-                    })?
-                }
+                _ => writeln!(
+                    w,
+                    "{tab}let {out} = self.linear_quantized(&{x}, {}, {scale}, {zero_point}, {bias}, {act}, {buf});",
+                    inputs[1]
+                )?,
             }
         }
         Op::EmbeddingConcat { value } => {

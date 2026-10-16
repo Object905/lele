@@ -419,6 +419,7 @@ pub(crate) fn conv2d_activation<'b, 'a>(
                             alpha: 1.0,
                             add: false,
                             b_cols: false,
+                            act: None,
                         };
                         matmul_nn::gemm_nn(
                             level,

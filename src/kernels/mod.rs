@@ -38,7 +38,8 @@ pub use conv2d::{
     topk,
 };
 pub use gemm::{
-    PackedF16, WeightElem, gemm, linear_swiglu, matmul, matmul_fused_add, weight_only_matmul,
+    PackedF16, WeightElem, gemm, linear_swiglu, matmul, matmul_act, matmul_fused_add,
+    matmul_fused_add_act, weight_only_matmul,
 };
 pub use matmul::Codes;
 pub use manipulation::*;

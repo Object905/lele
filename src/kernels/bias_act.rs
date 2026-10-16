@@ -102,12 +102,46 @@ pub enum Act {
     GeluErf,
 }
 
+/// `act` of every lane, as [`act_inplace`] computes it: kernels that end in an
+/// activation apply this to their results before storing them.
+#[inline(always)]
+pub(crate) fn act_f32x16<S: Simd>(
+    act: Act,
+    x: fearless_simd::f32x16<S>,
+) -> fearless_simd::f32x16<S> {
+    match act {
+        Act::Relu => vm::relu(x),
+        Act::Silu => vm::silu(x),
+        Act::Sigmoid => vm::sigmoid(x),
+        Act::GeluErf => vm::gelu_erf(x),
+    }
+}
+
+/// [`act_f32x16`] of `V` (1 or 2) vectors of 8 lanes, which go through one
+/// vector of 16 (padded with zeros for one).
+#[inline(always)]
+pub(crate) fn act_f32x8<S: Simd, const V: usize>(
+    simd: S,
+    act: Act,
+    x: [fearless_simd::f32x8<S>; V],
+) -> [fearless_simd::f32x8<S>; V] {
+    use fearless_simd::prelude::*;
+    let zero = fearless_simd::f32x8::splat(simd, 0.0);
+    let (lo, hi) = act_f32x16(act, x[0].combine(if V > 1 { x[V - 1] } else { zero })).split();
+    core::array::from_fn(|v| if v == 0 { lo } else { hi })
+}
+
 /// `data[i] = act(data[i])`, element for element as the activation's own
 /// kernel ([`relu`](crate::kernels::relu), [`silu`](crate::kernels::silu),
 /// [`sigmoid`](crate::kernels::sigmoid), [`gelu_erf`](crate::kernels::gelu_erf))
 /// computes it.
 pub fn act_inplace(act: Act, data: &mut [f32]) {
-    let level = Level::new();
+    act_inplace_at(Level::new(), act, data)
+}
+
+/// [`act_inplace`] at `level`. Where it has no fused multiply-add, the activations round
+/// differently: kernels applying one as they store must run at the level it would.
+pub(crate) fn act_inplace_at(level: Level, act: Act, data: &mut [f32]) {
     let run = |data: &mut [f32]| match act {
         Act::Relu => simd_call!(level, max = Avx2, relu_simd(data)),
         Act::Silu => simd_call!(level, max = Avx2, silu_simd(data)),

@@ -1112,7 +1112,8 @@ fn side_by_side(a: &TensorProto, b: &TensorProto) -> Option<TensorProto> {
 }
 
 /// The dynamically quantized linear layer ONNX Runtime's
-/// `quantize_dynamic` emits, optionally followed by `Relu`:
+/// `quantize_dynamic` emits (an activation after it joins it in
+/// [`fuse_product_act`]):
 ///
 /// ```text
 /// q, s, z = DynamicQuantizeLinear(x)
@@ -1159,20 +1160,12 @@ fn fuse_dynamic_quant_linear(g: &mut Graph) {
                 return None;
             }
             let x = dql_node.input(0);
-            let mut nodes = vec![dql, scale_mul, mmi, cast, mul, add];
-            // A ReLU reading nothing but the layer joins it.
-            let out = g.node(add).output(0)?;
-            let relu = match g.value(out).consumers() {
-                [r] if g.uses(out) == 1 && unary(Unary::Relu)(&g.node(*r).op) => Some(*r),
-                _ => None,
-            };
-            nodes.extend(relu);
-            Some((nodes, vec![x, w, w_scale, w_zp, bias], relu.is_some()))
+            let nodes = vec![dql, scale_mul, mmi, cast, mul, add];
+            Some((nodes, vec![x, w, w_scale, w_zp, bias]))
         });
-        if let Some((nodes, inputs, relu)) = fused {
+        if let Some((nodes, inputs)) = fused {
             let proto = named_after(g, add);
-            let act = relu.then_some(Activation::Relu);
-            g.fuse(&nodes, Op::QLinearDynamic { act }, proto, inputs);
+            g.fuse(&nodes, Op::QLinearDynamic { act: None }, proto, inputs);
         }
     }
 }
@@ -1182,10 +1175,11 @@ fn fuse_dynamic_quant_linear(g: &mut Graph) {
 /// `QLinearDynamic` whose output nothing else reads. A `MatMul` becomes a
 /// `Linear` without a bias.
 ///
-/// The product's kernel writes its output, and the activation then runs over
-/// it in place ([`activated`](crate::kernels::activated)) with the
-/// arithmetic of its own kernel, so the result is unchanged bit for bit; the
-/// activation needs no buffer of its own and no call.
+/// The product's kernel applies the activation as it writes its output (a
+/// `Gemm` runs over it in place after, [`activated`](crate::kernels::activated)),
+/// with the arithmetic of the activation's own kernel, so the result is
+/// unchanged bit for bit; the activation needs no buffer of its own and no
+/// call.
 fn fuse_product_act(g: &mut Graph) {
     let acts: Vec<(NodeId, Activation)> = g
         .nodes()
