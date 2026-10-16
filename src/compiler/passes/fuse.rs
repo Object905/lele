@@ -958,16 +958,28 @@ fn fuse_conv_bias(g: &mut Graph) {
     }
 }
 
-/// `Conv` followed by `Relu`, or a 2D or non-pointwise 1D `Conv` followed by
-/// `Silu` → `ConvAct`.
+/// The activation a node computes, as the kernels apply it to what they
+/// write: `Relu`, `Sigmoid`, `Silu` or erf `Gelu`.
+fn kernel_activation(op: &Op) -> Option<Activation> {
+    match op {
+        Op::Unary(Unary::Relu) => Some(Activation::Relu),
+        Op::Unary(Unary::Sigmoid) => Some(Activation::Sigmoid),
+        Op::Silu => Some(Activation::Silu),
+        Op::Gelu { approximate } if approximate.as_deref().is_none_or(|a| a == "none") => {
+            Some(Activation::GeluErf)
+        }
+        _ => None,
+    }
+}
+
+/// `Conv` followed by an activation ([`kernel_activation`]) whose input
+/// nothing else reads → `ConvAct`. The kernels apply it as they write the
+/// output, with the arithmetic of its own kernel: the result is unchanged bit
+/// for bit.
 fn fuse_conv_act(g: &mut Graph) {
     let acts: Vec<(NodeId, Activation)> = g
         .nodes()
-        .filter_map(|(id, n)| match n.op {
-            Op::Unary(Unary::Relu) => Some((id, Activation::Relu)),
-            Op::Silu => Some((id, Activation::Silu)),
-            _ => None,
-        })
+        .filter_map(|(id, n)| Some((id, kernel_activation(&n.op)?)))
         .collect();
     for (act_id, act) in acts {
         if !g.contains(act_id) {
@@ -980,18 +992,6 @@ fn fuse_conv_act(g: &mut Graph) {
         let Op::Conv(attrs) = g.node(conv).op.clone() else {
             unreachable!()
         };
-        // SiLU fuses into a 2D kernel, or into a 1D one whose constant weights
-        // say it is 1D; not into a pointwise one, whose weights are read by
-        // the matrix product kernels, packed.
-        let weight_dims = constant_tensor(g, g.node(conv).input(1)).map(|w| w.dims.as_slice());
-        let silu_fuses = match (attrs.kernel_shape.as_deref(), weight_dims) {
-            (_, Some(&[_, _, k])) => k > 1,
-            (Some(k), _) => k.len() >= 2,
-            (None, _) => false,
-        };
-        if act == Activation::Silu && !silu_fuses {
-            continue;
-        }
         let inputs = g.node(conv).inputs().to_vec();
         let proto = g.node(conv).proto.clone();
         let op = Op::ConvAct { conv: attrs, act };
@@ -1170,10 +1170,9 @@ fn fuse_dynamic_quant_linear(g: &mut Graph) {
     }
 }
 
-/// An activation of a product → the product, applying it: `Relu`,
-/// `Sigmoid`, `Silu` or erf `Gelu` of a `MatMul`, `Linear`, `Gemm` or
-/// `QLinearDynamic` whose output nothing else reads. A `MatMul` becomes a
-/// `Linear` without a bias.
+/// An activation ([`kernel_activation`]) of a product → the product, applying
+/// it: of a `MatMul`, `Linear`, `Gemm` or `QLinearDynamic` whose output
+/// nothing else reads. A `MatMul` becomes a `Linear` without a bias.
 ///
 /// The product's kernel applies the activation as it writes its output (a
 /// `Gemm` runs over it in place after, [`activated`](crate::kernels::activated)),
@@ -1183,20 +1182,12 @@ fn fuse_dynamic_quant_linear(g: &mut Graph) {
 fn fuse_product_act(g: &mut Graph) {
     let acts: Vec<(NodeId, Activation)> = g
         .nodes()
-        .filter_map(|(id, n)| {
-            let act = match &n.op {
-                Op::Unary(Unary::Relu) => Activation::Relu,
-                Op::Unary(Unary::Sigmoid) => Activation::Sigmoid,
-                Op::Silu => Activation::Silu,
-                Op::Gelu { approximate } if approximate.as_deref().is_none_or(|a| a == "none") => {
-                    Activation::GeluErf
-                }
-                _ => return None,
-            };
-            Some((id, act))
-        })
+        .filter_map(|(id, n)| Some((id, kernel_activation(&n.op)?)))
         .collect();
     for (id, act) in acts {
+        if !g.contains(id) {
+            continue;
+        }
         let x = g.node(id).input(0);
         // f16 is held as f32 and goes through the same kernels.
         let float = x.is_some_and(|x| {
@@ -1593,8 +1584,8 @@ mod tests {
         ];
         assert_eq!(fused(nodes, vec![]), ["ConvAct"]);
 
-        // A 1D one, as T-one's depthwise convolution, fuses; a pointwise one,
-        // and one whose rank is not known, do not.
+        // A 1D one, as T-one's depthwise convolution, a pointwise one, whose
+        // kernel takes the activation too, and one whose rank is not known.
         let weights = |dims: &[i64]| TensorProto {
             name: "w".to_string(),
             data_type: DType::F32.to_onnx(),
@@ -1610,8 +1601,50 @@ mod tests {
             ]
         };
         assert_eq!(fused(nodes(), vec![weights(&[4, 1, 31])]), ["ConvAct"]);
-        assert_eq!(fused(nodes(), vec![weights(&[4, 4, 1])]), ["Conv", "Silu"]);
-        assert_eq!(fused(nodes(), vec![]), ["Conv", "Silu"]);
+        assert_eq!(fused(nodes(), vec![weights(&[4, 4, 1])]), ["ConvAct"]);
+        assert_eq!(fused(nodes(), vec![]), ["ConvAct"]);
+    }
+
+    /// Every activation the kernels apply joins the `Conv` before it, unless
+    /// something else reads the convolution's output; not a tanh GELU.
+    #[test]
+    fn fuses_activations_into_convs() {
+        let act_of = |nodes: Vec<NodeProto>| -> Vec<(String, Option<Activation>)> {
+            fused_graph(nodes, vec![])
+                .nodes()
+                .map(|(_, n)| {
+                    let act = match &n.op {
+                        Op::ConvAct { act, .. } => Some(*act),
+                        _ => None,
+                    };
+                    (n.op.op_type().to_string(), act)
+                })
+                .collect()
+        };
+        let conv = || node("Conv", &["x", "w"], "c");
+        for (op, act) in [
+            ("Relu", Activation::Relu),
+            ("Sigmoid", Activation::Sigmoid),
+            ("Gelu", Activation::GeluErf),
+        ] {
+            let nodes = vec![conv(), node(op, &["c"], "y")];
+            assert_eq!(act_of(nodes), [("ConvAct".into(), Some(act))], "{op}");
+        }
+        let mut tanh = node("Gelu", &["c"], "y");
+        tanh.attribute
+            .push(crate::model::onnx_proto::AttributeProto {
+                name: "approximate".to_string(),
+                s: b"tanh".to_vec(),
+                r#type: 3, // STRING
+                ..Default::default()
+            });
+        assert_eq!(act_of(vec![conv(), tanh]).len(), 2);
+        let shared = vec![
+            conv(),
+            node("Gelu", &["c"], "g"),
+            node("Add", &["c", "g"], "y"),
+        ];
+        assert_eq!(act_of(shared).len(), 3);
     }
 
     #[test]

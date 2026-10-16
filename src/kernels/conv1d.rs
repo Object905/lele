@@ -12,6 +12,10 @@ use fearless_simd::Level;
 
 /// Adds `bias[oc]` to every `[oc, ..]` row of `out` (laid out `[batch, out_channels, len]`)
 /// and applies the activation if any.
+///
+/// The activation goes over the whole output at once, not row by row: rows are
+/// often short (a few frames), and each would pay a call and a last vector that
+/// overlaps the one before it.
 fn bias_act_rows(
     level: Level,
     out: &mut [f32],
@@ -20,14 +24,13 @@ fn bias_act_rows(
     out_channels: usize,
     len: usize,
 ) {
-    match (bias, act) {
-        (Some(bias), _) => {
-            for (i, row) in out.chunks_exact_mut(len).enumerate() {
-                bias_act_inplace_at(level, row, bias.data[i % out_channels], act);
-            }
+    if let Some(bias) = bias {
+        for (i, row) in out.chunks_exact_mut(len).enumerate() {
+            bias_act_inplace_at(level, row, bias.data[i % out_channels], None);
         }
-        (None, Some(act)) => act_inplace_at(level, act, out),
-        (None, None) => {}
+    }
+    if let Some(act) = act {
+        act_inplace_at(level, act, out);
     }
 }
 

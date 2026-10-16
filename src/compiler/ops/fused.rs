@@ -2,22 +2,9 @@
 
 use super::super::{
     generate::{ElemType, OpContext},
-    ir::{Activation, ConvAttrs, DType, Op},
+    ir::{Activation, DType, Op},
 };
 use std::io::Write;
-
-impl ConvAttrs {
-    /// Strides and dilations with one entry per spatial axis of a 2D
-    /// convolution (a single value covers both, none means 1); each axis
-    /// keeps its own, so a stride of `[2, 1]` stays `[2, 1]`.
-    fn per_axis(ints: &Option<Vec<i64>>) -> Vec<i64> {
-        match ints.as_deref() {
-            None | Some([]) => vec![1, 1],
-            Some([v]) => vec![*v, *v],
-            Some(ints) => ints.to_vec(),
-        }
-    }
-}
 
 /// `let {out} = {product};`, `product(buf)` being the call that writes the
 /// product to `buf`; with an activation, the call goes through
@@ -42,7 +29,7 @@ pub(super) fn write_product(
 }
 
 /// An activation as the kernels take it: `None` or `Some(lele::kernels::Act::…)`.
-fn act_arg(act: Option<Activation>) -> String {
+pub(super) fn act_arg(act: Option<Activation>) -> String {
     match act {
         None => "None".to_string(),
         Some(act) => format!("Some(lele::kernels::Act::{})", act.name()),
@@ -147,60 +134,7 @@ pub(super) fn generate(ctx: &mut OpContext, w: &mut dyn Write) -> std::io::Resul
             ctx.matmul_weight(1),
             inputs[2]
         )?,
-        Op::ConvAct { conv, act } => {
-            let weight_shape = ctx
-                .weight(1)
-                .map(|weight| weight.shape.clone())
-                .unwrap_or(vec![3, 3, 3, 3]);
-            let bias = match ctx.ir().input(2) {
-                Some(_) => format!("Some(&{})", inputs[2]),
-                None => "None".to_string(),
-            };
-            let act = act_arg(Some(*act));
-            let strides = ConvAttrs::per_axis(&conv.strides);
-            let dilations = ConvAttrs::per_axis(&conv.dilations);
-            let groups = conv.group.unwrap_or(1) as usize;
-            let mut pads = conv.pads.clone().unwrap_or_default();
-            let auto_pad = conv.auto_pad.as_deref().unwrap_or("");
-            if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") && pads.is_empty() {
-                let kh = weight_shape.get(2).copied().unwrap_or(1) as i64;
-                let kw = weight_shape.get(3).copied().unwrap_or(kh as usize) as i64;
-                let total_h = (kh - 1) * dilations[0];
-                let total_w = (kw - 1) * dilations[1];
-                let split = |total: i64| {
-                    if auto_pad == "SAME_LOWER" {
-                        (total - total / 2, total / 2)
-                    } else {
-                        (total / 2, total - total / 2)
-                    }
-                };
-                let ((pt, pb), (pl, pr)) = (split(total_h), split(total_w));
-                pads = vec![pt, pl, pb, pr];
-            }
-            if pads.is_empty() {
-                pads = vec![0, 0, 0, 0];
-            }
-            if weight_shape.len() >= 4 {
-                writeln!(
-                    w,
-                    "{tab}let {} = lele::kernels::conv2d_fused(&{}, &{}, {bias}, &{:?}, {groups}, &{:?}, &{:?}, {act}, {buf});",
-                    outputs[0], inputs[0], inputs[1], dilations, pads, strides,
-                )?;
-            } else {
-                // Pads are [begin, end], or [begin, _, end, _] as computed above.
-                writeln!(
-                    w,
-                    "{tab}let {} = lele::kernels::conv1d_fused(&{}, &{}, {bias}, &[{}], {groups}, &[{}, {}], &[{}], {act}, {buf});",
-                    outputs[0],
-                    inputs[0],
-                    inputs[1],
-                    dilations[0],
-                    pads[0],
-                    pads[pads.len() / 2],
-                    strides[0],
-                )?;
-            }
-        }
+        Op::ConvAct { conv, act } => super::nn::write_conv(ctx, w, conv, Some(*act))?,
         Op::QLinearDynamic { act } => {
             let (x, scale, zero_point, bias) = (&inputs[0], &inputs[2], &inputs[3], &inputs[4]);
             let (out, act) = (&outputs[0], act_arg(*act));
