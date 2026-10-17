@@ -654,6 +654,7 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
         | Op::LogSoftmax { .. }
         | Op::QuantizeLinear(_)
         | Op::RmsNorm { .. }
+        | Op::Rope { .. }
         | Op::ScaleNorm { .. }
         | Op::ScatterElements { .. }
         | Op::ScatterND

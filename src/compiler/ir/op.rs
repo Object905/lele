@@ -570,6 +570,14 @@ pub enum Op {
     /// (x · w[:, n:] + b[n:])`. Inputs: `[x, w, b]`, `w` `[k, 2n]` holding the
     /// gate's weights then the value's, `b` `[2n]` their biases likewise.
     SwiGlu,
+    /// Rotary position embedding of the first `rot` values along the last
+    /// axis, the others passed through: `r * cos + rotate_half(r) * sin`,
+    /// `rotate_half(r) = concat(-r[rot/2..], r[..rot/2])`. Inputs:
+    /// `[x, cos, sin]`, the tables `rot` wide (unlike ONNX
+    /// `RotaryEmbedding`'s half-width caches) and broadcast over `x`.
+    Rope {
+        rot: usize,
+    },
     /// Dynamically quantized linear layer: `DynamicQuantizeLinear` of the
     /// activation, `MatMulInteger` against a quantized weight, rescale and
     /// bias, optionally an activation. Inputs:
@@ -880,6 +888,7 @@ impl Op {
             Op::SimAm { .. } => "SimAm",
             Op::Linear { .. } => "Linear",
             Op::SwiGlu => "SwiGlu",
+            Op::Rope { .. } => "Rope",
             Op::QLinearDynamic { .. } => "QLinearDynamic",
             Op::EmbeddingConcat { .. } => "EmbeddingConcat",
             Op::ReshapeTo { .. } => "ReshapeTo",
@@ -1050,6 +1059,7 @@ impl Op {
                 set_attr_f(attrs, "next_epsilon", next_epsilon, 0.0);
             }
             Op::RmsNorm { epsilon } => set_attr_f(attrs, "epsilon", epsilon, 0.0),
+            Op::Rope { rot } => set_attr_i(attrs, "rot", rot as i64, 0),
             Op::SimAm {
                 axes,
                 lambda,
