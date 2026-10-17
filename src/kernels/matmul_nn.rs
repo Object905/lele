@@ -23,7 +23,7 @@
 //! multiply-adds. That holds a row of A in a register for four steps, so they are 5 rows
 //! high: 20 accumulators, 5 of A and 4 of B, of the 32 registers.
 
-use crate::kernels::bias_act::{Act, act_f32x8};
+use crate::kernels::bias_act::{Act, act_inplace_at};
 use crate::kernels::simd::simd_call;
 use aligned_vec::AVec;
 use fearless_simd::{Level, Simd, f32x4, f32x8};
@@ -660,6 +660,11 @@ lane_tile_fn!(lanes1_narrow, 1, 1);
 
 /// Writes `act(alpha * acc)` to the `R` rows of C, the first `width` columns, adding
 /// `alpha * acc` to what is there first if asked.
+///
+/// The activation is applied to the rows once all are stored, still in L1, by one call
+/// to its own kernel per row. Inlined here, its polynomials made the tiles keep their
+/// accumulators on the stack, and so did a call with accumulators still to store, which
+/// it would clobber (T-one's products ran at half speed either way).
 #[inline(always)]
 fn store_tile<S: Simd, const R: usize, const V: usize>(
     simd: S,
@@ -676,36 +681,27 @@ fn store_tile<S: Simd, const R: usize, const V: usize>(
         let row = &mut c[r * d.ldc..][..width];
         let vals = acc[r].map(|a| a * alpha);
         if width == 8 * V {
-            let mut out = vals;
-            if accumulate {
-                for (v, out) in out.iter_mut().enumerate() {
-                    *out = *out + f32x8::from_slice(simd, &row[v * 8..][..8]);
+            for (v, val) in vals.iter().enumerate() {
+                let dst = &mut row[v * 8..][..8];
+                if accumulate {
+                    (*val + f32x8::from_slice(simd, dst)).store_slice(dst);
+                } else {
+                    val.store_slice(dst);
                 }
-            }
-            if let Some(act) = act {
-                out = act_f32x8(simd, act, out);
-            }
-            for (v, out) in out.iter().enumerate() {
-                out.store_slice(&mut row[v * 8..][..8]);
             }
         } else {
             let mut flat = [0.0f32; NR];
             for (v, val) in vals.iter().enumerate() {
                 val.store_slice(&mut flat[v * 8..][..8]);
             }
-            for (x, &v) in flat.iter_mut().zip(row.iter()) {
-                if accumulate {
-                    *x += v;
-                }
+            for (x, &v) in row.iter_mut().zip(&flat) {
+                *x = if accumulate { *x + v } else { v };
             }
-            if let Some(act) = act {
-                let x: [f32x8<S>; 2] =
-                    core::array::from_fn(|v| f32x8::from_slice(simd, &flat[v * 8..][..8]));
-                for (v, y) in act_f32x8(simd, act, x).iter().enumerate() {
-                    y.store_slice(&mut flat[v * 8..][..8]);
-                }
-            }
-            row.copy_from_slice(&flat[..width]);
+        }
+    }
+    if let Some(act) = act {
+        for r in 0..R {
+            act_inplace_at(simd.level(), act, &mut c[r * d.ldc..][..width]);
         }
     }
 }
