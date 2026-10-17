@@ -1005,6 +1005,23 @@ fn gemm_nn_wide(simd: Avx512, d: &Dims, a: &[f32], b: BSrc, c: &mut [f32], bpack
     }
 }
 
+/// How far ahead of the rows it reads a tile widening packed B prefetches each panel.
+/// On an Ice Lake Xeon, products did about as well from 512 bytes to 4 KB ahead, and no
+/// better with hints to L2 or past the caches than to L1. T-one per chunk: f16 7-8%
+/// faster, int8 0-4%.
+#[cfg(target_arch = "x86_64")]
+const PREFETCH_AHEAD: usize = 2048;
+
+/// Asks for the cache line at `p` (fearless_simd has no prefetch). The address need not
+/// be valid: a prefetch does not fault.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+    // SAFETY: a prefetch reads nothing the program sees and does not fault.
+    unsafe { _mm_prefetch::<_MM_HINT_T0>(p as *const i8) }
+}
+
 /// 16 f16 widened, with AVX-512's `vcvtph2ps` (fearless_simd has no f16). Exact.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -1100,7 +1117,17 @@ macro_rules! wide_tile_fn {
                         ($codes:expr, |$src:ident| $widen:expr) => {{
                             let rows = panels!($codes);
                             let out = &mut dst.as_chunks_mut::<NR>().0;
+                            // B comes from memory, a row of each panel per step: one
+                            // prefetch per cache line of each, `PREFETCH_AHEAD` bytes on
+                            // (into the next panels past the last rows).
+                            let row_bytes = core::mem::size_of_val(&rows[0][0]);
+                            let (ahead, every) = (PREFETCH_AHEAD / row_bytes, 64 / row_bytes);
                             for p in 0..kc {
+                                if p % every == 0 {
+                                    for v in 0..V {
+                                        prefetch(rows[v].as_ptr().wrapping_add(p + ahead));
+                                    }
+                                }
                                 let bv: [f32x16<Avx512>; V] = core::array::from_fn(|v| {
                                     let $src = &rows[v][p];
                                     $widen
