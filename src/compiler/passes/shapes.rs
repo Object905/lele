@@ -655,6 +655,7 @@ fn output_shapes(g: &Graph, node: &Node, elems: &Elems) -> Vec<Option<Shape>> {
         | Op::QuantizeLinear(_)
         | Op::RmsNorm { .. }
         | Op::Rope { .. }
+        | Op::RotaryEmbedding { .. }
         | Op::ScaleNorm { .. }
         | Op::ScatterElements { .. }
         | Op::ScatterND
